@@ -1,0 +1,99 @@
+Recoil [
+    Title: "Brom harmonic reader bounds exercise"
+    Description: {
+        Checks that the exported harmonic sum keeps arbitrary-phase behavior
+        while the ordinary warped-phase domain remains eligible for the
+        bounded reader.
+    }
+    Type: module
+    Module: recoil-brom/test/sum-harmonics-bounds-test
+    Imports: [
+        brom/dsp/oscillator [
+            BROM-MAX-HARMONICS
+            brom-wavetable! brom-wavetable-bytes brom-wavetable-fill
+            brom-wavetable-read
+            brom-ln-table! brom-ln-table-bytes brom-ln-table-fill
+            brom-slope-table! brom-slope-table-bytes brom-slope-table-fill
+            brom-slope-value
+            brom-pd-osc! brom-pd-osc-bytes brom-pd-osc-reset
+            brom-osc-params! brom-sum-harmonics
+        ]
+    ]
+    Exports: []
+]
+
+check: func [
+    "Write one assertion result."
+    ok? [logic!] "True when the assertion passed."
+    return: [none!] "No value; the marker is written to stdout."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+near?: func [
+    "Check two floating-point sums within tolerance."
+    actual [f64!] "The value produced by the exported sum."
+    expected [f64!] "The value from arbitrary-phase table reads."
+    return: [logic!] "True when the values agree within 1e-12."
+] [
+    delta: either actual >= expected [actual - expected] [expected - actual]
+    return delta <= 1e-12
+]
+
+table: make c-pointer! unsafe/malloc brom-wavetable-bytes
+brom-wavetable-fill :table false
+ln: make c-pointer! unsafe/malloc brom-ln-table-bytes
+brom-ln-table-fill :ln
+odd: make c-pointer! unsafe/malloc brom-slope-table-bytes
+even: make c-pointer! unsafe/malloc brom-slope-table-bytes
+brom-slope-table-fill :odd :ln 0.0
+brom-slope-table-fill :even :ln 0.0
+osc: make c-pointer! unsafe/malloc brom-pd-osc-bytes
+unsafe/memset :osc 0 brom-pd-osc-bytes
+brom-pd-osc-reset :osc
+params: make c-pointer! unsafe/malloc (as i32! size-of brom-osc-params!)
+unsafe/memset :params 0 (as i32! size-of brom-osc-params!)
+p: make [#mutable brom-osc-params!] as brom-osc-params! :params
+p/num-harmonics: 4
+p/odd-level: 1.0
+p/even-level: 1.0
+
+sum-reference: func [
+    "Sum the test spectrum with the checked arbitrary-phase reader."
+    phase [f64!] "Warped fundamental phase, including out-of-range values."
+    return: [f64!] "The expected harmonic sum."
+] [
+    value: make [#mutable f64!] brom-wavetable-read :table phase
+    value: value + ((brom-wavetable-read :table (phase * 2.0)) * (brom-slope-value 2 0.0))
+    value: value + ((brom-wavetable-read :table (phase * 4.0)) * (brom-slope-value 4 0.0))
+    value: value + ((brom-wavetable-read :table (phase * 3.0)) * (brom-slope-value 3 0.0))
+    value: value + ((brom-wavetable-read :table (phase * 5.0)) * (brom-slope-value 5 0.0))
+    return value
+]
+
+check-sum: func [
+    "Compare the exported sum with the checked-reader reference."
+    phase [f64!] "Warped fundamental phase to exercise."
+    return: [none!] "No value; the assertion result is written to stdout."
+] [
+    actual: brom-sum-harmonics :table :osc :params :odd :even :ln
+        phase 440.0 22050.0 1.0 1.0 5 5 BROM-MAX-HARMONICS
+    check (near? actual (sum-reference phase))
+    return none
+]
+
+; Normal warped phase uses the guard-free dispatch; later harmonics exceed the
+; fast reader's phase bound and must still produce the arbitrary-phase result.
+check-sum 1.25
+check-sum 30000.0
+; The fundamental itself can be outside the bound for direct public callers.
+check-sum 200000.0
+
+unsafe/free :params
+unsafe/free :osc
+unsafe/free :even
+unsafe/free :odd
+unsafe/free :ln
+unsafe/free :table
+print "PASS"

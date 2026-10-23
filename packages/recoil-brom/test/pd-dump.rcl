@@ -1,0 +1,171 @@
+Recoil [
+    Title: "Phase-distortion A/B dump"
+    Description: {
+        Renders the same PD preview curves Mach's Rust core renders, through
+        the brom/dsp/oscillator primitives, and writes them as raw doubles for
+        an external comparison against the Rust oracle.
+
+        Raw doubles rather than text on purpose: the comparison is numeric, and
+        a formatted round-trip would put the printer's precision between the two
+        implementations.
+    }
+    Type: module
+    Module: recoil-brom/test/pd-dump
+    Imports: [
+        brom/dsp/oscillator [
+            BROM-WAVETABLE-SIZE BROM-MAX-HARMONICS
+            BROM-PD-ALGO-SAWTOOTH BROM-PD-ALGO-SINEPULSE BROM-PD-ALGO-SQUARE
+            BROM-PD-ALGO-SAWSQUARE BROM-PD-ALGO-TRAPEZOID
+            brom-wavetable! brom-wavetable-bytes brom-wavetable-fill brom-wavetable-read
+            brom-pd-cache! brom-pd-cache-update brom-pd-distort
+            brom-harmonic-phase brom-slope-value
+        ]
+        brom/dsp/utils [brom-clamp-f64 brom-abs-f64]
+    ]
+    Exports: []
+]
+
+stdio: foreign <stdio.h> [
+    fopen: "fopen" [c-string! c-string! return: [c-pointer!]]
+    fwrite: "fwrite" [c-pointer! size! size! c-pointer! return: [size!]]
+    fclose: "fclose" [c-pointer! return: [i32!]]
+]
+
+POINTS: 256
+CASE-COUNT: 35
+DUMP-PATH: "recoil-pd.bin"
+
+; Mirrors the Rust core's brightness_to_slope: brightness 0.5 is a sawtooth's
+; 1/h rolloff, and the quadratic gives finer control either side of it than a
+; straight line would.
+BRIGHTNESS-DARK-MAX: 1.0
+BRIGHTNESS-BRIGHT-MAX: 0.5
+
+out-buffer!: make c-struct! [
+    values: [c-array! [f64! 8960]]
+]
+
+brightness-to-slope: func [
+    "Map a brightness control to a spectral slope parameter."
+    brightness [f64!] "Brightness in 0..1; 0.5 is a sawtooth."
+    return: [f64!] "Slope in -BRIGHT_MAX..DARK_MAX for brom-slope-value."
+] [
+    b: brom-clamp-f64 brightness 0.0 1.0
+    t: (b - 0.5) * 2.0
+    return either t >= 0.0 [
+        0.0 - ((t * t) * BRIGHTNESS-BRIGHT-MAX)
+    ] [
+        (t * t) * BRIGHTNESS-DARK-MAX
+    ]
+]
+
+render-case: func [
+    "Render one normalized PD preview curve into the output buffer."
+    :out [c-pointer!] "Borrowed out-buffer! to write into."
+    slot [i32!] "Case index; the curve occupies POINTS doubles from slot * POINTS."
+    :sine [c-pointer!] "Borrowed filled sine wavetable."
+    :cosine [c-pointer!] "Borrowed filled cosine wavetable."
+    harmonics [i32!] "Harmonic count, clamped to BROM-MAX-HARMONICS."
+    drift [f64!] "Phase drift across the spectrum."
+    odd-level [f64!] "Level of the odd harmonics above the fundamental."
+    odd-brightness [f64!] "Brightness of the odd harmonics."
+    even-level [f64!] "Level of the even harmonics."
+    even-brightness [f64!] "Brightness of the even harmonics."
+    algorithm [i32!] "One of the BROM-PD-* selectors."
+    modulation [f64!] "Warp depth in 0..1."
+    return: [none!] "No value; the curve is written in place."
+] [
+    buffer: make [#mutable out-buffer!] as out-buffer! :out
+    cache: make [#mutable brom-pd-cache!] make c-pointer! unsafe/malloc (as i32! size-of brom-pd-cache!)
+    depth: brom-clamp-f64 modulation 0.0 1.0
+    brom-pd-cache-update :cache depth
+
+    ; Sawtooth reads a cosine table and everything else a sine, which is what
+    ; makes the same warp sound like a saw in one algorithm and a pulse in the
+    ; next.
+    table: either algorithm = BROM-PD-ALGO-SAWTOOTH [:cosine] [:sine]
+
+    odd-slope: brightness-to-slope odd-brightness
+    even-slope: brightness-to-slope even-brightness
+    limit: brom-clamp-f64 (as f64! harmonics) 1.0 (as f64! BROM-MAX-HARMONICS)
+    top: as i32! limit
+    base: slot * POINTS
+    span: (as f64! POINTS) - 1.0
+    peak: make [#mutable f64!] 0.001
+
+    repeat i POINTS [
+        t: (as f64! i) / span
+        distorted: brom-pd-distort :cache t depth algorithm
+        sum: make [#mutable f64!] 0.0
+        repeat step top [
+            h: step + 1
+            level: either h = 1 [
+                1.0
+            ] [
+                either (h % 2) = 0 [
+                    even-level * (brom-slope-value h even-slope)
+                ] [
+                    odd-level * (brom-slope-value h odd-slope)
+                ]
+            ]
+            if (brom-abs-f64 level) > 0.0001 [
+                h-phase: brom-harmonic-phase distorted h drift BROM-MAX-HARMONICS
+                sum: sum + ((brom-wavetable-read :table h-phase) * level)
+            ]
+        ]
+        buffer/values/(base + i): sum
+        magnitude: brom-abs-f64 sum
+        if magnitude > peak [peak: magnitude]
+    ]
+
+    repeat i POINTS [
+        buffer/values/(base + i): buffer/values/(base + i) / peak
+    ]
+    unsafe/free :cache
+    return none
+]
+
+; --- the case grid ----------------------------------------------------------
+; Group one holds the fundamental alone, so it isolates the warp, the table
+; read and the normalization with no spectrum in the way. Group two adds a full
+; spectrum, group three adds drift and asymmetric odd/even levels.
+
+sine-table: make c-pointer! unsafe/malloc brom-wavetable-bytes
+cosine-table: make c-pointer! unsafe/malloc brom-wavetable-bytes
+brom-wavetable-fill :sine-table false
+brom-wavetable-fill :cosine-table true
+
+out: make c-pointer! unsafe/malloc (as i32! size-of out-buffer!)
+depths: make [vector! [f64! 4]] [0.0 0.3 0.6 1.0]
+slot: make [#mutable i32!] 0
+
+repeat algorithm 5 [
+    repeat d 4 [
+        render-case :out slot :sine-table :cosine-table
+            1 0.0 1.0 0.5 1.0 0.5 algorithm depths/:d
+        slot: slot + 1
+    ]
+]
+
+rich-depths: make [vector! [f64! 2]] [0.0 0.6]
+repeat algorithm 5 [
+    repeat d 2 [
+        render-case :out slot :sine-table :cosine-table
+            32 0.0 1.0 0.5 1.0 0.5 algorithm rich-depths/:d
+        slot: slot + 1
+    ]
+]
+
+repeat algorithm 5 [
+    render-case :out slot :sine-table :cosine-table
+        16 0.7 1.0 0.8 0.5 0.2 algorithm 0.4
+    slot: slot + 1
+]
+
+handle: stdio/fopen DUMP-PATH "wb"
+stdio/fwrite :out 8 (as size! (CASE-COUNT * POINTS)) handle
+stdio/fclose handle
+unsafe/free :sine-table
+unsafe/free :cosine-table
+unsafe/free :out
+print "dumped"

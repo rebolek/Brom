@@ -1,0 +1,62 @@
+Recoil [
+    Title: "brom/dsp/envelope ADSR lifecycle exercise"
+    Type: module
+    Module: examples/pokuston/loos/adsr-test
+    Imports: [
+        brom/dsp/envelope [
+            adsr-config! adsr-config-brom adsr-envelope!
+            adsr-reset adsr-trigger adsr-release adsr-tick adsr-active? adsr-level
+        ]
+    ]
+    Exports: []
+]
+
+config: adsr-config-brom 0.01 0.01 0.25 0.01
+envelope: make [#mutable adsr-envelope!] adsr-reset
+previous: make [#mutable f64!] 0.0
+current: make [#mutable f64!] 0.0
+attack-monotonic?: make [#mutable logic!] true
+decay-monotonic?: make [#mutable logic!] true
+
+; A hard retrigger always starts at zero, irrespective of the prior value.
+envelope: adsr-trigger envelope
+print adsr-level envelope
+
+repeat tick 480 [
+    previous: adsr-level envelope
+    envelope: adsr-tick envelope config 48000.0
+    current: adsr-level envelope
+    if current < previous [attack-monotonic?: false]
+]
+print attack-monotonic?
+
+; The attack tick snaps to one and changes stage; begin the decay check on
+; the following sample so each observed segment has one direction.
+envelope: adsr-tick envelope config 48000.0
+repeat tick 480 [
+    previous: adsr-level envelope
+    envelope: adsr-tick envelope config 48000.0
+    current: adsr-level envelope
+    if current > previous [decay-monotonic?: false]
+]
+print adsr-level envelope
+print decay-monotonic?
+
+envelope: adsr-release envelope
+repeat tick 480 [envelope: adsr-tick envelope config 48000.0]
+print adsr-active? envelope
+current: adsr-level envelope
+print current = current
+
+instant: adsr-config-brom 0.0 0.0 0.5 0.0
+envelope: adsr-trigger envelope
+envelope: adsr-tick envelope instant 48000.0
+envelope: adsr-tick envelope instant 48000.0
+print adsr-level envelope
+envelope: adsr-release envelope
+envelope: adsr-tick envelope instant 48000.0
+print adsr-active? envelope
+
+invalid-rate: make [#mutable adsr-envelope!] adsr-trigger envelope
+invalid-rate: adsr-tick invalid-rate config 0.0
+print adsr-level invalid-rate

@@ -1,0 +1,430 @@
+Recoil [
+    Title: "Brom DSP exponential ADSR envelope"
+    Description: {
+        One ADSR, with its curve as a parameter.
+
+        An earlier version of this file claimed Mach's Rust core "reaches the
+        same algorithm through the brom-dsp-envelope crate". It does not, and
+        that was never checked: the two differ in the exponential constant
+        (-100 dB against -60 dB per nominal segment time), in where each stage
+        snaps to its endpoint, in whether release has a minimum time, and in
+        whether a near-zero segment is instant.
+
+        Every one of those is a voicing choice rather than a different
+        algorithm, so they live in adsr-config! beside the times they shape.
+        Use adsr-config-brom or adsr-config-mach rather than filling the struct
+        by hand -- a wrong curve constant does not look like a bug, it just
+        sounds like a different instrument.
+
+        Coefficients are cached in the envelope and recomputed only when the
+        parameter behind them moves. Mach runs about fifteen of these per voice
+        across sixteen voices, so an exp per envelope per sample would be 240
+        transcendentals a sample; the reference does none.
+
+        adsr-tick-n advances several samples at once, which is what lets a host
+        stagger envelope updates across voices instead of doing all of them
+        every sample.
+
+        Stages are an fsm! rather than a mutable stage integer, so an illegal
+        transition is a compile-time question rather than a runtime one.
+    }
+    Type: module
+    Module: brom/dsp/envelope
+    Imports: []
+    Exports: [
+        adsr-config! adsr-envelope!
+        ADSR_STAGE_IDLE ADSR_STAGE_ATTACK ADSR_STAGE_DECAY ADSR_STAGE_SUSTAIN ADSR_STAGE_RELEASE
+        ADSR_ENDPOINT_LOG ADSR_MACH_ENDPOINT_LOG
+        adsr-config-brom adsr-config-mach
+        adsr-reset adsr-trigger adsr-release adsr-tick adsr-tick-n
+        adsr-active? adsr-level adsr-releasing?
+    ]
+]
+
+math-ffi: foreign <math.h> [
+    exp: "exp" [f64! return: [f64!]]
+]
+
+ADSR_STAGE_IDLE: 0
+ADSR_STAGE_ATTACK: 1
+ADSR_STAGE_DECAY: 2
+ADSR_STAGE_SUSTAIN: 3
+ADSR_STAGE_RELEASE: 4
+ADSR_ENDPOINT_TOLERANCE: 0.00001
+; -ln(1e-5): a segment reaches a hundred decibels below its span in its nominal
+; time. This is the curve Loos has always had.
+ADSR_ENDPOINT_LOG: 11.512925464970229
+; Sixty decibels in the same nominal time, so every segment sounds faster and
+; more abrupt than the constant above. Mach's curve.
+;
+; 6.908 and not -ln(1e-3) = 6.907755..., which is what the name suggests and
+; what this said first. The reference is written with the rounded literal, and
+; rounding it back to the exact value moved the curve by 3.5e-5 relative --
+; small per sample, but it is in the exponent, so a couple of hundred samples of
+; attack compound it to 1e-5 of level and every A/B case failed. The constant is
+; whatever the instrument uses, not whatever the mathematics says it should be.
+ADSR_MACH_ENDPOINT_LOG: 6.908
+; Sentinel for "no coefficient computed yet". No real segment time is negative,
+; so the first tick after a reset always recomputes whatever it is asked for.
+ADSR_CACHE_UNSET: -1.0
+
+adsr-machine!: make fsm! [
+    events: [
+        trigger ["Hard retrigger from zero"]
+        attack-complete ["Move from attack to decay"]
+        decay-complete ["Move from decay to sustain"]
+        release ["Start the release segment"]
+        release-complete ["Become idle after release"]
+        reset ["Return immediately to idle"]
+    ]
+    idle [
+        trigger => attack
+        reset => idle
+    ]
+    attack [
+        trigger => attack
+        attack-complete => decay
+        release => release
+        reset => idle
+    ]
+    decay [
+        trigger => attack
+        decay-complete => sustain
+        release => release
+        reset => idle
+    ]
+    sustain [
+        trigger => attack
+        release => release
+        reset => idle
+    ]
+    release [
+        trigger => attack
+        release-complete => idle
+        reset => idle
+    ]
+]
+
+adsr-config!: make c-struct! [
+    attack: [f64!]
+    decay: [f64!]
+    sustain: [f64!]
+    release: [f64!]
+    ; --- curve, not timing ---------------------------------------------------
+    ; How steeply a segment approaches its target: larger is a sharper knee.
+    endpoint-log: [f64!]
+    ; How close to one the attack gets before it is called finished. Reaching a
+    ; target exponentially takes forever, so every implementation of this
+    ; decides somewhere to stop, and where it stops is audible on short times.
+    attack-snap: [f64!]
+    ; The same decision for decay and release, which approach from above.
+    level-snap: [f64!]
+    ; Release times shorter than this are treated as this. Guards against a
+    ; click when a note is cut, at the cost of the shortest releases.
+    release-floor: [f64!]
+    ; A segment shorter than this is instant rather than very fast.
+    min-time: [f64!]
+]
+
+adsr-envelope!: make c-struct! [
+    stage: [i32!]
+    level: [f64!]
+    ; The per-segment coefficients, and the parameters they were derived from.
+    ; Held here rather than in the config because the config is the caller's and
+    ; may be shared across every voice, while the cache is per envelope.
+    attack-coefficient: [f64!]
+    decay-coefficient: [f64!]
+    release-coefficient: [f64!]
+    cached-attack: [f64!]
+    cached-decay: [f64!]
+    cached-release: [f64!]
+]
+
+adsr-config-brom: func [
+    "Build an ADSR configuration on Brom's own curve, the one Loos uses."
+    attack [f64!] "Attack time in seconds."
+    decay [f64!] "Decay time in seconds."
+    sustain [f64!] "Sustain level, zero to one."
+    release [f64!] "Release time in seconds."
+    return: [adsr-config!] "Configuration reaching a hundred decibels down per nominal time."
+] [
+    return make adsr-config! [
+        attack: attack
+        decay: decay
+        sustain: sustain
+        release: release
+        endpoint-log: ADSR_ENDPOINT_LOG
+        attack-snap: ADSR_ENDPOINT_TOLERANCE
+        level-snap: ADSR_ENDPOINT_TOLERANCE
+        release-floor: 0.0
+        min-time: 0.0
+    ]
+]
+
+adsr-config-mach: func [
+    "Build an ADSR configuration on Mach's curve."
+    attack [f64!] "Attack time in seconds."
+    decay [f64!] "Decay time in seconds."
+    sustain [f64!] "Sustain level, zero to one."
+    release [f64!] "Release time in seconds."
+    return: [adsr-config!] "Configuration reaching sixty decibels down per nominal time."
+] [
+    return make adsr-config! [
+        attack: attack
+        decay: decay
+        sustain: sustain
+        release: release
+        endpoint-log: ADSR_MACH_ENDPOINT_LOG
+        ; Attack is called done at 0.999, decay and release at a ten-thousandth.
+        attack-snap: 0.001
+        level-snap: 0.0001
+        release-floor: 0.005
+        min-time: 0.0001
+    ]
+]
+
+adsr-stage-number: func [
+    "Return the public numeric stage constant for an ADSR state machine."
+    machine [adsr-machine!] "ADSR state machine whose current state is inspected."
+    return: [i32!] "One of the ADSR_STAGE_* constants."
+] [
+    if state? machine adsr-machine!/attack [return ADSR_STAGE_ATTACK]
+    if state? machine adsr-machine!/decay [return ADSR_STAGE_DECAY]
+    if state? machine adsr-machine!/sustain [return ADSR_STAGE_SUSTAIN]
+    if state? machine adsr-machine!/release [return ADSR_STAGE_RELEASE]
+    return ADSR_STAGE_IDLE
+]
+
+adsr-machine-from-stage: func [
+    "Reconstruct the ADSR state machine represented by a public stage constant."
+    stage [i32!] "Public ADSR_STAGE_* value stored in an envelope."
+    return: [adsr-machine!] "FSM value in the matching state, or idle for an invalid stage."
+] [
+    if stage = ADSR_STAGE_ATTACK [return adsr-machine!/attack]
+    if stage = ADSR_STAGE_DECAY [return adsr-machine!/decay]
+    if stage = ADSR_STAGE_SUSTAIN [return adsr-machine!/sustain]
+    if stage = ADSR_STAGE_RELEASE [return adsr-machine!/release]
+    return adsr-machine!/idle
+]
+
+adsr-clamp-sustain: func [
+    "Clamp an ADSR sustain target to the normalized envelope range."
+    value [f64!] "Requested sustain level."
+    return: [f64!] "Normalized sustain level in the inclusive zero-to-one range."
+] [
+    if value < 0.0 [return 0.0]
+    if value > 1.0 [return 1.0]
+    return value
+]
+
+adsr-reset: func [
+    "Create an idle ADSR envelope at exactly zero level."
+    return: [adsr-envelope!] "Fresh inactive envelope value with no cached coefficients."
+] [
+    return make adsr-envelope! [
+        stage: ADSR_STAGE_IDLE
+        level: 0.0
+        attack-coefficient: 0.0
+        decay-coefficient: 0.0
+        release-coefficient: 0.0
+        cached-attack: ADSR_CACHE_UNSET
+        cached-decay: ADSR_CACHE_UNSET
+        cached-release: ADSR_CACHE_UNSET
+    ]
+]
+
+adsr-trigger: func [
+    "Hard-retrigger an ADSR envelope from zero into its attack stage."
+    envelope [adsr-envelope!] "Previous envelope value, replaced by the returned value."
+    return: [adsr-envelope!] "Active zero-level envelope in the attack stage."
+] [
+    ; The cached coefficients survive the retrigger. They describe the
+    ; configuration, not the note, and a synth retriggering sixteen voices on a
+    ; chord would otherwise recompute every one of them for no reason.
+    machine: make [#mutable adsr-machine!] adsr-machine!/idle
+    send machine trigger []
+    out: make [#mutable adsr-envelope!] envelope
+    out/stage: adsr-stage-number machine
+    out/level: 0.0
+    return out
+]
+
+adsr-release: func [
+    "Start the release stage while preserving the envelope's current level."
+    envelope [adsr-envelope!] "Current envelope value whose level starts the release."
+    return: [adsr-envelope!] "Envelope value in the release stage."
+] [
+    machine: make [#mutable adsr-machine!] adsr-machine-from-stage envelope/stage
+    if state? machine adsr-machine!/idle [return adsr-reset]
+    send machine release []
+    out: make [#mutable adsr-envelope!] envelope
+    out/stage: adsr-stage-number machine
+    return out
+]
+
+adsr-releasing?: func [
+    "Report whether an ADSR envelope is in its release stage."
+    envelope [adsr-envelope!] "Envelope value to inspect."
+    return: [logic!] "True only during release."
+] [
+    return envelope/stage = ADSR_STAGE_RELEASE
+]
+
+adsr-active?: func [
+    "Report whether an ADSR envelope has not reached its idle stage."
+    envelope [adsr-envelope!] "Envelope value to inspect."
+    return: [logic!] "True when the envelope is in attack, decay, sustain, or release."
+] [
+    machine: adsr-machine-from-stage envelope/stage
+    if state? machine adsr-machine!/idle [return false]
+    return true
+]
+
+adsr-level: func [
+    "Return the current normalized envelope level."
+    envelope [adsr-envelope!] "Envelope value to inspect."
+    return: [f64!] "Current level, exactly zero for a reset or completed release."
+] [
+    return envelope/level
+]
+
+adsr-coefficient: func [
+    "Per-sample multiplier that carries a segment toward its target."
+    seconds [f64!] "Segment duration in seconds; zero or less yields an instant segment."
+    sample-rate [f64!] "Processing sample rate in samples per second."
+    endpoint-log [f64!] "Curve constant: how far down the segment reaches in its nominal time."
+    return: [f64!] "Multiplier in zero to one; smaller converges faster."
+] [
+    ; A segment of no length has no rate. adsr-advance-segment already treats
+    ; one as instant and never reads this, but the cache refresh computes every
+    ; coefficient whether its segment is used or not -- so the degenerate case
+    ; has to answer here rather than divide.
+    samples: seconds * sample-rate
+    if samples <= 0.0 [return 0.0]
+    return math-ffi/exp (0.0 - (endpoint-log / samples))
+]
+
+adsr-coefficient-pow: func [
+    "Raise a segment coefficient to a whole number of samples."
+    coefficient [f64!] "Per-sample multiplier."
+    steps [i32!] "Number of samples to advance; one or more."
+    return: [f64!] "The multiplier for advancing that many samples at once."
+] [
+    ; Repeated multiplication rather than exp(steps * ln coefficient): steps is
+    ; a handful, so this is both cheaper and exactly equal to taking the same
+    ; number of single steps, which is what makes a strided update indis-
+    ; tinguishable from an unstrided one.
+    out: make [#mutable f64!] 1.0
+    repeat i steps [out: out * coefficient]
+    return out
+]
+
+adsr-advance-segment: func [
+    "Advance one exponential segment by a number of samples, snapping at its endpoint."
+    envelope [adsr-envelope!] "Envelope value at the start of this segment."
+    target [f64!] "Normalized level approached by this segment."
+    seconds [f64!] "Configured segment duration in seconds."
+    coefficient [f64!] "Cached per-sample multiplier for this segment."
+    steps [i32!] "Number of samples to advance."
+    snap [f64!] "Distance from the target at which the segment is called finished."
+    min-time [f64!] "Segment durations at or below this are instant."
+    return: [adsr-envelope!] "Updated envelope, its level snapped if it reached the endpoint band."
+] [
+    out: make [#mutable adsr-envelope!] envelope
+    if seconds <= min-time [
+        out/level: target
+        return out
+    ]
+    distance: target - out/level
+    out/level: target - (distance * (adsr-coefficient-pow coefficient steps))
+    if (out/level - target) < snap [
+        if (target - out/level) < snap [
+            out/level: target
+        ]
+    ]
+    return out
+]
+
+adsr-refresh-cache: func [
+    "Recompute whichever segment coefficients their parameters have invalidated."
+    envelope [adsr-envelope!] "Envelope whose cache is being brought up to date."
+    config [adsr-config!] "Current configuration."
+    sample-rate [f64!] "Processing sample rate in samples per second."
+    return: [adsr-envelope!] "Envelope with coefficients matching the configuration."
+] [
+    out: make [#mutable adsr-envelope!] envelope
+    if out/cached-attack <> config/attack [
+        out/cached-attack: config/attack
+        out/attack-coefficient: adsr-coefficient config/attack sample-rate config/endpoint-log
+    ]
+    if out/cached-decay <> config/decay [
+        out/cached-decay: config/decay
+        out/decay-coefficient: adsr-coefficient config/decay sample-rate config/endpoint-log
+    ]
+    if out/cached-release <> config/release [
+        out/cached-release: config/release
+        floored: either config/release < config/release-floor [config/release-floor] [config/release]
+        out/release-coefficient: adsr-coefficient floored sample-rate config/endpoint-log
+    ]
+    return out
+]
+
+adsr-tick-n: func [
+    "Advance an ADSR envelope by several samples at once."
+    envelope [adsr-envelope!] "Envelope value at the current sample."
+    config [adsr-config!] "Segment times, sustain level and curve."
+    steps [i32!] "Number of samples to advance; one or more."
+    sample-rate [f64!] "Processing sample rate in samples per second."
+    return: [adsr-envelope!] "Envelope advanced by that many samples."
+] [
+    ; Advancing n samples at once is exactly n single steps, because within a
+    ; segment the envelope is a geometric sequence. What it cannot do is notice
+    ; a stage boundary partway through the group -- the envelope leaves attack
+    ; up to n-1 samples late. That is the trade a strided update makes, and it
+    ; is why the step count belongs to the caller.
+    if sample-rate <= 0.0 [return envelope]
+    out: make [#mutable adsr-envelope!] adsr-refresh-cache envelope config sample-rate
+    machine: make [#mutable adsr-machine!] adsr-machine-from-stage out/stage
+    if state? machine adsr-machine!/idle [
+        out/level: 0.0
+        return out
+    ]
+    if state? machine adsr-machine!/attack [
+        out: adsr-advance-segment out 1.0 config/attack out/attack-coefficient
+            steps config/attack-snap config/min-time
+        if out/level = 1.0 [send machine attack-complete []]
+        out/stage: adsr-stage-number machine
+        return out
+    ]
+    if state? machine adsr-machine!/decay [
+        sustain: adsr-clamp-sustain config/sustain
+        out: adsr-advance-segment out sustain config/decay out/decay-coefficient
+            steps config/level-snap config/min-time
+        if out/level = sustain [send machine decay-complete []]
+        out/stage: adsr-stage-number machine
+        return out
+    ]
+    if state? machine adsr-machine!/sustain [
+        out/level: adsr-clamp-sustain config/sustain
+        out/stage: adsr-stage-number machine
+        return out
+    ]
+    if state? machine adsr-machine!/release [
+        out: adsr-advance-segment out 0.0 config/release out/release-coefficient
+            steps config/level-snap config/min-time
+        if out/level = 0.0 [send machine release-complete []]
+        out/stage: adsr-stage-number machine
+        return out
+    ]
+    return adsr-reset
+]
+
+adsr-tick: func [
+    "Advance an ADSR envelope by one sample."
+    envelope [adsr-envelope!] "Envelope value at the current sample."
+    config [adsr-config!] "Segment times, sustain level and curve."
+    sample-rate [f64!] "Processing sample rate in samples per second."
+    return: [adsr-envelope!] "Next envelope value; invalid sample rates leave it unchanged."
+] [
+    return adsr-tick-n envelope config 1 sample-rate
+]

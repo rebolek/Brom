@@ -1,0 +1,192 @@
+Recoil [
+    Title: "VID flow layout accounts for what a face paints, not just what it measures"
+    Description: {
+        A face advances the flow cursor by its size, and for two kinds of face
+        the size is not what it occupies.
+
+        A knob's face IS its body: a `radius 34` knob is a 68x68 square. But it
+        prints its caption seventeen pixels under that square and its readout
+        thirty-five under it, so two rows of knobs packed by size overlap by
+        about fifty pixels -- the second row's names land on the first row's
+        values. That is not a hypothetical: it shipped, and it is what this
+        test exists to stop happening again.
+
+        A text face is worse. Nothing sizes it until a backend measures it, so
+        in a context view it stays 0x0 and a column of stacked captions all
+        lands on the same line.
+
+        Both are checked here by building a real layout headlessly and reading
+        the placements back, because neither is visible in emitted C and
+        neither can be seen by a test that only compiles.
+
+        It lives in Loos' project rather than beside the GUI package because
+        building a view needs a windowing backend linked, and Loos is the
+        smallest project in the tree that has one. What it exercises is the
+        dialect, not the instrument.
+    }
+    Type: module
+    Module: examples/pokuston/loos/flow-layout-test
+    Imports: [
+        gui/vid [
+            actor-edit actor-default actor-value actor-format
+            view-build view-hit-parameter
+        ]
+        gui/widget [
+            widget-format-number
+            knob-style! knob-style-default widget-knob-label-band
+            fader-style! fader-style-loos fader-geometry!
+            widget-fader-geometry
+        ]
+        std/geometry [rect-of]
+    ]
+    Exports: []
+]
+
+on-value-of: func ["Stub value query." id [u32!] return: [f64!]] [unused id return 0.5]
+on-default-of: func ["Stub default query." id [u32!] return: [f64!]] [unused id return 0.5]
+on-edited: func [
+    "Stub gesture sink."
+    id [u32!] "Parameter id." n [f64!] "Normalized value." p [i32!] "Phase."
+    return: [none!] "No value."
+] [unused id unused n unused p return none]
+on-shown: func [
+    "Stub formatter."
+    id [u32!] "Parameter id." n [f64!] "Normalized value."
+    return: [string!] "Owned text."
+] [unused id return widget-format-number n "%.2f"]
+
+failures: make [#mutable i32!] 0
+checks: make [#mutable i32!] 0
+
+check: func [
+    "Record one layout condition."
+    condition [logic!] "Condition that must hold."
+    note [string!] "What the condition is, printed when it fails."
+    return: [none!] "No value."
+] [
+    checks: checks + 1
+    if not condition [
+        failures: failures + 1
+        print rejoin ["  " note]
+    ]
+    return none
+]
+
+expect-hit: func [
+    "Require one point to resolve to one parameter."
+    x [i32!] "Point x." y [i32!] "Point y."
+    want [i32!] "Parameter the point must resolve to."
+    return: [none!] "No value."
+] [
+    got: view-hit-parameter x y
+    checks: checks + 1
+    if got <> want [
+        failures: failures + 1
+        print rejoin ["  hit: " x "x" y " gave " got ", wanted " want]
+    ]
+    return none
+]
+
+actor-edit 'edited :on-edited
+actor-default 'defaulted :on-default-of
+actor-value 'reads :on-value-of
+actor-format 'shown :on-shown
+
+; The two numbers a knob paints outside its face, asked of the widget rather
+; than written down here so this test cannot drift from the thing it checks.
+style: make [#mutable knob-style!] knob-style-default
+band: make i32! widget-knob-label-band (addr-of style)
+ring: make i32! widget-knob-ring-overspill (addr-of style)
+check (band > 30) "the default style should reserve a real caption band"
+check (band < 90) "the caption band should not be absurd"
+check (ring > 5) "the track ring is drawn outside the body and must be counted"
+check (ring < 40) "the track ring should not be absurd"
+
+; Fader geometry is wholly inside its declared face, and value one must move
+; the handle upward rather than invert the control.
+fader-style: make [#mutable fader-style!] fader-style-loos
+low: make [#mutable fader-geometry!] widget-fader-geometry
+    (rect-of 0.0 0.0 56.0 132.0) 0.0 (addr-of fader-style)
+high: make [#mutable fader-geometry!] widget-fader-geometry
+    (rect-of 0.0 0.0 56.0 132.0) 1.0 (addr-of fader-style)
+check (high/handle/origin/y < low/handle/origin/y)
+    "a larger fader value should move the handle upward"
+
+; Named PROBE-* rather than KNOB-*: Recoil words are case-insensitive, so
+; KNOB-RADIUS is the same word as gui/vid's knob-radius, and an unresolved
+; word is emitted verbatim rather than diagnosed -- it surfaces as a C
+; compile error naming an identifier that appears nowhere in the source.
+PROBE-RADIUS: 34
+PROBE-BODY: 68
+FLOW-GAP: 8
+START: 40
+
+; Two rows of two knobs, flowing across and wrapping with `return`, from one
+; starting point. Everything below is derived from the rule, so a change to how
+; a face advances the cursor shows up as a failure rather than as a layout
+; nobody looked at.
+view-build [
+    panel 0x0 500x500 colour panel [
+        at 40x40 across
+        knob "ONE" radius 34 param 0
+            on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+        knob "TWO" radius 34 param 1
+            on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+        return
+        knob "THREE" radius 34 param 2
+            on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+        knob "FOUR" radius 34 param 3
+            on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+
+        ; A separate scope keeps this rectangular-flow probe independent of
+        ; the knob cursor above. A fader paints entirely inside 56x132, so its
+        ; flow pitch is exactly size plus the standard eight-pixel gap.
+        panel 280x0 180x320 [
+            at 20x40 across
+            fader "A" 56x132 style loos param 4
+                on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            fader "B" 56x132 style loos param 5
+                on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            return
+            fader "C" 56x132 style loos param 6
+                on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+        ]
+    ]
+]
+
+; The cursor addresses what a knob PAINTS, so the body sits one ring inside the
+; point the row started at.
+first-x: make i32! (START + ring + PROBE-RADIUS)
+first-y: make i32! (START + ring + PROBE-RADIUS)
+; Across: the painted width is the body plus a ring on each side.
+pitch-x: make i32! (PROBE-BODY + ring + ring + FLOW-GAP)
+; Down: a ring above, the body, and the caption band below it.
+pitch-y: make i32! (ring + PROBE-BODY + band + FLOW-GAP)
+
+expect-hit first-x first-y 0
+expect-hit (first-x + pitch-x) first-y 1
+expect-hit first-x (first-y + pitch-y) 2
+expect-hit (first-x + pitch-x) (first-y + pitch-y) 3
+
+expect-hit 328 106 4
+expect-hit 392 106 5
+expect-hit 328 246 6
+; The whole rectangular face is live, not only its handle.
+expect-hit 301 41 4
+
+; The midpoints belong to neither neighbour. A knob is grabbable ten pixels
+; past its drawn edge, so two knobs one gap apart leave a sliver between them
+; that answers nothing -- and if either pitch ever collapses back to the body
+; width, these are the checks that fail. Under the size-only rule the rings
+; overlapped by twenty-eight pixels across and the grab areas by fifty down,
+; which is what it looked like and what it felt like.
+expect-hit (first-x + (pitch-x / 2)) first-y -1
+expect-hit first-x (first-y + (pitch-y / 2)) -1
+expect-hit 360 106 -1
+expect-hit 328 176 -1
+
+print "checks:"
+print checks
+print "failures:"
+print failures
+either failures = 0 [print "PASS"] [print "FAIL"]

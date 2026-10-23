@@ -1,0 +1,348 @@
+Recoil [
+    Title: "Brom plugin parameter values"
+    Description: {
+        Parameter range mapping and unit conversion for Brom-based plug-ins.
+
+        The normalized side of every parameter is 0.0-1.0, which is what CLAP
+        and VST3 exchange with the host and what a VID face's `data` facet
+        carries. This module owns the mapping between that and engineering
+        units, so the taper lives in exactly one place: applying it in a widget
+        instead would make a host-automated value and a dragged one disagree,
+        because automation never travels through the editor.
+
+        Two tapers are available, and the default matters.
+
+        EXPONENTIAL is the 1V/oct shape, `lo * (hi/lo)^p`. It puts a constant
+        number of octaves under every part of the control's travel, which is
+        what a filter cutoff, an LFO rate or an envelope time wants. Prefer it
+        for anything frequency-like.
+
+        POWER is JUCE's NormalisableRange curve, kept for reproducing a shape
+        that already exists rather than as a default. Definitions transcribed
+        from juce_core/maths/juce_NormalisableRange.h:
+          value -> norm  pow(proportion, skew)
+          norm -> value  exp(log(proportion) / skew)
+          centre         skew = log(0.5) / log((centre - start) / (end - start))
+        with the symmetric variant applying the same curve to the signed
+        distance from the midpoint, which is what a bipolar control wants.
+        Note that despite its reputation this is *not* a logarithmic taper: it
+        is pinned only at the endpoints and the chosen centre, and octave
+        density drifts in between. Over 20 Hz - 20 kHz centred at 640 Hz it
+        spends 0.97 octaves on the first quarter of travel and 4.03 on the
+        second, where the exponential spends 2.49 on each.
+
+        The linear helpers (dB, MIDI note, omega) are ported from Brom's
+        brom-plugin-ffi crate. Its normalize/denormalize pair was linear-only,
+        so the taper here is new work rather than a port.
+    }
+    Type: module
+    Module: brom/plugin/values
+    Imports: [
+        std/math/core [pow-f64 log-f64 exp-f64 round-f64]
+    ]
+    Exports: [
+        param-range!
+        BROM-TAPER-POWER BROM-TAPER-EXPONENTIAL
+        param-linear param-skewed param-centred param-stepped param-bipolar
+        param-exponential
+        param-normalize param-denormalize param-skew-for-centre
+        linear-to-db db-to-linear
+        midi-note-to-freq freq-to-midi-note
+        val-to-omega omega-to-freq
+    ]
+]
+
+; Prefixed so a module-level constant cannot collide with an importer's own
+; spelling once these lower to C constants.
+BROM-VALUES-PI: 3.141592653589793
+BROM-LN2: 0.6931471805599453
+BROM-LN10: 2.302585092994046
+
+; Taper kinds, in `param-range!/kind`.
+;
+; POWER is JUCE's NormalisableRange curve. It is pinned at the two endpoints
+; plus whatever centre you ask for, and drifts everywhere else: on a
+; 20 Hz - 20 kHz range centred at 640 Hz it spends 0.97 octaves on the first
+; quarter of travel and 4.03 on the second. Keep it for reproducing a curve
+; that already exists; do not reach for it when designing a new control.
+;
+; EXPONENTIAL is the 1V/oct shape -- a constant number of octaves per unit of
+; travel, which is what "logarithmic cutoff" normally means and what an analog
+; synth's pitch CV does. It is the right default for anything frequency-like.
+BROM-TAPER-POWER: 0
+BROM-TAPER-EXPONENTIAL: 1
+
+; A parameter's mapping between normalized 0.0-1.0 and engineering units.
+;
+; `skew` of 1.0 is linear. Below 1.0 the low end of the range gets more of the
+; control's travel; above 1.0 the high end does. It applies to POWER only.
+; `symmetric` applies the curve to the distance from the midpoint instead of
+; from `lo`, which is what a bipolar control (pan, detune, a +/- dB trim) needs
+; so that resolution is expanded around zero rather than at one end. POWER only.
+; `steps` of 0 or 1 means continuous; N > 1 quantises to N discrete positions,
+; which is how a choice parameter (filter type, PD algorithm) is described. It
+; applies to every kind.
+param-range!: make struct! [
+    lo: f64!
+    hi: f64!
+    skew: f64!
+    symmetric: i32!
+    steps: i32!
+    kind: i32!
+]
+
+; --- constructors ------------------------------------------------------------
+
+param-linear: func [
+    "Build a linear parameter range."
+    low [f64!] "Value at normalized 0.0."
+    high [f64!] "Value at normalized 1.0."
+    return: [param-range!] "Continuous linear range."
+] [
+    return make param-range! [lo: low hi: high skew: 1.0 symmetric: 0 steps: 0 kind: BROM-TAPER-POWER]
+]
+
+param-skewed: func [
+    "Build a parameter range with an explicit skew factor."
+    low [f64!] "Value at normalized 0.0."
+    high [f64!] "Value at normalized 1.0."
+    skew [f64!] "Skew factor; 1.0 is linear, below 1.0 favours the low end."
+    return: [param-range!] "Continuous skewed range."
+] [
+    return make param-range! [lo: low hi: high skew: skew symmetric: 0 steps: 0 kind: BROM-TAPER-POWER]
+]
+
+param-centred: func [
+    "Build a parameter range whose midpoint travel lands on `centre`. This is the constructor a frequency control wants: `param-centred 20.0 20000.0 640.0` puts 640 Hz at the halfway point instead of 10 kHz."
+    low [f64!] "Value at normalized 0.0."
+    high [f64!] "Value at normalized 1.0."
+    centre [f64!] "Value the normalized midpoint 0.5 should produce; must lie strictly between low and high."
+    return: [param-range!] "Continuous range skewed to place `centre` at 0.5."
+] [
+    s: param-skew-for-centre low high centre
+    return make param-range! [lo: low hi: high skew: s symmetric: 0 steps: 0 kind: BROM-TAPER-POWER]
+]
+
+param-bipolar: func [
+    "Build a symmetric (bipolar) parameter range, expanding resolution around the midpoint rather than at an end."
+    low [f64!] "Value at normalized 0.0."
+    high [f64!] "Value at normalized 1.0."
+    skew [f64!] "Skew factor applied to the distance from the midpoint; below 1.0 expands the centre."
+    return: [param-range!] "Continuous symmetric range."
+] [
+    return make param-range! [lo: low hi: high skew: skew symmetric: 1 steps: 0 kind: BROM-TAPER-POWER]
+]
+
+param-stepped: func [
+    "Build a quantised parameter range for a choice-style parameter."
+    low [f64!] "Value at normalized 0.0."
+    high [f64!] "Value at normalized 1.0."
+    count [i32!] "Number of discrete positions; must be at least 2."
+    return: [param-range!] "Linear range quantised to `count` positions."
+] [
+    return make param-range! [lo: low hi: high skew: 1.0 symmetric: 0 steps: count kind: BROM-TAPER-POWER]
+]
+
+param-exponential: func [
+    "Build an exponential (1V/oct) parameter range: a constant number of octaves per unit of travel. This is the right default for anything frequency-like -- a filter cutoff, an LFO rate, an envelope time. Unlike param-centred it needs no centre, because the shape is the same everywhere; `param-exponential 20.0 20000.0` already puts 632 Hz at mid-travel."
+    low [f64!] "Value at normalized 0.0; must be above zero."
+    high [f64!] "Value at normalized 1.0; must be above zero."
+    return: [param-range!] "Continuous exponential range."
+] [
+    return make param-range! [
+        lo: low hi: high skew: 1.0 symmetric: 0 steps: 0
+        kind: BROM-TAPER-EXPONENTIAL
+    ]
+]
+
+; --- mapping -----------------------------------------------------------------
+
+clamp01: func [
+    "Confine a value to the normalized range."
+    v [f64!] "Candidate value."
+    return: [f64!] "v clamped to 0.0-1.0."
+] [
+    if v < 0.0 [return 0.0]
+    if v > 1.0 [return 1.0]
+    return v
+]
+
+abs-f64: func [
+    "Absolute value."
+    v [f64!] "Candidate value."
+    return: [f64!] "Magnitude of v."
+] [
+    if v < 0.0 [return 0.0 - v]
+    return v
+]
+
+param-skew-for-centre: func [
+    "Compute the skew factor that places `centre` at the normalized midpoint, mirroring JUCE's setSkewForCentre."
+    low [f64!] "Value at normalized 0.0."
+    high [f64!] "Value at normalized 1.0."
+    centre [f64!] "Value that normalized 0.5 should produce."
+    return: [f64!] "Skew factor; 1.0 when the inputs are degenerate."
+] [
+    span: high - low
+    if span = 0.0 [return 1.0]
+    ratio: (centre - low) / span
+    ; log(ratio) is undefined at or below zero and zero at exactly 1.0, either of
+    ; which would divide by zero below. A centre outside the range is a caller
+    ; error; degrade to linear rather than emitting a NaN that would silently
+    ; poison every later conversion.
+    if ratio <= 0.0 [return 1.0]
+    if ratio >= 1.0 [return 1.0]
+    return (log-f64 0.5) / (log-f64 ratio)
+]
+
+exponential-usable?: func [
+    "True when a range's endpoints admit an exponential taper, which needs the logarithm of both."
+    range [param-range!] "The parameter's range description."
+    return: [logic!] "Whether lo and hi are both positive and distinct."
+] [
+    if range/lo <= 0.0 [return false]
+    if range/hi <= 0.0 [return false]
+    return range/lo <> range/hi
+]
+
+taper-denorm-exponential: func [
+    "Map a clamped normalized position through the 1V/oct curve: lo * (hi/lo)^p."
+    range [param-range!] "The parameter's range description."
+    p [f64!] "Normalized position, already clamped to 0.0-1.0."
+    return: [f64!] "Value in the parameter's own units."
+] [
+    return range/lo * (exp-f64 (p * (log-f64 (range/hi / range/lo))))
+]
+
+taper-denorm-power: func [
+    "Map a clamped normalized position through JUCE's NormalisableRange curve, symmetric or not."
+    range [param-range!] "The parameter's range description."
+    p [f64!] "Normalized position, already clamped to 0.0-1.0."
+    return: [f64!] "Value in the parameter's own units."
+] [
+    span: range/hi - range/lo
+    either range/symmetric = 0 [
+        q: make [#mutable f64!] p
+        ; The proportion > 0 guard is JUCE's: log(0) is -inf.
+        if all [range/skew <> 1.0 q > 0.0] [
+            q: exp-f64 ((log-f64 q) / range/skew)
+        ]
+        return range/lo + (span * q)
+    ] [
+        d: make [#mutable f64!] ((2.0 * p) - 1.0)
+        if all [range/skew <> 1.0 d <> 0.0] [
+            mag: exp-f64 ((log-f64 (abs-f64 d)) / range/skew)
+            d: either d < 0.0 [0.0 - mag] [mag]
+        ]
+        return range/lo + ((span / 2.0) * (1.0 + d))
+    ]
+]
+
+param-denormalize: func [
+    "Map a normalized 0.0-1.0 position to engineering units, applying the range's taper and quantisation."
+    range [param-range!] "The parameter's range description."
+    v [f64!] "Normalized position; clamped to 0.0-1.0."
+    return: [f64!] "Value in the parameter's own units."
+] [
+    p: clamp01 v
+    span: range/hi - range/lo
+    out: make [#mutable f64!] range/lo
+    ; A non-positive endpoint has no logarithm, so an exponential range built
+    ; over one degrades to the power path (which is linear at skew 1.0) rather
+    ; than producing NaN. Callers should not build such a range; a frequency
+    ; never reaches zero.
+    either all [range/kind = BROM-TAPER-EXPONENTIAL exponential-usable? range] [
+        out: taper-denorm-exponential range p
+    ] [
+        out: taper-denorm-power range p
+    ]
+    ; Quantisation is deliberately applied here only, not in param-normalize:
+    ; the host owns the normalized value and must get back exactly what it sent,
+    ; while the engine wants the legal value.
+    if range/steps > 1 [
+        interval: span / (as f64! (range/steps - 1))
+        if interval <> 0.0 [
+            out: range/lo + (interval * (round-f64 ((out - range/lo) / interval)))
+        ]
+    ]
+    return out
+]
+
+param-normalize: func [
+    "Map a value in engineering units back to its normalized 0.0-1.0 position, the inverse of param-denormalize for a continuous range."
+    range [param-range!] "The parameter's range description."
+    x [f64!] "Value in the parameter's own units."
+    return: [f64!] "Normalized position in 0.0-1.0."
+] [
+    span: range/hi - range/lo
+    if span = 0.0 [return 0.0]
+    ; Inverse of taper-denorm-exponential: log(x/lo) / log(hi/lo).
+    if all [range/kind = BROM-TAPER-EXPONENTIAL exponential-usable? range] [
+        if x <= 0.0 [return 0.0]
+        return clamp01 ((log-f64 (x / range/lo)) / (log-f64 (range/hi / range/lo)))
+    ]
+    p: clamp01 ((x - range/lo) / span)
+    if range/skew = 1.0 [return p]
+    if range/symmetric = 0 [return pow-f64 p range/skew]
+    d: (2.0 * p) - 1.0
+    mag: pow-f64 (abs-f64 d) range/skew
+    signed: either d < 0.0 [0.0 - mag] [mag]
+    return (1.0 + signed) / 2.0
+]
+
+; --- unit conversion ---------------------------------------------------------
+
+linear-to-db: func [
+    "Convert a linear gain to decibels."
+    linear [f64!] "Linear gain; must be above zero."
+    return: [f64!] "Level in dB; -600.0 stands in for silence."
+] [
+    ; log(0) is -inf and negative gains have no dB value at all; a large finite
+    ; floor keeps arithmetic downstream well-defined.
+    if linear <= 0.0 [return -600.0]
+    return 20.0 * ((log-f64 linear) / BROM-LN10)
+]
+
+db-to-linear: func [
+    "Convert decibels to a linear gain."
+    db [f64!] "Level in dB."
+    return: [f64!] "Linear gain."
+] [
+    return pow-f64 10.0 (db / 20.0)
+]
+
+midi-note-to-freq: func [
+    "Convert a MIDI note number to its equal-tempered frequency at A440."
+    note [f64!] "MIDI note number; fractional values give the pitch between semitones."
+    return: [f64!] "Frequency in Hz."
+] [
+    return 440.0 * (pow-f64 2.0 ((note - 69.0) / 12.0))
+]
+
+freq-to-midi-note: func [
+    "Convert a frequency to its equal-tempered MIDI note number at A440."
+    freq [f64!] "Frequency in Hz; must be above zero."
+    return: [f64!] "MIDI note number, fractional between semitones; 0.0 for a non-positive input."
+] [
+    if freq <= 0.0 [return 0.0]
+    return (12.0 * ((log-f64 (freq / 440.0)) / BROM-LN2)) + 69.0
+]
+
+val-to-omega: func [
+    "Convert a frequency to its angular frequency per sample."
+    freq [f64!] "Frequency in Hz."
+    sample-rate [f64!] "Sample rate in Hz; must be above zero."
+    return: [f64!] "Angular frequency in radians per sample."
+] [
+    if sample-rate <= 0.0 [return 0.0]
+    return (2.0 * BROM-VALUES-PI * freq) / sample-rate
+]
+
+omega-to-freq: func [
+    "Convert an angular frequency per sample back to Hz."
+    omega [f64!] "Angular frequency in radians per sample."
+    sample-rate [f64!] "Sample rate in Hz."
+    return: [f64!] "Frequency in Hz."
+] [
+    return (omega * sample-rate) / (2.0 * BROM-VALUES-PI)
+]

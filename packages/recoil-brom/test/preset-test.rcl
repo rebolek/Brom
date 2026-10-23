@@ -1,0 +1,503 @@
+Recoil [
+    Title: "brom/plugin/preset exercise"
+    Type: module
+    Module: recoil-brom/test/preset-test
+    Imports: [
+        brom/plugin/engine [param-info!]
+        brom/plugin/values [param-linear param-stepped]
+        brom/plugin/engine [engine!]
+        brom/plugin/preset [preset-name-slug preset-slug-of preset-format preset-apply preset-prepare preset-snapshot! preset-save preset-load preset-dir preset-path
+            preset-key-of preset-description-of preset-param-count preset-feature-count preset-feature-at
+            preset-factory-count preset-factory-name preset-factory-key
+            preset-factory-index-by-key preset-factory-apply preset-snapshot-apply]
+        brom/plugin/preset/schema [
+            brom-preset-schema-read brom-preset-prepare-text
+            brom-preset-format-snapshot brom-preset-decode-legacy
+            brom-preset-apply-validated
+        ]
+    ]
+    Exports: []
+]
+
+checks: make [#mutable i32!] 0
+failures: make [#mutable i32!] 0
+
+expect-text: func [
+    "Report one string comparison."
+    :label [string!] "What is being checked."
+    :actual [string!] "Value produced."
+    :expected [string!] "Value required."
+    return: [none!] "No value."
+] [
+    checks: checks + 1
+    either actual = expected [
+        print rejoin ["PASS " label]
+    ] [
+        failures: failures + 1
+        print rejoin ["FAIL " label " -- got " actual " want " expected]
+    ]
+    return none
+]
+
+info: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+p: make [#mutable param-info!] as param-info! info
+p/id: as u32! 0
+p/name: as c-string! "Harmonics"
+p/module: as c-string! "Oscillator 1"
+p/default-value: 1.0
+p/range: param-linear 0.0 1.0
+expect-text (make string! "slug joins module and name") (preset-slug-of :info) (make string! "oscillator-1-harmonics")
+
+p/name: as c-string! "PD Modulation"
+p/module: as c-string! "Global"
+expect-text (make string! "slug folds case and spaces") (preset-slug-of :info) (make string! "global-pd-modulation")
+
+p/name: as c-string! "Odd/Even  Level"
+p/module: as c-string! "OSC 2"
+expect-text (make string! "slug collapses punctuation runs") (preset-slug-of :info) (make string! "osc-2-odd-even-level")
+
+; --- a two-parameter engine, driven only through its descriptor -------------
+
+demo-core!: make c-struct! [
+    cutoff: [f64!]
+    gain: [f64!]
+    mode: [f64!]
+]
+
+demo-param-info: func [
+    "Describe the parameter at `index`."
+    index [i32!] "Parameter index."
+    out [c-pointer!] "Address of a caller-owned param-info!."
+    return: [logic!] "False when the index is unknown."
+] [
+    d: make [#mutable param-info!] as param-info! out
+    if index = 0 [
+        r: param-linear 20.0 20000.0
+        d/id: 0
+        d/name: as c-string! "Cutoff"
+        d/module: as c-string! "Filter"
+        d/default-value: 1000.0
+        d/range: r
+        return true
+    ]
+    if index = 1 [
+        r2: param-linear 0.0 1.0
+        d/id: 1
+        d/name: as c-string! "Odd Level"
+        d/module: as c-string! "Oscillator 1"
+        d/default-value: 0.5
+        d/range: r2
+        return true
+    ]
+    if index = 2 [
+        r3: param-stepped 0.0 2.0 3
+        d/id: 2
+        d/name: as c-string! "Mode"
+        d/module: as c-string! "Global"
+        d/default-value: 0.0
+        d/range: r3
+        return true
+    ]
+    return false
+]
+
+demo-get-param: func [
+    "Read a parameter in engineering units."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    id [u32!] "Parameter id."
+    return: [f64!] "Current value."
+] [
+    c: make [#mutable demo-core!] as demo-core! :core
+    if id = (as u32! 0) [return c/cutoff]
+    if id = (as u32! 1) [return c/gain]
+    return c/mode
+]
+
+demo-set-param: func [
+    "Write a parameter in engineering units."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    id [u32!] "Parameter id."
+    value [f64!] "New value."
+    return: [logic!] "True when the id was known."
+] [
+    c: make [#mutable demo-core!] as demo-core! :core
+    if id = (as u32! 0) [c/cutoff: value  return true]
+    if id = (as u32! 1) [c/gain: value  return true]
+    if id = (as u32! 2) [c/mode: value  return true]
+    return false
+]
+
+demo-factory-preset: func [
+    "Serve one built-in preset."
+    index [i32!] "Bank index."
+    return: [string!] "Preset text."
+] [
+    if index = 0 [
+        return make string! {Recoil-Preset [
+    name: "Warm"
+    key: "warm-pad"
+    description: "Soft filtered demonstration patch."
+    features: [warm pad]
+    version: 1
+    plugin: "preset-demo"
+    params: [
+        filter-cutoff: 800.0
+    ]
+]
+}
+    ]
+    return make string! {Recoil-Preset [
+    name: "Open"
+    version: 1
+    plugin: "preset-demo"
+    params: [
+        filter-cutoff: 12000.0
+        oscillator-1-odd-level: 0.9
+    ]
+]
+}
+]
+
+demo-engine: make engine! [
+    id: (as c-string! "com.pokuston.presetdemo")
+    name: (as c-string! "Preset Demo")
+    vendor: (as c-string! "Pokuston")
+    version: (as c-string! "0.1.0")
+    description: (as c-string! "Three-parameter preset validation exercise")
+    param-count: 3
+    max-voices: 1
+    state-size: 16
+    output-capacity: 64
+    editor-width: 0
+    editor-height: 0
+    param-info-fn: :demo-param-info
+    get-param-fn: :demo-get-param
+    set-param-fn: :demo-set-param
+    factory-count: 2
+    factory-preset-fn: :demo-factory-preset
+]
+
+; The CLAP transaction initializer depends on this copied schema being fully
+; populated. Keep a direct check here so descriptor rows cannot silently be
+; read into a temporary value and discarded.
+test-schema-param!: make c-struct! [
+    id: [u32!]
+    steps: [u32!]
+    minimum: [f64!]
+    maximum: [f64!]
+    default-value: [f64!]
+    key: [c-array! [u8! 128]]
+]
+test-schema!: make c-struct! [
+    count: [u32!]
+    version: [u32!]
+    parameters: [c-array! [test-schema-param! 256]]
+]
+schema-raw: make c-pointer! unsafe/malloc (as i32! size-of test-schema!)
+unsafe/memset schema-raw 0 (as i32! size-of test-schema!)
+schema: make [#mutable test-schema!] as test-schema! :schema-raw
+expect-true (make string! "schema reader copies every descriptor parameter")
+    (brom-preset-schema-read (addr-of demo-engine) :schema-raw)
+expect-true (make string! "schema reader preserves parameter count") schema/count = (as u32! 3)
+expect-true (make string! "schema reader preserves first parameter identity")
+    all [schema/parameters/0/id = (as u32! 0) schema/parameters/0/minimum = 20.0
+        schema/parameters/0/maximum = 20000.0]
+expect-true (make string! "schema reader preserves final parameter identity")
+    all [schema/parameters/2/id = (as u32! 2) schema/parameters/2/steps = (as u32! 3)
+        schema/parameters/2/maximum = 2.0]
+unsafe/free :schema-raw
+
+core: make c-pointer! unsafe/malloc (as i32! size-of demo-core!)
+unsafe/memset core 0 (as i32! size-of demo-core!)
+state: make [#mutable demo-core!] as demo-core! core
+
+; Both at their declared defaults: a preset says what it CHANGES, so the
+; params block must come out empty rather than restating the defaults.
+state/cutoff: 1000.0
+state/gain: 0.5
+print "--- all-default preset:"
+print preset-format :demo-engine :core (make string! "Init")
+
+state/cutoff: 3000.0
+print "--- one parameter moved:"
+print preset-format :demo-engine :core (make string! "Bright")
+
+; --- round trip -------------------------------------------------------------
+
+expect-f64: func [
+    "Report one numeric comparison."
+    :label [string!] "What is being checked."
+    actual [f64!] "Value produced."
+    expected [f64!] "Value required."
+    return: [none!] "No value."
+] [
+    checks: checks + 1
+    either actual = expected [
+        print rejoin ["PASS " label]
+    ] [
+        failures: failures + 1
+        print rejoin ["FAIL " label " -- got " actual " want " expected]
+    ]
+    return none
+]
+
+; A value chosen so a lossy formatter would be caught: it needs all 17
+; significant digits to come back bit-identical.
+state/cutoff: 1234.5678901234567
+state/gain: 0.1
+saved: preset-format :demo-engine :core (make string! "Round Trip")
+
+state/cutoff: 20.0
+state/gain: 0.9
+count-applied: preset-apply :demo-engine :core :saved
+expect-f64 (make string! "round trip restores cutoff exactly") state/cutoff 1234.5678901234567
+expect-f64 (make string! "round trip restores gain exactly") state/gain 0.1
+expect-f64 (make string! "round trip applied both parameters") (make f64! count-applied) 2.0
+
+; A key no parameter answers to is skipped, not fatal, and does not stop the
+; keys around it from being read.
+mixed: make string! {Recoil-Preset [
+    name: "Mixed"
+    version: 1
+    plugin: "preset-demo"
+    params: [
+        filter-cutoff: 440.0
+        no-such-parameter: 3.0
+        oscillator-1-odd-level: 0.25
+    ]
+]
+}
+state/cutoff: 1.0
+state/gain: 1.0
+mixed-applied: preset-apply :demo-engine :core :mixed
+expect-f64 (make string! "unknown key is skipped, known keys still apply") (make f64! mixed-applied) 2.0
+expect-f64 (make string! "key before the unknown one applied") state/cutoff 440.0
+expect-f64 (make string! "key after the unknown one applied") state/gain 0.25
+
+; --- files ------------------------------------------------------------------
+
+expect-true: func [
+    "Report one boolean check."
+    :label [string!] "What is being checked."
+    actual [logic!] "Result."
+    return: [none!] "No value."
+] [
+    checks: checks + 1
+    either actual [print rejoin ["PASS " label]] [
+        failures: failures + 1
+        print rejoin ["FAIL " label]
+    ]
+    return none
+]
+
+state/cutoff: 987.6543
+state/gain: 0.75
+on-disk: preset-format :demo-engine :core (make string! "Saved")
+file-path: make string! "/tmp/brom-preset-roundtrip.preset"
+expect-true (make string! "preset-save writes the file") (preset-save :file-path :on-disk)
+back: preset-load :file-path
+expect-true (make string! "preset-load returns what was written") (back = on-disk)
+
+state/cutoff: 1.0
+state/gain: 1.0
+from-file: preset-apply :demo-engine :core :back
+expect-f64 (make string! "values survive the file round trip") state/cutoff 987.6543
+expect-f64 (make string! "both parameters came back from disk") (make f64! from-file) 2.0
+
+missing: preset-load (make string! "/tmp/brom-preset-does-not-exist.preset")
+expect-true (make string! "a missing file loads as empty, not a crash") ((length? missing) = 0)
+
+print rejoin ["preset dir: " (preset-dir :demo-engine)]
+print rejoin ["preset path: " (preset-path :demo-engine (make string! "glass-bells"))]
+
+; --- factory bank -----------------------------------------------------------
+
+expect-text (make string! "factory reports the first preset's name")
+    (preset-factory-name :demo-engine 0) (make string! "Warm")
+expect-text (make string! "factory reports the second preset's name")
+    (preset-factory-name :demo-engine 1) (make string! "Open")
+expect-f64 (make string! "factory bank reports its size")
+    (make f64! (preset-factory-count :demo-engine)) 2.0
+expect-text (make string! "factory uses an explicit stable key")
+    (preset-factory-key :demo-engine 0) (make string! "warm-pad")
+open-key: preset-name-slug (as c-pointer! (as c-string! "Open"))
+expect-text (make string! "factory falls back to the name slug")
+    (preset-factory-key :demo-engine 1) :open-key
+
+warm-text: demo-factory-preset 0
+expect-text (make string! "preset exposes its description")
+    (preset-description-of :warm-text) (make string! "Soft filtered demonstration patch.")
+expect-f64 (make string! "preset reports its feature count")
+    (make f64! (preset-feature-count :warm-text)) 2.0
+expect-f64 (make string! "preset reports its parameter count")
+    (make f64! (preset-param-count :warm-text)) 1.0
+warm-feature: preset-name-slug (as c-pointer! (as c-string! "Warm"))
+expect-text (make string! "preset reports its first feature")
+    (preset-feature-at :warm-text 0) :warm-feature
+expect-text (make string! "preset reports its second feature")
+    (preset-feature-at :warm-text 1) (make string! "pad")
+expect-text (make string! "preset name slug remains a compatible key fallback")
+    (preset-key-of (demo-factory-preset 1)) :open-key
+expect-f64 (make string! "factory finds an explicit key")
+    (make f64! (preset-factory-index-by-key :demo-engine (make string! "warm-pad"))) 0.0
+expect-f64 (make string! "factory finds a fallback key")
+    (make f64! (preset-factory-index-by-key :demo-engine :open-key)) 1.0
+expect-f64 (make string! "factory rejects an unknown key")
+    (make f64! (preset-factory-index-by-key :demo-engine (make string! "missing"))) (make f64! -1.0)
+
+state/cutoff: 1.0
+state/gain: 1.0
+warm: preset-factory-apply :demo-engine :core 0
+expect-f64 (make string! "factory preset applies its one value") state/cutoff 800.0
+expect-f64 (make string! "factory preset applies only what it names") (make f64! warm) 1.0
+expect-f64 (make string! "a value the factory preset omits is untouched") state/gain 1.0
+
+out-of-range: preset-factory-apply :demo-engine :core 7
+expect-f64 (make string! "an out-of-range bank index applies nothing") (make f64! out-of-range) 0.0
+
+; --- strict isolated preparation -------------------------------------------
+
+valid-complete: make string! {Recoil-Preset [
+    name: "Complete"
+    version: 1
+    plugin: "preset-demo"
+    params: [
+        filter-cutoff: 250.0
+        oscillator-1-odd-level: 0.75
+        global-mode: 2.0
+    ]
+]
+}
+prepared: make [#mutable preset-snapshot!] none
+expect-true (make string! "complete preset validates")
+    (preset-prepare :demo-engine :valid-complete (addr-of prepared))
+expect-f64 (make string! "complete preset fills canonical parameter count")
+    (make f64! prepared/count) 3.0
+expect-f64 (make string! "complete preset stores first parameter")
+    (make f64! prepared/values/0) 250.0
+expect-f64 (make string! "complete preset stores discrete parameter")
+    (make f64! prepared/values/2) 2.0
+expect-true (make string! "complete prepared snapshot applies")
+    (preset-snapshot-apply :demo-engine :core (addr-of prepared))
+expect-f64 (make string! "validated snapshot writes the first parameter") state/cutoff 250.0
+expect-f64 (make string! "validated snapshot writes the second parameter") state/gain 0.75
+expect-f64 (make string! "validated snapshot writes the discrete parameter") state/mode 2.0
+prepared/values/2: 1.5
+expect-true (make string! "invalid snapshot is rejected before any setter runs")
+    not (preset-snapshot-apply :demo-engine :core (addr-of prepared))
+expect-f64 (make string! "invalid snapshot leaves earlier parameter untouched") state/cutoff 250.0
+expect-f64 (make string! "invalid snapshot leaves middle parameter untouched") state/gain 0.75
+expect-f64 (make string! "invalid snapshot leaves later parameter untouched") state/mode 2.0
+
+quoted-name-text: make string! {Recoil-Preset [
+    name: "Quoted \"Patch\" Name"
+    version: 1
+    plugin: "preset-demo"
+    params: [filter-cutoff: 500.0]
+]
+}
+expect-text (make string! "quoted metadata escapes are decoded")
+    (preset-name-of :quoted-name-text) (make string! {Quoted "Patch" Name})
+expect-true (make string! "escaped display name remains a valid preset")
+    (preset-prepare :demo-engine :quoted-name-text (addr-of prepared))
+
+sparse-text: make string! {Recoil-Preset [
+    name: "Sparse"
+    version: 1
+    plugin: "preset-demo"
+    params: [filter-cutoff: 500.0]
+]
+}
+prepared/values/1: 0.125
+prepared/values/2: 2.0
+expect-true (make string! "sparse preset validates")
+    (preset-prepare :demo-engine :sparse-text (addr-of prepared))
+expect-f64 (make string! "sparse preset fills omitted parameter default")
+    (make f64! prepared/values/1) 0.5
+expect-f64 (make string! "sparse preset fills omitted discrete default")
+    (make f64! prepared/values/2) 0.0
+
+unknown-text: make string! {Recoil-Preset [
+    name: "Unknown key"
+    version: 1
+    plugin: "preset-demo"
+    params: [future-parameter: 99.0 filter-cutoff: 750.0]
+]
+}
+expect-true (make string! "unknown parameter is ignored while known values parse")
+    (preset-prepare :demo-engine :unknown-text (addr-of prepared))
+
+duplicate-text: make string! {Recoil-Preset [
+    name: "Duplicate"
+    version: 1
+    plugin: "preset-demo"
+    params: [filter-cutoff: 250.0 filter-cutoff: 500.0]
+]
+}
+expect-true (make string! "duplicate parameter key rejects whole preset")
+    not (preset-prepare :demo-engine :duplicate-text (addr-of prepared))
+
+malformed-text: make string! {Recoil-Preset [
+    name: "Malformed"
+    version: 1
+    plugin: "preset-demo"
+    params: [filter-cutoff: 250.0
+}
+expect-true (make string! "truncated preset rejects whole input")
+    not (preset-prepare :demo-engine :malformed-text (addr-of prepared))
+
+wrong-plugin-text: make string! {Recoil-Preset [
+    name: "Wrong product"
+    version: 1
+    plugin: "other-product"
+    params: []
+]
+}
+expect-true (make string! "wrong product identity rejects preset")
+    not (preset-prepare :demo-engine :wrong-plugin-text (addr-of prepared))
+
+non-finite-text: make string! {Recoil-Preset [
+    name: "Overflow number"
+    version: 1
+    plugin: "preset-demo"
+    params: [filter-cutoff: 1e999]
+]
+}
+expect-true (make string! "non-finite numeric value rejects preset")
+    not (preset-prepare :demo-engine :non-finite-text (addr-of prepared))
+
+out-of-range-text: make string! {Recoil-Preset [
+    name: "Out of range"
+    version: 1
+    plugin: "preset-demo"
+    params: [filter-cutoff: 20001.0]
+]
+}
+expect-true (make string! "out of range value rejects preset")
+    not (preset-prepare :demo-engine :out-of-range-text (addr-of prepared))
+
+discrete-text: make string! {Recoil-Preset [
+    name: "Fractional mode"
+    version: 1
+    plugin: "preset-demo"
+    params: [global-mode: 1.5]
+]
+}
+expect-true (make string! "non-discrete step value rejects preset")
+    not (preset-prepare :demo-engine :discrete-text (addr-of prepared))
+
+oversized-text: make [#flexible [string! 16385]] none
+repeat long-index 16385 [append oversized-text #"x"]
+expect-true (make string! "oversized preset rejects before parsing")
+    not (preset-prepare :demo-engine :oversized-text (addr-of prepared))
+
+state/cutoff: 4321.0
+state/gain: 0.375
+expect-true (make string! "invalid prepare leaves engine parameter state unchanged")
+    not (preset-prepare :demo-engine :out-of-range-text (addr-of prepared))
+expect-f64 (make string! "invalid prepare did not mutate current engine") state/cutoff 4321.0
+expect-f64 (make string! "invalid prepare preserved other engine values") state/gain 0.375
+
+unsafe/free :core
+unsafe/free :info
+print rejoin ["checks " checks " failures " failures]

@@ -1,0 +1,216 @@
+Recoil [
+    Title: "brom-state-load/-save/-save-context sniff format and pick the plain-save shape"
+    Type: module
+    Module: recoil-brom/test/state-dispatch-test
+    Imports: [
+        brom/plugin/engine [engine! param-info!]
+        brom/plugin/values [param-range! param-linear]
+        brom/plugin/preset [preset-cstr-view! preset-format]
+        brom/plugin/state/dispatch [brom-state-load brom-state-save brom-state-save-context]
+    ]
+    Exports: []
+]
+
+checks: make [#mutable i32!] 0
+failures: make [#mutable i32!] 0
+
+expect: func [
+    :label [string!]
+    actual [logic!]
+    expected [logic!]
+    return: [none!]
+] [
+    checks: checks + 1
+    either actual = expected [
+        print rejoin ["PASS " label]
+    ] [
+        failures: failures + 1
+        print rejoin ["FAIL " label " -- got " actual " want " expected]
+    ]
+    return none
+]
+
+; --- a two-parameter fixture, one ASCII plain-save, one binary --------------
+
+fixture-core!: make c-struct! [values: [c-array! [f64! 2]]]
+
+fixture-param-info: func [
+    index [i32!]
+    :out [c-pointer!]
+    return: [logic!]
+] [
+    if any [index < 0 index >= 2] [return false]
+    info: make [#mutable param-info!] as param-info! :out
+    info/id: as u32! index
+    info/name: either index = 0 [as c-string! "Alpha"] [as c-string! "Beta"]
+    info/module: as c-string! ""
+    info/default-value: (as f64! index) * 5.0
+    info/range: make param-range! [
+        lo: 0.0 hi: 1000.0 skew: 1.0 symmetric: 0 steps: 0 kind: 0
+    ]
+    return true
+]
+
+fixture-get-param: func [
+    :core [c-pointer!]
+    id [u32!]
+    return: [f64!]
+] [
+    state: make [#mutable fixture-core!] as fixture-core! :core
+    if id >= (as u32! 2) [return 0.0]
+    return state/values/(as i32! id)
+]
+
+fixture-set-param: func [
+    :core [c-pointer!]
+    id [u32!]
+    value [f64!]
+    return: [logic!]
+] [
+    state: make [#mutable fixture-core!] as fixture-core! :core
+    if id >= (as u32! 2) [return false]
+    state/values/(as i32! id): value
+    return true
+]
+
+ascii-engine: make engine! [
+    id: (as c-string! "com.recoil-brom.test.dispatch-ascii")
+    name: (as c-string! "Dispatch ASCII")
+    vendor: (as c-string! "Recoil")
+    version: (as c-string! "0.0.0")
+    description: (as c-string! "state-dispatch-test ASCII fixture")
+    param-count: 2
+    max-voices: 0
+    state-size: 4096
+    output-capacity: 0
+    editor-width: 0
+    editor-height: 0
+    param-info-fn: :fixture-param-info
+    get-param-fn: :fixture-get-param
+    set-param-fn: :fixture-set-param
+    state-subsystem: 0#41585946
+    state-version: 1
+    state-save-ascii: true
+]
+
+binary-engine: make engine! [
+    id: (as c-string! "com.recoil-brom.test.dispatch-binary")
+    name: (as c-string! "Dispatch Binary")
+    vendor: (as c-string! "Recoil")
+    version: (as c-string! "0.0.0")
+    description: (as c-string! "state-dispatch-test binary fixture")
+    param-count: 2
+    max-voices: 0
+    state-size: 36
+    output-capacity: 0
+    editor-width: 0
+    editor-height: 0
+    param-info-fn: :fixture-param-info
+    get-param-fn: :fixture-get-param
+    set-param-fn: :fixture-set-param
+    state-subsystem: 0#42585946
+    state-version: 1
+    state-save-ascii: false
+]
+
+; --- ASCII round trip ---------------------------------------------------------
+
+a-core: make c-pointer! unsafe/malloc (as i32! size-of fixture-core!)
+unsafe/memset a-core 0 (as i32! size-of fixture-core!)
+fixture-set-param a-core (as u32! 0) 12.0
+fixture-set-param a-core (as u32! 1) 34.0
+
+ascii-buf: make c-pointer! unsafe/malloc 4096
+unsafe/memset ascii-buf 0 4096
+ascii-saved: brom-state-save :ascii-engine a-core ascii-buf (as size! 4096)
+expect (make string! "brom-state-save picks ASCII for state-save-ascii true") ascii-saved true
+
+fixture-set-param a-core (as u32! 0) 0.0
+fixture-set-param a-core (as u32! 1) 0.0
+ascii-loaded: brom-state-load :ascii-engine a-core ascii-buf (as size! 4096)
+expect (make string! "brom-state-load sniffs ASCII text and applies it") ascii-loaded true
+expect (make string! "ASCII round trip: Alpha")
+    ((fixture-get-param a-core (as u32! 0)) = 12.0) true
+expect (make string! "ASCII round trip: Beta")
+    ((fixture-get-param a-core (as u32! 1)) = 34.0) true
+
+; A value left at its default is omitted from preset text, so loading over a
+; non-default instance must reset first -- this is the behaviour that differs
+; from calling preset-apply directly. Re-save with Alpha at its default (0.0,
+; so the text omits it entirely) and Beta away from its default (so the text
+; keeps that key) -- only then does the reset-before-apply step matter to the
+; outcome; preset-apply alone would leave a stale, unmentioned Alpha alone.
+fixture-set-param a-core (as u32! 0) 0.0
+fixture-set-param a-core (as u32! 1) 40.0
+unsafe/memset ascii-buf 0 4096
+sparse-saved: brom-state-save :ascii-engine a-core ascii-buf (as size! 4096)
+expect (make string! "brom-state-save omits a default-valued parameter from the saved text") sparse-saved true
+
+fixture-set-param a-core (as u32! 0) 999.0
+brom-state-load :ascii-engine a-core ascii-buf (as size! 4096)
+expect (make string! "brom-state-load resets a parameter the text omits back to default")
+    ((fixture-get-param a-core (as u32! 0)) = 0.0) true
+expect (make string! "brom-state-load still applies the parameter the text does mention")
+    ((fixture-get-param a-core (as u32! 1)) = 40.0) true
+
+; --- binary round trip ---------------------------------------------------------
+
+b-core: make c-pointer! unsafe/malloc (as i32! size-of fixture-core!)
+unsafe/memset b-core 0 (as i32! size-of fixture-core!)
+fixture-set-param b-core (as u32! 0) 1.25
+fixture-set-param b-core (as u32! 1) 2.75
+
+binary-buf: make c-pointer! unsafe/malloc 36
+unsafe/memset binary-buf 0 36
+binary-saved: brom-state-save :binary-engine b-core binary-buf (as size! 36)
+expect (make string! "brom-state-save picks binary for state-save-ascii false") binary-saved true
+
+fixture-set-param b-core (as u32! 0) 0.0
+fixture-set-param b-core (as u32! 1) 0.0
+binary-loaded: brom-state-load :binary-engine b-core binary-buf (as size! 36)
+expect (make string! "brom-state-load sniffs the BROM prefix and applies it") binary-loaded true
+expect (make string! "binary round trip: param 0")
+    ((fixture-get-param b-core (as u32! 0)) = 1.25) true
+expect (make string! "binary round trip: param 1")
+    ((fixture-get-param b-core (as u32! 1)) = 2.75) true
+
+; --- neither shape is rejected -------------------------------------------------
+
+junk: make c-pointer! unsafe/malloc 16
+unsafe/memset junk 0 16
+rejected: brom-state-load :binary-engine b-core junk (as size! 16)
+expect (make string! "a blob opening with neither R nor BROM is rejected") rejected false
+
+; --- save-context byte counts ---------------------------------------------------
+
+preset-buf: make c-pointer! unsafe/malloc 4096
+unsafe/memset preset-buf 0 4096
+preset-written: brom-state-save-context :ascii-engine a-core preset-buf (as size! 4096) 1
+expected-preset-text: preset-format :ascii-engine a-core (make string! "preset")
+expect (make string! "FOR_PRESET on an ASCII engine reports the exact preset text byte count")
+    (preset-written = (as size! ((length? expected-preset-text) + 1))) true
+
+project-buf: make c-pointer! unsafe/malloc 36
+unsafe/memset project-buf 0 36
+project-written: brom-state-save-context :binary-engine b-core project-buf (as size! 36) 3
+expect (make string! "FOR_PROJECT on a binary engine reports exactly state-size")
+    (project-written = (as size! 36)) true
+
+context-preset-buf: make c-pointer! unsafe/malloc 4096
+unsafe/memset context-preset-buf 0 4096
+binary-preset-written: brom-state-save-context :binary-engine b-core context-preset-buf (as size! 4096) 1
+expect (make string! "FOR_PRESET is ASCII even for a binary-plain-save engine")
+    (binary-preset-written > (as size! 0)) true
+context-preset-head: make [#mutable preset-cstr-view!] as preset-cstr-view! context-preset-buf
+expect (make string! "FOR_PRESET's ASCII text starts with the preset header marker")
+    ((as char! context-preset-head/bytes/0) = #"R") true
+
+unsafe/free a-core
+unsafe/free b-core
+unsafe/free ascii-buf
+unsafe/free binary-buf
+unsafe/free junk
+unsafe/free preset-buf
+unsafe/free project-buf
+unsafe/free context-preset-buf
+print rejoin ["checks " checks " failures " failures]

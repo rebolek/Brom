@@ -1,0 +1,8 @@
+Recoil-Project [
+    Name: recoil-brom-bench
+    Version: 0.1.0
+    ; The spike is deliberately self-contained -- it declares its own math.h
+    ; foreign block and mirrors the Rust hot loop directly, so that what it
+    ; measures is Recoil codegen rather than any brom/ abstraction.
+    Dependencies: []
+]

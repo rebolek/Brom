@@ -1,0 +1,250 @@
+Recoil [
+    Title: "Loos factory preset bank"
+    Description: {
+        Twelve patches, in the format-neutral Brom preset text CLAP, VST3 and
+        AUv2 all read. There is no per-format copy and no struct restating the
+        schema: brom/plugin/preset drives everything from the engine
+        descriptor, and a preset says only what it changes from the defaults.
+
+        The bank is small on purpose. Loos is the instrument the namesake note
+        calls a reduction to purposeful structure, and a bank that padded
+        itself out with variations would be exactly the applied ornament the
+        name argues against. Each patch here is the shortest demonstration of
+        one thing the mechanism can do, and no two demonstrate the same thing:
+        the two ends of Shape, the one contour used as a pluck and as a pad,
+        both directions of the bipolar amount, the register the permanent sub
+        carries, per-voice modulation, and resonance near self-oscillation.
+
+        Names come from Loos' own buildings and interiors where the patch has
+        an argument for one, and say what they do where it does not.
+    }
+    Type: module
+    Module: examples/pokuston/loos/presets
+    Imports: []
+    Exports: [LOOS-FACTORY-PRESET-COUNT loos-factory-preset]
+]
+
+LOOS-FACTORY-PRESET-COUNT: make i32! 12
+
+loos-factory-presets: make [array! [string!]] [
+{Recoil-Preset [
+    name: "Raumplan"
+    key: "raumplan"
+    description: "The default voicing stated as a patch: one contour opening each voice's own filter."
+    features: [init default balanced]
+    version: 1
+    plugin: "loos"
+    params: []
+]}
+{Recoil-Preset [
+    name: "Villa Muller"
+    key: "villa-muller"
+    description: "Sustained saw pad, filter opening slowly with the contour. The plain exterior."
+    features: [pad sustained saw warm]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 420.0
+        filter-resonance: 0.22
+        filter-env-amount: 2.4
+        envelope-attack: 0.85
+        envelope-decay: 1.60
+        envelope-sustain: 0.85
+        envelope-release: 1.40
+        oscillator-shape: 1.0
+    ]
+]}
+{Recoil-Preset [
+    name: "Cafe Museum"
+    key: "cafe-museum"
+    description: "Triangle at the other end of Shape: hollow, quiet, nothing added."
+    features: [triangle soft mellow sustained]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 2400.0
+        filter-resonance: 0.05
+        filter-env-amount: 0.4
+        envelope-attack: 0.32
+        envelope-decay: 0.80
+        envelope-sustain: 0.90
+        envelope-release: 0.70
+        oscillator-shape: 0.5
+    ]
+]}
+{Recoil-Preset [
+    name: "Steiner Pluck"
+    key: "steiner-pluck"
+    description: "One contour used as a pluck: fast decay to nothing, filter following it down."
+    features: [pluck percussive short bright]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 320.0
+        filter-resonance: 0.45
+        filter-env-amount: 3.6
+        envelope-attack: 0.001
+        envelope-decay: 0.22
+        envelope-sustain: 0.0
+        envelope-release: 0.18
+        oscillator-shape: 1.0
+    ]
+]}
+{Recoil-Preset [
+    name: "Looshaus"
+    key: "looshaus"
+    description: "Firm saw lead with a short bright edge that settles into the body of the note."
+    features: [lead saw bright mid]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 900.0
+        filter-resonance: 0.30
+        filter-env-amount: 2.0
+        envelope-attack: 0.004
+        envelope-decay: 0.35
+        envelope-sustain: 0.55
+        envelope-release: 0.30
+        oscillator-shape: 0.92
+    ]
+]}
+{Recoil-Preset [
+    name: "Inverse Room"
+    key: "inverse-room"
+    description: "A negative amount: the voice darkens as it grows louder, and opens as it falls away."
+    features: [inverted dark expressive unusual]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 5200.0
+        filter-resonance: 0.28
+        filter-env-amount: -3.2
+        envelope-attack: 0.02
+        envelope-decay: 0.55
+        envelope-sustain: 0.70
+        envelope-release: 0.60
+        oscillator-shape: 1.0
+    ]
+]}
+{Recoil-Preset [
+    name: "Tristan Tzara"
+    key: "tristan-tzara"
+    description: "Sharply inverted: a bright transient that closes to a dark held tone."
+    features: [inverted transient dark percussive]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 7000.0
+        filter-resonance: 0.52
+        filter-env-amount: -4.0
+        envelope-attack: 0.001
+        envelope-decay: 0.14
+        envelope-sustain: 0.55
+        envelope-release: 0.35
+        oscillator-shape: 1.0
+    ]
+]}
+{Recoil-Preset [
+    name: "Knize Bass"
+    key: "knize-bass"
+    description: "Filter closed to the lower register, where the permanent sub does the work."
+    features: [bass sub dark short]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 180.0
+        filter-resonance: 0.35
+        filter-env-amount: 1.2
+        envelope-attack: 0.002
+        envelope-decay: 0.30
+        envelope-sustain: 0.45
+        envelope-release: 0.22
+        oscillator-shape: 1.0
+    ]
+]}
+{Recoil-Preset [
+    name: "Cellar Octave"
+    key: "cellar-octave"
+    description: "A triangle low enough that the octave below it is most of what is heard."
+    features: [sub low triangle sustained]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 260.0
+        filter-resonance: 0.12
+        filter-env-amount: 0.6
+        envelope-attack: 0.05
+        envelope-decay: 0.90
+        envelope-sustain: 0.80
+        envelope-release: 0.55
+        oscillator-shape: 0.55
+    ]
+]}
+{Recoil-Preset [
+    name: "Four Rooms"
+    key: "four-rooms"
+    description: "Slow modulation on voices that each own their filter, so a held chord never moves as one."
+    features: [lfo movement chord evolving]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 700.0
+        filter-resonance: 0.40
+        filter-env-amount: 1.0
+        envelope-attack: 0.40
+        envelope-decay: 1.20
+        envelope-sustain: 0.85
+        envelope-release: 1.10
+        lfo-rate: 0.35
+        lfo-cutoff-depth: 0.55
+        oscillator-shape: 0.78
+    ]
+]}
+{Recoil-Preset [
+    name: "Ornament And Crime"
+    key: "ornament-and-crime"
+    description: "Fast modulation with a hard edge: the one patch that wears its decoration outside."
+    features: [lfo fast aggressive bright]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 480.0
+        filter-resonance: 0.62
+        filter-env-amount: 2.8
+        envelope-attack: 0.001
+        envelope-decay: 0.45
+        envelope-sustain: 0.40
+        envelope-release: 0.25
+        lfo-rate: 6.5
+        lfo-cutoff-depth: 0.80
+        oscillator-shape: 1.0
+    ]
+]}
+{Recoil-Preset [
+    name: "Whistle Point"
+    key: "whistle-point"
+    description: "Resonance near self-oscillation, where four separate ladders are least like one."
+    features: [resonant sharp narrow lead]
+    version: 1
+    plugin: "loos"
+    params: [
+        filter-cutoff: 640.0
+        filter-resonance: 0.94
+        filter-env-amount: 2.2
+        envelope-attack: 0.006
+        envelope-decay: 0.40
+        envelope-sustain: 0.35
+        envelope-release: 0.28
+        oscillator-shape: 0.68
+    ]
+]}
+]
+
+loos-factory-preset: func [
+    "Return one factory preset's Brom preset text by bank index."
+    index [i32!] "Zero-based factory-bank index."
+    return: [string!] "Borrowed preset text, empty when out of range."
+] [
+    if any [index < 0 index >= LOOS-FACTORY-PRESET-COUNT] [return make string! ""]
+    return loos-factory-presets/:index
+]

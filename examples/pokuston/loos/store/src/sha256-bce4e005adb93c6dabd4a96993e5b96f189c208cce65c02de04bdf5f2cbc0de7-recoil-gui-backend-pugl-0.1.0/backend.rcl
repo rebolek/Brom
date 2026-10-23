@@ -1,0 +1,6 @@
+Recoil [
+    Title: "Recoil GUI Pugl backend marker"
+    Type: module
+    Module: recoil/gui/backend/pugl
+    Exports: []
+]

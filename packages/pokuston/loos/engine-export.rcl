@@ -1,0 +1,23 @@
+Recoil [
+    Title: "Loos engine export"
+    Description: {
+        The symbol Brom's plug-in shells link against: every plug-in binary
+        exports exactly one brom-engine-ptr, pointing at its descriptor.
+
+        It lives here rather than in plugin.rcl so that the descriptor can be
+        imported without it. A program that plays several Brom synths at once,
+        such as the sequencer's ensemble, imports each plugin module; Recoil
+        puts every module's top-level names in one namespace, so a
+        brom-engine-ptr in each of them would collide. Only the shells import
+        this module.
+    }
+    Type: module
+    Module: examples/pokuston/loos/engine-export
+    Imports: [
+        examples/pokuston/loos/plugin [loos-brom-engine]
+    ]
+    Exports: []
+]
+
+#export [brom-engine-ptr]
+brom-engine-ptr: make c-pointer! addr-of loos-brom-engine

@@ -1,0 +1,751 @@
+Recoil [
+    Title: "Pokuston Loos instance-safe synth and parameter core"
+    Type: module
+    Module: examples/pokuston/loos/core
+    Imports: [
+        brom/dsp/utils [brom-clamp-f64 brom-sanitize-f64]
+        brom/dsp/filter [brom-ladder! brom-ladder-reset brom-ladder-tick]
+        brom/dsp/oscillator [
+            brom-blamp-table! brom-blamp-table-fill
+            brom-morph-osc! brom-morph-osc-reset brom-morph-osc-set-phase
+            brom-morph-osc-tick
+        ]
+        brom/dsp/envelope [
+            adsr-config! adsr-envelope!
+            adsr-config-brom
+            adsr-reset adsr-trigger adsr-release adsr-tick adsr-active? adsr-level
+        ]
+        brom/plugin/state/codec [
+            state-codec-size state-codec-write-header state-codec-read-count
+            state-codec-write-f64 state-codec-read-f64
+        ]
+    ]
+    Exports: [
+        LOOS_MAX_VOICES LOOS_MAX_BLOCK
+        LOOS_PARAM_CUTOFF LOOS_PARAM_RESONANCE LOOS_PARAM_ENV_AMOUNT
+        LOOS_PARAM_ATTACK LOOS_PARAM_DECAY LOOS_PARAM_SUSTAIN LOOS_PARAM_RELEASE
+        LOOS_PARAM_LFO_RATE LOOS_PARAM_LFO_CUTOFF_DEPTH LOOS_PARAM_MORPH
+        LOOS_PARAM_COUNT
+        LOOS_STATE_MAGIC LOOS_STATE_SCHEMA
+        loos-create loos-destroy loos-activate loos-reset
+        loos-voice-state loos-note-on loos-note-off loos-process-block
+        loos-output loos-output-capacity
+        loos-get-parameter loos-set-parameter
+        loos-parameter-min loos-parameter-max loos-parameter-default
+        loos-parameter-to-normalized loos-parameter-from-normalized
+        loos-state-size loos-save-state loos-load-state
+    ]
+]
+
+math-ffi: foreign <math.h> [
+    log: "log" [f64! return: [f64!]]
+    exp: "exp" [f64! return: [f64!]]
+    sin: "sin" [f64! return: [f64!]]
+]
+
+; Ten parameters, not thirteen, and the ids below id 2 are the only ones that
+; still mean what they meant in schema 1. The four filter-envelope stages are
+; gone: there is one contour per voice now, and one bipolar amount saying what
+; else it does besides make the voice louder. Because ids changed meaning
+; rather than merely moving, LOOS_STATE_VERSION goes to 2 and an older blob is
+; refused outright rather than reinterpreted.
+LOOS_PARAM_CUTOFF: 0
+LOOS_PARAM_RESONANCE: 1
+; Bipolar, in octaves. Positive opens a voice's filter as it grows louder,
+; negative darkens it, nought leaves cutoff where the Cutoff control put it.
+LOOS_PARAM_ENV_AMOUNT: 2
+LOOS_PARAM_ATTACK: 3
+LOOS_PARAM_DECAY: 4
+LOOS_PARAM_SUSTAIN: 5
+LOOS_PARAM_RELEASE: 6
+LOOS_PARAM_LFO_RATE: 7
+LOOS_PARAM_LFO_CUTOFF_DEPTH: 8
+LOOS_PARAM_MORPH: 9
+LOOS_PARAM_COUNT: 10
+LOOS_CUTOFF_MIN: 20.0
+LOOS_CUTOFF_MAX: 18000.0
+LOOS_CUTOFF_DEFAULT: 1200.0
+LOOS_RESONANCE_MIN: 0.0
+LOOS_RESONANCE_MAX: 1.0
+LOOS_RESONANCE_DEFAULT: 0.15
+; Fraction of a cycle the ramp spends rising: a half is a triangle, the whole
+; of it a sawtooth. The default is the sawtooth, so a patch that predates the
+; control sounds as it always did.
+LOOS_MORPH_MIN: 0.5
+LOOS_MORPH_MAX: 1.0
+LOOS_MORPH_DEFAULT: 1.0
+
+; --- the imperfections -------------------------------------------------------
+; A digital oscillator is exactly periodic forever and every voice of it is
+; exactly the same oscillator. Neither was ever true of the instruments this
+; one is shaped after, and the difference is most of what "sounds synthetic"
+; means: notes whose attack transient is identical every time, and chords whose
+; voices sit so precisely in tune that nothing beats between them.
+;
+; Three fixed, seeded departures from that, all per voice slot. Nothing here is
+; random at run time -- a render has to be reproducible byte for byte -- but
+; nothing here is shared between slots either.
+
+; Natural log of two over twelve hundred: cents to a frequency ratio.
+LOOS_CENT_RATIO: 0.0005776226504666211
+; Spread of the fixed per-slot detune, in cents either side of true. Each voice
+; is a separate oscillator card and no two were ever trimmed alike.
+LOOS_DETUNE_CENTS: 4.0
+; Depth of the slow wander, in cents. Two sine motions at rates that share no
+; common period stand in for it: bounded, smooth, and repeatable, where a
+; filtered noise source is only the first two.
+LOOS_DRIFT_CENTS: 3.0
+; Samples between drift updates. Counted per voice rather than per block, so
+; the wander is identical however the host chooses to carve up its buffers --
+; a block-rate counter would drift at a rate set by the buffer size and break
+; every reproducibility test in the validator.
+LOOS_DRIFT_PERIOD: 64
+LOOS_TAU: 6.283185307179586
+LOOS_ENVELOPE_TIME_MIN: 0.001
+LOOS_ENVELOPE_TIME_MAX: 5.0
+LOOS_ATTACK_DEFAULT: 0.01
+LOOS_DECAY_DEFAULT: 0.20
+LOOS_SUSTAIN_DEFAULT: 0.80
+LOOS_RELEASE_DEFAULT: 0.25
+; Octaves of cutoff movement at full articulation, either direction.
+LOOS_ENV_AMOUNT_MIN: -4.0
+LOOS_ENV_AMOUNT_MAX: 4.0
+; Deliberately not the 3.0 the old fixed filter-envelope depth used. That depth
+; multiplied a contour whose sustain defaulted to nought -- a blip that decayed
+; away -- while articulation sustains at 0.8, so carrying 3.0 over would leave
+; every held note two and a half octaves brighter than Loos has ever been.
+LOOS_ENV_AMOUNT_DEFAULT: 1.5
+LOOS_LFO_RATE_MIN: 0.05
+LOOS_LFO_RATE_MAX: 20.0
+LOOS_LFO_RATE_DEFAULT: 2.0
+LOOS_LFO_CUTOFF_DEPTH_DEFAULT: 0.0
+LOOS_MAX_VOICES: 4
+LOOS_MAX_BLOCK: 512
+
+; --- the lower register ------------------------------------------------------
+; An inseparable octave below the main oscillator: no level, tuning, waveform,
+; routing or enable control, because it is not a second oscillator the player
+; chooses to add. It is the lower level of one designed volume, and the whole
+; point is that it is always there.
+;
+; It is the SAME morph oscillator at half the step with its morph pinned to the
+; triangle end, rather than a sub read from the primary's live phase. That is
+; not a convenience: brom-morph-osc-tick trails its input by BROM-BLAMP-HALF
+; samples, so a sub taken from the live phase would arrive a third of a
+; millisecond AHEAD of the primary and comb against it. Running it through the
+; same tick gives it the same delay, and the same band-limiting, for nothing.
+LOOS_SUB_LEVEL: 0.35
+; Reciprocal of one plus the sub level, so a permanently present second source
+; does not simply raise the instrument by two and a half decibels and quietly
+; invalidate every headroom measurement the render test makes.
+LOOS_SUB_MIX: 0.7407407407407407
+LOOS_EDIT_BEGIN: 0
+LOOS_EDIT_CHANGE: 1
+LOOS_EDIT_END: 2
+loos-voice!: make c-struct! [
+    active: [logic!]
+    gate: [logic!]
+    ; Note-on sequence number, so Brom's allocator can break a tie and steal
+    ; the oldest voice when every key is held. Not serialized -- LOOS_STATE_SIZE
+    ; covers parameters only, so adding it moves no saved patch.
+    age: [i64!]
+    oscillator: [brom-morph-osc!]
+    ; The always-present octave below, stepped at half the primary's rate from
+    ; the same starting phase, so the two are one voice rather than two.
+    sub-oscillator: [brom-morph-osc!]
+    ; This voice's own ladder. The doc's Raumplan reading, and the reason the
+    ; filter-envelope maximum that used to arbitrate four contours into one
+    ; shared cutoff is gone: a new note now enters beside sustained notes
+    ; instead of imposing its filter position on all of them.
+    filter: [brom-ladder!]
+    detune: [f64!]
+    drift-rate-a: [f64!]
+    drift-rate-b: [f64!]
+    drift-phase-a: [f64!]
+    drift-phase-b: [f64!]
+    drift-counter: [i32!]
+    ; Detune and drift folded into one multiplier, refreshed with them. The
+    ; per-sample path is a multiply; the exponential runs once every
+    ; LOOS_DRIFT_PERIOD samples.
+    pitch-ratio: [f64!]
+    frequency: [f64!]
+    velocity: [f64!]
+    ; One contour with more than one consequence -- loudness and colour are two
+    ; readings of the same performed gesture, not two temporal processes.
+    envelope: [adsr-envelope!]
+]
+loos-state!: make c-struct! [
+    sample-rate: [f64!]
+    cutoff: [f64!]
+    resonance: [f64!]
+    ; Octaves of cutoff per unit of articulation, signed.
+    env-amount: [f64!]
+    envelope-config: [adsr-config!]
+    lforate: [f64!]
+    lfocutoffdepth: [f64!]
+    lfophase: [f64!]
+    morph: [f64!]
+    ; One correction table for the instance rather than one per voice: it is
+    ; read-only once built and identical for every voice and every pitch. It
+    ; does not depend on the sample rate either, which is why it is built at
+    ; create and never again -- there is nothing for loos-activate to redo.
+    blamp: [brom-blamp-table!]
+    voices: [c-array! [loos-voice! 4]]
+    next-age: [i64!]
+    output: [c-array! [f64! 512]]
+]
+
+
+loos-fractional: func [
+    "Fractional part of a non-negative value."
+    value [f64!] "Value at or above zero."
+    return: [f64!] "Value less its whole part, in nought to one."
+] [
+    return value - (as f64! (as i64! value))
+]
+
+loos-slot-phase: func [
+    "The starting phase one voice slot owns, so no two begin together."
+    index [i32!] "Voice slot."
+    return: [f64!] "Phase in nought to one, distinct per slot."
+] [
+    ; Golden-ratio spacing rather than even quarters: four voices a quarter
+    ; cycle apart are still in a fixed relationship with each other, and the
+    ; point is that they should not be.
+    return loos-fractional ((as f64! index) * 0.6180339887498949)
+]
+
+loos-wrap-unit: func [
+    "Wrap a rising phase back into nought-to-one."
+    value [f64!] "Phase in cycles, at most a little above one."
+    return: [f64!] "Equivalent phase below one."
+] [
+    return either value >= 1.0 [value - 1.0] [value]
+]
+
+; --- the one range table -----------------------------------------------------
+; The engine states every range once, here. The host-facing schema asks rather
+; than keeping a copy, and the clamp below asks too, so a range cannot be
+; changed in one place and left stale in another. It used to be stated three
+; times: this clamp, a PARAM_MIN_*/PARAM_MAX_* pair in the CLAP entry, and the
+; normalization functions further down.
+
+loos-parameter-min: func [
+    "The low end of one parameter's engineering-unit range."
+    #export
+    parameter [u32!] "Loos parameter identifier."
+    return: [f64!] "Range minimum, or nought for an unknown id."
+] [
+    if parameter = LOOS_PARAM_CUTOFF [return LOOS_CUTOFF_MIN]
+    if parameter = LOOS_PARAM_RESONANCE [return LOOS_RESONANCE_MIN]
+    if parameter = LOOS_PARAM_ENV_AMOUNT [return LOOS_ENV_AMOUNT_MIN]
+    if any [
+        parameter = LOOS_PARAM_ATTACK
+        parameter = LOOS_PARAM_DECAY
+        parameter = LOOS_PARAM_RELEASE
+    ] [return LOOS_ENVELOPE_TIME_MIN]
+    if parameter = LOOS_PARAM_LFO_RATE [return LOOS_LFO_RATE_MIN]
+    if parameter = LOOS_PARAM_MORPH [return LOOS_MORPH_MIN]
+    return 0.0
+]
+
+loos-parameter-max: func [
+    "The high end of one parameter's engineering-unit range."
+    #export
+    parameter [u32!] "Loos parameter identifier."
+    return: [f64!] "Range maximum, or nought for an unknown id."
+] [
+    if parameter = LOOS_PARAM_CUTOFF [return LOOS_CUTOFF_MAX]
+    if parameter = LOOS_PARAM_RESONANCE [return LOOS_RESONANCE_MAX]
+    if parameter = LOOS_PARAM_ENV_AMOUNT [return LOOS_ENV_AMOUNT_MAX]
+    if any [
+        parameter = LOOS_PARAM_ATTACK
+        parameter = LOOS_PARAM_DECAY
+        parameter = LOOS_PARAM_RELEASE
+    ] [return LOOS_ENVELOPE_TIME_MAX]
+    if parameter = LOOS_PARAM_LFO_RATE [return LOOS_LFO_RATE_MAX]
+    if parameter = LOOS_PARAM_MORPH [return LOOS_MORPH_MAX]
+    if parameter >= (as u32! LOOS_PARAM_COUNT) [return 0.0]
+    ; Sustain and LFO depth are both plain fractions.
+    return 1.0
+]
+
+parameter-value: func [
+    "Clamp a physical parameter value into its declared range."
+    parameter [u32!] "Loos parameter identifier."
+    value [f64!] "Physical parameter value."
+    return: [f64!] "Clamped physical value, or the value itself when unknown."
+] [
+    if parameter >= (as u32! LOOS_PARAM_COUNT) [return value]
+    return brom-clamp-f64 value (loos-parameter-min parameter) (loos-parameter-max parameter)
+]
+
+reset-filters: func [
+    "Clear every voice's filter history for one synth instance."
+    raw [c-pointer!] "Opaque Loos instance."
+    return: [none!] "No value."
+] [
+    state: make [#mutable loos-state!] as loos-state! raw
+    repeat index LOOS_MAX_VOICES [
+        voice: make [#mutable loos-voice!] as loos-voice! (addr-of state/voices/:index)
+        brom-ladder-reset (addr-of voice/filter)
+    ]
+    return none
+]
+
+
+tick-voice: func [
+    "Render and advance one whole voice: its contour, both oscillators and its own filter."
+    raw [c-pointer!] "Opaque Loos instance."
+    index [i32!] "Voice index from zero through three."
+    lfo [f64!] "This sample's shared LFO value, in minus one to one."
+    return: [f64!] "This voice's filtered contribution to the mix."
+] [
+    state: make [#mutable loos-state!] as loos-state! raw
+    voice: make [#mutable loos-voice!] as loos-voice! (addr-of state/voices/:index)
+    if not voice/active [return 0.0]
+    voice/envelope: adsr-tick voice/envelope state/envelope-config state/sample-rate
+    if not adsr-active? voice/envelope [
+        voice/active: false
+        return 0.0
+    ]
+    ; The one value this whole design turns on. Velocity and contour together
+    ; are the performed gesture; loudness and colour are both read off it, so
+    ; there is no second temporal process and nothing to arbitrate.
+    articulation: voice/velocity * (adsr-level voice/envelope)
+    if voice/drift-counter <= 0 [
+        voice/drift-counter: LOOS_DRIFT_PERIOD
+        advance: (as f64! LOOS_DRIFT_PERIOD) / state/sample-rate
+        voice/drift-phase-a: loos-wrap-unit (voice/drift-phase-a + (voice/drift-rate-a * advance))
+        voice/drift-phase-b: loos-wrap-unit (voice/drift-phase-b + (voice/drift-rate-b * advance))
+        wander: ((math-ffi/sin (voice/drift-phase-a * LOOS_TAU))
+            + (math-ffi/sin (voice/drift-phase-b * LOOS_TAU))) * 0.5
+        voice/pitch-ratio: math-ffi/exp
+            ((voice/detune + (wander * LOOS_DRIFT_CENTS)) * LOOS_CENT_RATIO)
+    ]
+    voice/drift-counter: voice/drift-counter - 1
+    step: (voice/frequency * voice/pitch-ratio) / state/sample-rate
+    primary: brom-morph-osc-tick (addr-of voice/oscillator) (addr-of state/blamp)
+        step state/morph
+    ; Half the step and the triangle end of the same morph. Not a second
+    ; oscillator with its own controls -- the lower level of one volume.
+    sub: brom-morph-osc-tick (addr-of voice/sub-oscillator) (addr-of state/blamp)
+        (step * 0.5) LOOS_MORPH_MIN
+    source: (primary + (sub * LOOS_SUB_LEVEL)) * LOOS_SUB_MIX
+    ; This voice's own filter position. The modulation is Loos'; the ladder is
+    ; Brom's. Everything above the brom-ladder-tick call decides *where* this
+    ; voice's filter sits, and nothing here knows how the filter is built.
+    octaves: (state/env-amount * articulation) + (lfo * state/lfocutoffdepth)
+    cutoff: brom-clamp-f64
+        (state/cutoff * math-ffi/exp (0.6931471805599453 * octaves))
+        LOOS_CUTOFF_MIN LOOS_CUTOFF_MAX
+    resonance: brom-clamp-f64 state/resonance LOOS_RESONANCE_MIN LOOS_RESONANCE_MAX
+    filtered: make f64! brom-ladder-tick (addr-of voice/filter)
+        source cutoff resonance state/sample-rate
+    return filtered * articulation
+]
+
+loos-create: func [
+    "Allocate and initialize one independent Loos synth instance."
+    #export
+    return: [c-pointer!] "Opaque instance pointer, or null when allocation fails."
+] [
+    raw: unsafe/malloc (as i32! size-of loos-state!)
+    if none? raw [return as c-pointer! 0]
+    unsafe/memset raw 0 (as i32! size-of loos-state!)
+    state: make [#mutable loos-state!] as loos-state! raw
+    state/sample-rate: 44100.0
+    state/cutoff: LOOS_CUTOFF_DEFAULT
+    state/resonance: LOOS_RESONANCE_DEFAULT
+    ; Built through the constructor rather than field by field, because an
+    ; adsr-config! now carries its curve as well as its times and the state was
+    ; memset to zero above -- a zero curve constant makes every coefficient one,
+    ; and an envelope that never moves.
+    state/envelope-config: adsr-config-brom
+        LOOS_ATTACK_DEFAULT LOOS_DECAY_DEFAULT
+        LOOS_SUSTAIN_DEFAULT LOOS_RELEASE_DEFAULT
+    state/env-amount: LOOS_ENV_AMOUNT_DEFAULT
+    state/lforate: LOOS_LFO_RATE_DEFAULT
+    state/lfocutoffdepth: LOOS_LFO_CUTOFF_DEPTH_DEFAULT
+    state/morph: LOOS_MORPH_DEFAULT
+    brom-blamp-table-fill (addr-of state/blamp)
+    repeat index LOOS_MAX_VOICES [
+        voice: make [#mutable loos-voice!] as loos-voice! (addr-of state/voices/:index)
+        brom-morph-osc-reset (addr-of voice/oscillator)
+        brom-morph-osc-set-phase (addr-of voice/oscillator) (loos-slot-phase index)
+        ; The sub starts where the primary starts, and is thereafter stepped at
+        ; half its rate, so the two hold a fixed relationship by construction
+        ; rather than by being read off one another.
+        brom-morph-osc-reset (addr-of voice/sub-oscillator)
+        brom-morph-osc-set-phase (addr-of voice/sub-oscillator) (loos-slot-phase index)
+        slot: as f64! index
+        ; Detune spread evenly across the slots, centred on true, so the
+        ; ensemble stays in tune with itself while no two voices are.
+        voice/detune: (slot - 1.5) * (LOOS_DETUNE_CENTS / 1.5)
+        ; Rates chosen close but not commensurate, and different per slot, so
+        ; no two voices wander together and none of them repeats quickly.
+        voice/drift-rate-a: 0.11 + (slot * 0.013)
+        voice/drift-rate-b: 0.17 + (slot * 0.019)
+        voice/drift-phase-a: loos-fractional (slot * 0.37)
+        voice/drift-phase-b: loos-fractional (slot * 0.61)
+        voice/drift-counter: 0
+        voice/pitch-ratio: 1.0
+    ]
+    return make c-pointer! raw
+]
+
+loos-destroy: func [
+    "Release one Loos synth instance."
+    #export
+    raw [c-pointer!] "Opaque instance pointer returned by loos-create."
+    return: [none!] "No value."
+] [
+    if not none? raw [unsafe/free raw]
+    return none
+]
+
+loos-activate: func [
+    "Set the processing sample rate and clear voices/filter history."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    sample-rate [f64!] "Host sample rate in Hz."
+    return: [none!] "No value."
+] [
+    if none? raw [return none]
+    state: make [#mutable loos-state!] as loos-state! raw
+    state/sample-rate: either sample-rate > 100.0 [sample-rate] [44100.0]
+    state/lfophase: 0.0
+    reset-filters raw
+    repeat index LOOS_MAX_VOICES [
+        voice: make [#mutable loos-voice!] as loos-voice! (addr-of state/voices/:index)
+        voice/active: false
+        voice/gate: false
+        ; Re-seeded, not merely cleared: a plain reset would put all four back
+        ; on phase zero and hand the next chord the phase lock this exists to
+        ; remove. The drift phases are left running -- they carry no transient
+        ; and restarting them would make every reset sound the same way twice.
+        brom-morph-osc-reset (addr-of voice/oscillator)
+        brom-morph-osc-set-phase (addr-of voice/oscillator) (loos-slot-phase index)
+        brom-morph-osc-reset (addr-of voice/sub-oscillator)
+        brom-morph-osc-set-phase (addr-of voice/sub-oscillator) (loos-slot-phase index)
+        voice/drift-counter: 0
+        voice/frequency: 440.0
+        voice/velocity: 0.0
+        voice/envelope: adsr-reset
+    ]
+    return none
+]
+
+loos-reset: func [
+    "Silence every voice and clear filter/output history while retaining parameters."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    return: [none!] "No value."
+] [
+    if none? raw [return none]
+    state: make [#mutable loos-state!] as loos-state! raw
+    state/lfophase: 0.0
+    state/next-age: as i64! 0
+    reset-filters raw
+    repeat index LOOS_MAX_VOICES [
+        voice: make [#mutable loos-voice!] as loos-voice! (addr-of state/voices/:index)
+        voice/active: false
+        voice/gate: false
+        voice/age: as i64! 0
+        ; Preserve each slot's phase spread so the next chord remains diffuse.
+        brom-morph-osc-reset (addr-of voice/oscillator)
+        brom-morph-osc-set-phase (addr-of voice/oscillator) (loos-slot-phase index)
+        brom-morph-osc-reset (addr-of voice/sub-oscillator)
+        brom-morph-osc-set-phase (addr-of voice/sub-oscillator) (loos-slot-phase index)
+        voice/drift-counter: 0
+        voice/frequency: 440.0
+        voice/velocity: 0.0
+        voice/envelope: adsr-reset
+    ]
+    repeat frame LOOS_MAX_BLOCK [state/output/:frame: 0.0]
+    return none
+]
+
+loos-voice-report!: make c-struct! [
+    active: [logic!]
+    gate:   [logic!]
+    energy: [f64!]
+    age:    [i64!]
+]
+
+loos-voice-state: func [
+    "Report one voice's state so Brom's shared allocator can rank it."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    slot [i32!] "Voice slot to describe."
+    :out [c-pointer!] "Borrowed address of a caller-owned brom-voice-state!."
+    return: [logic!] "False when the slot is out of range."
+] [
+    if none? raw [return false]
+    if slot < 0 [return false]
+    if slot >= LOOS_MAX_VOICES [return false]
+    state: make [#mutable loos-state!] as loos-state! raw
+    voice: make [#mutable loos-voice!] as loos-voice! (addr-of state/voices/:slot)
+    vs: make [#mutable loos-voice-report!] as loos-voice-report! :out
+    vs/active: voice/active
+    vs/gate: voice/gate
+    ; Amplitude is what "quietest" means here. There is one contour now, so
+    ; this is also the value that decides the voice's colour.
+    vs/energy: adsr-level voice/envelope
+    vs/age: voice/age
+    return true
+]
+
+loos-note-on: func [
+    "Start one voice of an instance."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    index [i32!] "Voice slot from zero through three."
+    frequency [f64!] "Note frequency in Hz."
+    velocity [f64!] "Normalized note velocity."
+    return: [none!] "No value."
+] [
+    if any [none? raw index < 0 index >= LOOS_MAX_VOICES] [return none]
+    state: make [#mutable loos-state!] as loos-state! raw
+    voice: make [#mutable loos-voice!] as loos-voice! (addr-of state/voices/:index)
+    voice/active: true
+    voice/gate: true
+    state/next-age: state/next-age + 1
+    voice/age: state/next-age
+    voice/frequency: frequency
+    voice/velocity: velocity
+    ; Deliberately NOT restarted. A note used to begin on the identical
+    ; waveform edge every time, which makes every attack transient the same
+    ; transient and starts a chord with its voices phase-locked -- summing
+    ; coherently in a way separate oscillators never do. Left running, each
+    ; note begins wherever its slot happens to have got to. The amplitude
+    ; envelope ramps from silence over at least a millisecond, so beginning
+    ; mid-cycle costs nothing audible.
+    voice/envelope: adsr-trigger voice/envelope
+    return none
+]
+
+loos-note-off: func [
+    "Stop one voice of an instance."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    index [i32!] "Voice slot from zero through three."
+    return: [none!] "No value."
+] [
+    if any [none? raw index < 0 index >= LOOS_MAX_VOICES] [return none]
+    state: make [#mutable loos-state!] as loos-state! raw
+    voice: make [#mutable loos-voice!] as loos-voice! (addr-of state/voices/:index)
+    voice/gate: false
+    voice/envelope: adsr-release voice/envelope
+    return none
+]
+
+loos-process-block: func [
+    "Render an instance-local block of up to 512 mono samples."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    frames [i32!] "Requested sample count."
+    return: [none!] "No value."
+] [
+    if none? raw [return none]
+    count: make [#mutable i32!] frames
+    if count < 0 [count: 0]
+    if count > LOOS_MAX_BLOCK [count: LOOS_MAX_BLOCK]
+    state: make [#mutable loos-state!] as loos-state! raw
+    repeat frame count [
+        ; One LFO for the instance, read by four voice-local cutoffs: a shared
+        ; modulator reaching distinct rooms, rather than four uncoordinated
+        ; oscillators hiding behind a two-knob facade. It is advanced here
+        ; rather than inside a voice, because a voice now runs four times per
+        ; sample and would carry the phase four times as fast.
+        lfo: math-ffi/sin (state/lfophase * LOOS_TAU)
+        sample: make [#mutable f64!] 0.0
+        repeat index LOOS_MAX_VOICES [sample: sample + tick-voice raw index lfo]
+        state/output/:frame: sample
+        next-lfo-phase: state/lfophase + (state/lforate / state/sample-rate)
+        state/lfophase: either next-lfo-phase >= 1.0 [next-lfo-phase - 1.0] [next-lfo-phase]
+    ]
+    return none
+]
+
+loos-output: func [
+    "Return the instance-local sample buffer."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    return: [c-pointer!] "Pointer to the first f64 sample, or null."
+] [
+    if none? raw [return as c-pointer! 0]
+    state: make [#mutable loos-state!] as loos-state! raw
+    return addr-of state/output/0
+]
+
+loos-output-capacity: func [
+    "Return the fixed render-buffer capacity."
+    #export
+    return: [i32!] "Maximum render block length in samples."
+] [return LOOS_MAX_BLOCK]
+
+loos-set-parameter: func [
+    "Set one physical parameter without emitting a host edit callback."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    parameter [u32!] "Loos parameter identifier."
+    value [f64!] "Physical parameter value."
+    return: [logic!] "True when the parameter identifier was recognized."
+] [
+    if none? raw [return false]
+    state: make [#mutable loos-state!] as loos-state! raw
+    clamped: parameter-value parameter value
+    if parameter = LOOS_PARAM_CUTOFF [state/cutoff: clamped return true]
+    if parameter = LOOS_PARAM_RESONANCE [state/resonance: clamped return true]
+    if parameter = LOOS_PARAM_ENV_AMOUNT [state/env-amount: clamped return true]
+    if parameter = LOOS_PARAM_ATTACK [state/envelope-config/attack: clamped return true]
+    if parameter = LOOS_PARAM_DECAY [state/envelope-config/decay: clamped return true]
+    if parameter = LOOS_PARAM_SUSTAIN [state/envelope-config/sustain: clamped return true]
+    if parameter = LOOS_PARAM_RELEASE [state/envelope-config/release: clamped return true]
+    if parameter = LOOS_PARAM_LFO_RATE [state/lforate: clamped return true]
+    if parameter = LOOS_PARAM_LFO_CUTOFF_DEPTH [state/lfocutoffdepth: clamped return true]
+    if parameter = LOOS_PARAM_MORPH [state/morph: clamped return true]
+    return false
+]
+
+loos-get-parameter: func [
+    "Read one physical parameter value."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    parameter [u32!] "Loos parameter identifier."
+    return: [f64!] "Current physical value, or zero for an unknown parameter."
+] [
+    if none? raw [return 0.0]
+    state: make [#mutable loos-state!] as loos-state! raw
+    if parameter = LOOS_PARAM_CUTOFF [return state/cutoff]
+    if parameter = LOOS_PARAM_RESONANCE [return state/resonance]
+    if parameter = LOOS_PARAM_ENV_AMOUNT [return state/env-amount]
+    if parameter = LOOS_PARAM_ATTACK [return state/envelope-config/attack]
+    if parameter = LOOS_PARAM_DECAY [return state/envelope-config/decay]
+    if parameter = LOOS_PARAM_SUSTAIN [return state/envelope-config/sustain]
+    if parameter = LOOS_PARAM_RELEASE [return state/envelope-config/release]
+    if parameter = LOOS_PARAM_LFO_RATE [return state/lforate]
+    if parameter = LOOS_PARAM_LFO_CUTOFF_DEPTH [return state/lfocutoffdepth]
+    if parameter = LOOS_PARAM_MORPH [return state/morph]
+    return 0.0
+]
+
+loos-parameter-to-normalized: func [
+    "Map a physical parameter value to the shared zero-to-one UI domain."
+    #export
+    parameter [u32!] "Loos parameter identifier."
+    value [f64!] "Physical parameter value."
+    return: [f64!] "Normalized parameter value."
+] [
+    if parameter >= (as u32! LOOS_PARAM_COUNT) [return 0.0]
+    clamped: parameter-value parameter value
+    low: make f64! loos-parameter-min parameter
+    high: make f64! loos-parameter-max parameter
+    ; Cutoff and LFO rate are heard in octaves, so they are travelled in
+    ; octaves. Everything else, the bipolar amount included, is linear across
+    ; its own range.
+    if any [parameter = LOOS_PARAM_CUTOFF parameter = LOOS_PARAM_LFO_RATE] [
+        return (math-ffi/log (clamped / low)) / (math-ffi/log (high / low))
+    ]
+    return (clamped - low) / (high - low)
+]
+
+loos-parameter-from-normalized: func [
+    "Map a zero-to-one UI value to the shared physical parameter domain."
+    #export
+    parameter [u32!] "Loos parameter identifier."
+    value [f64!] "Normalized parameter value."
+    return: [f64!] "Physical parameter value."
+] [
+    if parameter >= (as u32! LOOS_PARAM_COUNT) [return 0.0]
+    normalized: brom-clamp-f64 value 0.0 1.0
+    low: make f64! loos-parameter-min parameter
+    high: make f64! loos-parameter-max parameter
+    if any [parameter = LOOS_PARAM_CUTOFF parameter = LOOS_PARAM_LFO_RATE] [
+        return low * (math-ffi/exp (normalized * (math-ffi/log (high / low))))
+    ]
+    return low + (normalized * (high - low))
+]
+
+loos-parameter-default: func [
+    "Return the stable default for one Loos parameter."
+    #export
+    parameter [u32!]
+    return: [f64!]
+] [
+    if parameter = LOOS_PARAM_CUTOFF [return LOOS_CUTOFF_DEFAULT]
+    if parameter = LOOS_PARAM_RESONANCE [return LOOS_RESONANCE_DEFAULT]
+    if parameter = LOOS_PARAM_ENV_AMOUNT [return LOOS_ENV_AMOUNT_DEFAULT]
+    if parameter = LOOS_PARAM_ATTACK [return LOOS_ATTACK_DEFAULT]
+    if parameter = LOOS_PARAM_DECAY [return LOOS_DECAY_DEFAULT]
+    if parameter = LOOS_PARAM_SUSTAIN [return LOOS_SUSTAIN_DEFAULT]
+    if parameter = LOOS_PARAM_RELEASE [return LOOS_RELEASE_DEFAULT]
+    if parameter = LOOS_PARAM_LFO_RATE [return LOOS_LFO_RATE_DEFAULT]
+    if parameter = LOOS_PARAM_LFO_CUTOFF_DEPTH [return LOOS_LFO_CUTOFF_DEPTH_DEFAULT]
+    if parameter = LOOS_PARAM_MORPH [return LOOS_MORPH_DEFAULT]
+    return 0.0
+]
+
+; Schema 2. Version 1 held thirteen parameters whose ids 2 through 12 mean
+; something else now, so it is refused rather than reinterpreted --
+; state-codec-read-count rejects a version it does not recognise, which is what
+; makes the break loud instead of silent.
+LOOS_STATE_MAGIC: 0#534f4f4c
+LOOS_STATE_SCHEMA: 2
+
+loos-state-size: func [
+    "The exact byte length of one saved Loos parameter payload."
+    #export
+    return: [size!] "Header plus eight bytes for every parameter."
+] [return state-codec-size as u32! LOOS_PARAM_COUNT]
+
+loos-save-state: func [
+    "Write every parameter into a caller-owned state payload."
+    #export
+    :raw [c-pointer!] "Opaque Loos instance."
+    bytes [c-pointer!] "Borrowed destination bytes."
+    capacity [size!] "Destination capacity in bytes."
+    return: [logic!] "True only when the whole payload was written."
+] [
+    if any [none? raw none? bytes capacity < loos-state-size] [return false]
+    if not state-codec-write-header :bytes capacity
+        (as u32! LOOS_STATE_MAGIC) (as u32! LOOS_STATE_SCHEMA) (as u32! LOOS_PARAM_COUNT)
+        [return false]
+    ; Every write is reported, and a refused one fails the save. The previous
+    ; version discarded this result against a capacity guard of a literal 108 --
+    ; the byte count of a twelve-parameter payload, left behind when the
+    ; thirteenth was added -- so a caller sizing its buffer from the header lost
+    ; the last parameter and was told the save had succeeded.
+    ok: make [#mutable logic!] true
+    repeat parameter LOOS_PARAM_COUNT [
+        if not state-codec-write-f64 :bytes capacity (as u32! parameter)
+            (loos-get-parameter :raw (as u32! parameter))
+            [ok: false]
+    ]
+    return ok
+]
+
+loos-load-state: func [
+    #export
+    :raw [c-pointer!]
+    bytes [c-pointer!]
+    size [size!]
+    return: [logic!]
+] [
+    if none? raw [return false]
+    count: state-codec-read-count :bytes size
+        (as u32! LOOS_STATE_MAGIC) (as u32! LOOS_STATE_SCHEMA)
+    if count < 0 [return false]
+    known: make [#mutable i32!] count
+    if known > LOOS_PARAM_COUNT [known: LOOS_PARAM_COUNT]
+    repeat parameter known [
+        loos-set-parameter :raw (as u32! parameter) (state-codec-read-f64 :bytes size (as u32! parameter))
+    ]
+    parameter: make [#mutable i32!] known
+    while [parameter < LOOS_PARAM_COUNT] [
+        loos-set-parameter :raw (as u32! parameter) (loos-parameter-default as u32! parameter)
+        parameter: parameter + 1
+    ]
+    return true
+]

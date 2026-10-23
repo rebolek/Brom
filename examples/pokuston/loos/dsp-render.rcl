@@ -1,0 +1,217 @@
+Recoil [
+    Title: "Pokuston Loos offline WAV renderer"
+    Type: module
+    Module: examples/pokuston/loos/dsp-render
+    Imports: [
+        std/io [get-env]
+        std/math/core [clamp]
+        examples/pokuston/loos/core [
+            loos-create loos-destroy loos-activate
+            loos-note-on loos-note-off loos-process-block loos-output
+        ]
+    ]
+    Exports: []
+]
+
+; Renders a fixed note sequence to a sixteen-bit mono WAV so voicing changes can
+; be auditioned and measured without a host. Modelled on Kapralova's renderer,
+; and written for the same reason: Loos had no way to prove its sound was
+; unchanged, which made moving its ladder filter into brom/dsp unfalsifiable.
+;
+;   r3 -s ../../../recoil.r3 compile -o /tmp/loos-render dsp-render.rcl
+;   LOOS_RENDER_OUT=/tmp/loos.wav /tmp/loos-render
+;
+; Deterministic by construction: a fresh instance each run, fixed frequencies
+; and velocities, default parameters, and a block count that never varies. The
+; LFO advances with rendered time only, so the output is reproducible.
+
+port-runtime: foreign "runtime" [
+    open-file:  ["port_open_file"  [c-string! c-string!] return: [port!]]
+    write-file: ["port_file_write" [c-pointer! i32! i32! :port!] return: [i32!]]
+    close-port: ["port_close"      [port!] return: [i32!]]
+]
+
+RENDER_SAMPLE_RATE: 48000.0
+RENDER_BLOCK: 512
+RENDER_HOLD_BLOCKS: 60
+RENDER_RELEASE_BLOCKS: 30
+RENDER_NOTES: 12
+
+header-buffer!: make c-struct! [
+    bytes: [c-array! [u8! 44]]
+]
+
+pcm-buffer!: make c-struct! [
+    bytes: [c-array! [u8! 1024]]
+]
+
+output-view!: make c-struct! [
+    samples: [c-array! [f64! 512]]
+]
+
+put-byte: func [
+    "Write the low byte of a value at one header offset."
+    :raw [c-pointer!] "Borrowed header buffer."
+    offset [i32!] "Byte offset into the 44-byte header."
+    value [u32!] "Value whose low byte is written."
+    return: [none!] "No value."
+] [
+    header: make [#mutable header-buffer!] as header-buffer! raw
+    header/bytes/:offset: as u8! (value & (as u32! 255))
+    return none
+]
+
+put-u16: func [
+    "Write a little-endian sixteen-bit field."
+    :raw [c-pointer!] "Borrowed header buffer."
+    offset [i32!] "Byte offset of the field."
+    value [u32!] "Value to encode."
+    return: [none!] "No value."
+] [
+    put-byte :raw offset value
+    put-byte :raw (offset + 1) (value >> (as u32! 8))
+    return none
+]
+
+put-u32: func [
+    "Write a little-endian thirty-two-bit field."
+    :raw [c-pointer!] "Borrowed header buffer."
+    offset [i32!] "Byte offset of the field."
+    value [u32!] "Value to encode."
+    return: [none!] "No value."
+] [
+    put-u16 :raw offset value
+    put-u16 :raw (offset + 2) (value >> (as u32! 16))
+    return none
+]
+
+put-tag: func [
+    "Write a four-character RIFF tag."
+    :raw [c-pointer!] "Borrowed header buffer."
+    offset [i32!] "Byte offset of the tag."
+    a [u32!] "First character."
+    b [u32!] "Second character."
+    c [u32!] "Third character."
+    d [u32!] "Fourth character."
+    return: [none!] "No value."
+] [
+    put-byte :raw offset a
+    put-byte :raw (offset + 1) b
+    put-byte :raw (offset + 2) c
+    put-byte :raw (offset + 3) d
+    return none
+]
+
+build-header: func [
+    "Fill a 44-byte canonical WAV header for mono sixteen-bit at 48 kHz."
+    :raw [c-pointer!] "Borrowed header buffer."
+    total-frames [u32!] "Frames the data chunk will hold."
+    return: [none!] "No value."
+] [
+    data-bytes: total-frames * (as u32! 2)
+    put-tag :raw 0 (as u32! 82) (as u32! 73) (as u32! 70) (as u32! 70)
+    put-u32 :raw 4 (data-bytes + (as u32! 36))
+    put-tag :raw 8 (as u32! 87) (as u32! 65) (as u32! 86) (as u32! 69)
+    put-tag :raw 12 (as u32! 102) (as u32! 109) (as u32! 116) (as u32! 32)
+    put-u32 :raw 16 (as u32! 16)
+    put-u16 :raw 20 (as u32! 1)
+    put-u16 :raw 22 (as u32! 1)
+    put-u32 :raw 24 (as u32! 48000)
+    put-u32 :raw 28 (as u32! 96000)
+    put-u16 :raw 32 (as u32! 2)
+    put-u16 :raw 34 (as u32! 16)
+    put-tag :raw 36 (as u32! 100) (as u32! 97) (as u32! 116) (as u32! 97)
+    put-u32 :raw 40 data-bytes
+    return none
+]
+
+encode-block: func [
+    "Convert one rendered block to little-endian sixteen-bit PCM."
+    :raw [c-pointer!] "Borrowed f64 sample buffer."
+    :pcm [c-pointer!] "Borrowed PCM byte buffer."
+    frames [i32!] "Frames to encode."
+    return: [none!] "No value."
+] [
+    output: make [#mutable output-view!] as output-view! raw
+    buffer: make [#mutable pcm-buffer!] as pcm-buffer! pcm
+    repeat frame frames [
+        bounded: clamp [f64!] output/samples/:frame -1.0 1.0
+        word: as u32! (as i32! (bounded * 32767.0))
+        low: frame * 2
+        high: low + 1
+        buffer/bytes/:low: as u8! (word & (as u32! 255))
+        buffer/bytes/:high: as u8! ((word >> (as u32! 8)) & (as u32! 255))
+    ]
+    return none
+]
+
+; Four octaves of A plus a fifth, so the ladder is exercised well below and well
+; above its default cutoff. Frequencies rather than MIDI keys because that is
+; what loos-note-on takes -- Loos carries no tuning policy.
+render-frequencies: make [vector! [f64! 4]] [110.0 220.0 440.0 659.255113825739]
+render-velocities: make [vector! [f64! 3]] [0.35 0.7 1.0]
+
+render-note: func [
+    "Play one note, hold it, release it, and stream the result to the file."
+    :instance [c-pointer!] "Borrowed Loos instance."
+    :pcm [c-pointer!] "Borrowed PCM byte buffer."
+    :handle [port!] "Borrowed output file port."
+    slot [i32!] "Voice slot to sound the note on."
+    frequency [f64!] "Note frequency in Hz."
+    velocity [f64!] "Normalized velocity."
+    return: [none!] "No value."
+] [
+    buffer: make [#mutable pcm-buffer!] as pcm-buffer! pcm
+    bytes: addr-of buffer/bytes/0
+    loos-note-on :instance slot frequency velocity
+    repeat block RENDER_HOLD_BLOCKS [
+        loos-process-block :instance RENDER_BLOCK
+        rendered: loos-output :instance
+        encode-block :rendered :pcm RENDER_BLOCK
+        port-runtime/write-file bytes 1 (RENDER_BLOCK * 2) :handle
+    ]
+    loos-note-off :instance slot
+    repeat block RENDER_RELEASE_BLOCKS [
+        loos-process-block :instance RENDER_BLOCK
+        rendered: loos-output :instance
+        encode-block :rendered :pcm RENDER_BLOCK
+        port-runtime/write-file bytes 1 (RENDER_BLOCK * 2) :handle
+    ]
+    return none
+]
+
+requested: get-env "LOOS_RENDER_OUT"
+path: either (length? requested) > 0 [requested] [make string! "loos-render.wav"]
+
+header: make [#mutable header-buffer!] []
+pcm: make [#mutable pcm-buffer!] []
+header-bytes: addr-of header/bytes/0
+header-pointer: addr-of header
+pcm-pointer: addr-of pcm
+
+total-frames: as u32! (RENDER_NOTES * (RENDER_HOLD_BLOCKS + RENDER_RELEASE_BLOCKS) * RENDER_BLOCK)
+build-header :header-pointer total-frames
+
+file: make [port!] port-runtime/open-file (as c-string! path) "wb"
+port-runtime/write-file header-bytes 1 44 :file
+
+instance: loos-create
+loos-activate :instance RENDER_SAMPLE_RATE
+
+; Four frequencies at three velocities, each on voice slot 0 so the render
+; exercises retriggering rather than the allocator, which voice-alloc-test.rcl
+; already covers.
+repeat velocity-index 3 [
+    repeat frequency-index 4 [
+        render-note :instance :pcm-pointer :file 0
+            render-frequencies/:frequency-index
+            render-velocities/:velocity-index
+    ]
+]
+
+port-runtime/close-port file
+
+print "wrote:"
+print path
+
+loos-destroy instance

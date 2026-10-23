@@ -1,0 +1,31 @@
+Recoil [
+    Title: "Loos editor size"
+    Description: {
+        The one place Loos's editor size is written down.
+
+        It used to be two: the editor declared it, and made
+        `*_editor_attach` REFUSE any other size, while the plug-in
+        descriptor stated it again as bare literals under a comment saying
+        the two must match. Nothing checked that they did, and a mismatch is
+        not a diagnostic -- the host sizes its window from the descriptor,
+        the attach refuses that size, and the player gets a silent black
+        rectangle.
+
+        A module of two constants rather than an import of the editor
+        itself: importing the editor would compile its whole body into the
+        descriptor's translation unit as well as its own, and every function
+        in it would then be defined twice at link time. Constants emit as
+        `static const`, so a module carrying nothing else can be imported
+        anywhere it is needed.
+    }
+    Type: module
+    Module: examples/pokuston/loos/editor-size
+    Exports: [LOOS-EDITOR-WIDTH LOOS-EDITOR-HEIGHT]
+]
+
+; Shorter than it was. The filter envelope's row of four went with the second
+; ADSR it belonged to, and nothing was moved in to fill the space: the facade
+; getting simpler as the interior gets richer is the point of the instrument,
+; not an accident of the edit.
+LOOS-EDITOR-WIDTH: make i32! 760
+LOOS-EDITOR-HEIGHT: make i32! 576

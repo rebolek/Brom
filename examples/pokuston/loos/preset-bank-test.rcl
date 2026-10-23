@@ -1,0 +1,148 @@
+Recoil [
+    Title: "Loos factory bank and sound exercise"
+    Description: {
+        Every preset in the bank is materialized through the public host ABI
+        into a complete snapshot, pinned where it makes a claim, and then
+        played, so a preset that is discoverable but silent cannot ship.
+
+        Two of the pins matter more than the rest. Inverse Room and Tristan
+        Tzara carry a NEGATIVE envelope amount, which is a value the parameter
+        could not hold before this schema and which a careless range or
+        normalization change would quietly clamp to nought -- the preset would
+        still load, still sound, and no longer be the patch it says it is. And
+        Raumplan declares no parameters at all: it must materialize to exactly
+        the engine's defaults, which is what makes "a preset says only what it
+        changes" checkable rather than a convention.
+    }
+    Type: module
+    Module: examples/pokuston/loos/preset-bank-test
+    Imports: [
+        brom/plugin/preset [
+            preset-snapshot! preset-factory-count preset-factory-name
+            preset-factory-key preset-factory-materialize
+        ]
+        examples/pokuston/loos/plugin [
+            loos-brom-engine
+            loos-plugin-create loos-plugin-destroy loos-plugin-activate
+            loos-plugin-reset loos-plugin-voice-state
+            loos-plugin-note-on loos-plugin-note-off
+            loos-plugin-process loos-plugin-output
+            loos-plugin-param-info loos-plugin-get-param loos-plugin-set-param
+            loos-plugin-save loos-plugin-load
+        ]
+        examples/pokuston/loos/core [
+            LOOS_PARAM_COUNT LOOS_PARAM_ENV_AMOUNT LOOS_PARAM_MORPH
+            LOOS_PARAM_CUTOFF LOOS_PARAM_RESONANCE LOOS_PARAM_SUSTAIN
+            LOOS_PARAM_LFO_CUTOFF_DEPTH
+            loos-create loos-destroy loos-activate
+            loos-note-on loos-process-block loos-output
+            loos-set-parameter loos-parameter-default
+        ]
+    ]
+    Exports: []
+]
+
+LOOS-BANK-SIZE: 12
+
+sample-buffer!: make c-struct! [samples: [c-array! [f64! 512]]]
+
+absolute: func [
+    "Return a sample's non-negative magnitude."
+    value [f64!] "Sample value."
+    return: [f64!] "Absolute magnitude."
+] [return either value < 0.0 [0.0 - value] [value]]
+
+check: func [
+    "Print the canonical verdict for one bank condition."
+    condition [logic!] "Condition to report."
+    return: [none!] "No value."
+] [print either condition ["PASS"] ["FAIL"] return none]
+
+check (preset-factory-count :loos-brom-engine) = LOOS-BANK-SIZE
+
+metadata-ok: make [#mutable logic!] true
+repeat index LOOS-BANK-SIZE [
+    name: preset-factory-name :loos-brom-engine index
+    key: preset-factory-key :loos-brom-engine index
+    if any [(length? name) = 0 (length? key) = 0] [metadata-ok: false]
+]
+check metadata-ok
+
+snapshot: make [#mutable preset-snapshot!] [count: 0 index: -1 values: []]
+
+; Raumplan declares nothing, so it must arrive as the engine's own defaults.
+check preset-factory-materialize :loos-brom-engine 0 (addr-of snapshot)
+defaults-ok: make [#mutable logic!] true
+repeat parameter LOOS_PARAM_COUNT [
+    if snapshot/values/:parameter <> (loos-parameter-default as u32! parameter) [
+        defaults-ok: false
+    ]
+]
+check defaults-ok
+
+; Villa Muller: the sustained saw, opening with the contour.
+check preset-factory-materialize :loos-brom-engine 1 (addr-of snapshot)
+check all [
+    snapshot/values/(as i32! LOOS_PARAM_CUTOFF) = 420.0
+    snapshot/values/(as i32! LOOS_PARAM_ENV_AMOUNT) = 2.4
+    snapshot/values/(as i32! LOOS_PARAM_MORPH) = 1.0
+    snapshot/values/(as i32! LOOS_PARAM_SUSTAIN) = 0.85
+]
+
+; Cafe Museum sits at the triangle end of Shape, which is the floor of its
+; range -- the one preset that pins the low end of the morph.
+check preset-factory-materialize :loos-brom-engine 2 (addr-of snapshot)
+check (snapshot/values/(as i32! LOOS_PARAM_MORPH) = 0.5)
+
+; The two inverted patches. A negative amount is the direction the old
+; unipolar filter envelope could not express, so it is pinned by value rather
+; than by sign alone.
+check preset-factory-materialize :loos-brom-engine 5 (addr-of snapshot)
+check (snapshot/values/(as i32! LOOS_PARAM_ENV_AMOUNT) = -3.2)
+check preset-factory-materialize :loos-brom-engine 6 (addr-of snapshot)
+check (snapshot/values/(as i32! LOOS_PARAM_ENV_AMOUNT) = -4.0)
+
+; Whistle Point is the resonance extreme, where four separate ladders are
+; least like the one they replaced.
+check preset-factory-materialize :loos-brom-engine 11 (addr-of snapshot)
+check (snapshot/values/(as i32! LOOS_PARAM_RESONANCE) = 0.94)
+
+; Exactly two patches use the LFO, and no others enable it by accident.
+modulated: make [#mutable i32!] 0
+repeat preset LOOS-BANK-SIZE [
+    if preset-factory-materialize :loos-brom-engine preset (addr-of snapshot) [
+        if snapshot/values/(as i32! LOOS_PARAM_LFO_CUTOFF_DEPTH) > 0.0 [
+            modulated: modulated + 1
+        ]
+    ]
+]
+check (modulated = 2)
+
+; And every one of them makes a sound. A low note, because the register the
+; permanent sub carries is the one a silent oscillator would be hidden in.
+all-sound: make [#mutable logic!] true
+repeat preset LOOS-BANK-SIZE [
+    if not preset-factory-materialize :loos-brom-engine preset (addr-of snapshot) [
+        all-sound: false
+    ]
+    core: make c-pointer! loos-create
+    if none? core [all-sound: false]
+    if not none? core [
+        loos-activate :core 48000.0
+        repeat parameter LOOS_PARAM_COUNT [
+            accepted: make logic! loos-set-parameter
+                :core (as u32! parameter) snapshot/values/:parameter
+            if not accepted [all-sound: false]
+        ]
+        loos-note-on :core 0 110.0 0.9
+        energy: make [#mutable f64!] 0.0
+        repeat block 8 [
+            loos-process-block :core 512
+            output: make sample-buffer! as sample-buffer! (loos-output :core)
+            repeat frame 512 [energy: energy + absolute output/samples/:frame]
+        ]
+        if energy <= 0.001 [all-sound: false]
+        loos-destroy core
+    ]
+]
+check all-sound

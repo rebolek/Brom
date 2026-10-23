@@ -1,0 +1,37 @@
+Recoil [
+    Title: "Brom preset transaction ABI bridge"
+    Description: {
+        Rebol-side declarations for Brom's bounded native transaction service.
+        Product adapters own their engine calls and invoke these operations at
+        the audio boundary; this module never exposes mutable DSP storage.
+    }
+    Type: module
+    Module: brom/plugin/preset/bridge
+    Imports: []
+    Exports: [preset-transaction-api]
+]
+
+preset-transaction-api: foreign <packages/recoil-brom/brom/plugin/preset/transaction.h> [
+    create: "brom_preset_tx_create"
+        [c-pointer! c-pointer! u32! return: [c-pointer!]]
+    destroy: "brom_preset_tx_destroy" [c-pointer! return: [none!]]
+    submit-load: "brom_preset_submit_load"
+        [c-pointer! c-pointer! c-pointer! c-pointer! return: [i32!]]
+    submit-restore: "brom_preset_submit_restore"
+        [c-pointer! c-pointer! c-pointer! return: [i32!]]
+    submit-compare: "brom_preset_submit_compare" [c-pointer! u64! return: [i32!]]
+    submit-edit: "brom_preset_submit_edit"
+        [c-pointer! u64! u32! f64! return: [i32!]]
+    read-completion: "brom_preset_read_completion"
+        [c-pointer! u64! c-pointer! return: [i32!]]
+    audio-edit: "brom_preset_audio_edit"
+        [c-pointer! u32! f64! logic! c-pointer! return: [i32!]]
+    audio-cutoff: "brom_preset_audio_cutoff" [c-pointer! return: [u64!]]
+    audio-boundary: "brom_preset_audio_boundary"
+        [c-pointer! u64! c-pointer! return: [logic!]]
+    audio-publish: "brom_preset_audio_publish"
+        [c-pointer! c-pointer! return: [none!]]
+    read-view: "brom_preset_read_view" [c-pointer! c-pointer! return: [logic!]]
+    set-active: "brom_preset_set_active" [c-pointer! logic! return: [none!]]
+    audio-resume: "brom_preset_audio_resume" [c-pointer! c-pointer! return: [logic!]]
+]

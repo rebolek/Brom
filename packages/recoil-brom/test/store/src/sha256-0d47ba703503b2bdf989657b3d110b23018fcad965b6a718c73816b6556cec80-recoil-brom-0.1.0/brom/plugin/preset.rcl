@@ -1,0 +1,899 @@
+Recoil [
+    Title: "Pokuston shared preset manager"
+    Description: {
+        Reads and writes a plug-in's parameter values as text, driven entirely
+        by the engine descriptor. There is no per-plug-in and no per-parameter
+        code here: everything comes from param-info-fn, get-param-fn and
+        set-param-fn, so a plug-in that already fills in a descriptor gets
+        presets without writing any.
+
+        That is the whole reason this exists rather than a struct per plug-in.
+        Mach's Rust core spells its preset out field by field -- 743 lines that
+        restate the parameter schema a third time, after the state struct and
+        the host-facing metadata, and that has to be edited again every time a
+        parameter is added. A preset is not a new schema; it is a set of values
+        for the schema that already exists.
+
+        Parameters are keyed by a slug derived from their module and name
+        ("Oscillator 1" + "Harmonics" -> oscillator-1-harmonics) rather than by
+        index, so inserting a parameter does not invalidate saved presets. A
+        key the running plug-in does not know is ignored, and a parameter the
+        file does not mention keeps its default -- which is also why only
+        values that differ from their default are written. A preset says what
+        it changes.
+    }
+    Type: module
+    Module: brom/plugin/preset
+    Imports: [
+        brom/plugin/engine [engine! param-info! BROM-MAX-PARAMS]
+        brom/plugin/values [param-range! param-normalize param-denormalize]
+        std/io [getenv]
+        std/string [find]
+    ]
+    Exports: [
+        BROM-PRESET-VERSION BROM-PRESET-TEXT-BYTES
+        preset-cstr-view! preset-snapshot!
+        preset-cstr-string preset-name-slug preset-slug-of
+        preset-format preset-apply preset-prepare
+        preset-config-root preset-dir preset-path preset-ensure-dir
+        preset-save preset-load
+        preset-fill-buffer
+        preset-name-of preset-key-of preset-description-of preset-param-count
+        preset-feature-count preset-feature-at
+        preset-factory-count preset-factory-text
+        preset-factory-name preset-factory-key preset-factory-index-by-key
+        preset-factory-apply preset-factory-materialize
+        preset-snapshot-apply preset-snapshot-param-matches
+        preset-snapshot-matches preset-factory-match
+    ]
+]
+
+; One foreign block per header. Declaring <stdlib.h> twice in a module gets the
+; second block's symbols mangled -- getenv came out as _getenv, undeclared.
+preset-stdlib: foreign <stdlib.h> [
+    strtod: "strtod" [c-string! c-pointer! return: [f64!]]
+]
+
+preset-stdio: foreign <stdio.h> [
+    fopen: "fopen" [c-string! c-string! return: [c-pointer!]]
+    fwrite: "fwrite" [c-pointer! size! size! c-pointer! return: [size!]]
+    fread: "fread" [c-pointer! size! size! c-pointer! return: [size!]]
+    fclose: "fclose" [c-pointer! return: [i32!]]
+]
+
+preset-math: foreign <math.h> [
+    fabs: "fabs" [f64! return: [f64!]]
+    isfinite: "isfinite" [f64! return: [i32!]]
+]
+
+; Bumped only when the text layout changes in a way an older reader cannot
+; handle. Adding parameters is not such a change -- that is what keying by
+; slug buys.
+; Typed rather than left to inference: an untyped module-level constant has no
+; type inside a function body, so `rejoin [... BROM-PRESET-VERSION ...]` fails
+; with P1710 "form ... got unknown!". Reported separately.
+BROM-PRESET-VERSION: make i32! 1
+
+; Ceiling for one preset's text. A plug-in with 124 parameters all away from
+; their defaults writes about 5 KB, so this is roughly triple the worst case
+; any current plug-in can produce.
+BROM-PRESET-TEXT-BYTES: make i32! 16384
+
+; A read-only byte window over a NUL-terminated C string. Indexing a c-string!
+; yields another c-string! rather than a byte, and c-string! itself is FFI-only
+; outside examples/ and std/port/, so a mirror is how a package module reads one
+; a character at a time. The length is a window, not an allocation -- nothing of
+; this type is ever constructed, only cast onto a pointer someone else owns.
+preset-cstr-view!: make c-struct! [
+    bytes: [c-array! [u8! 4096]]
+]
+
+; A complete, canonical parameter state. Preset text stays sparse and keyed by
+; stable slugs on disk; host formats need the opposite shape at run time: one
+; immutable value per public parameter, ready to copy without parsing.
+preset-snapshot!: make c-struct! [
+    count: [i32!]
+    index: [i32!]
+    values: [c-array! [f64! 256]]
+]
+
+preset-values-equal?: func [
+    "Return whether two canonical parameter values differ only by host round-off."
+    left [f64!] "First engineering-unit value."
+    right [f64!] "Second engineering-unit value."
+    return: [logic!] "True when the values are equivalent for preset identity."
+] [
+    scale: make [#mutable f64!] preset-math/fabs right
+    if scale < 1.0 [scale: 1.0]
+    return (preset-math/fabs (left - right)) <= (scale * 0.000000001)
+]
+
+preset-cstr-string: func [
+    "Copy a NUL-terminated byte buffer into an owned string!."
+    :text [c-pointer!] "Borrowed NUL-terminated bytes."
+    return: [string!] "Owned copy, empty when the first byte is the terminator."
+] [
+    src: make [#mutable preset-cstr-view!] as preset-cstr-view! :text
+    out: make [#flexible [string! 256]] none
+    idx: make [#mutable i32!] 0
+    ch: make [#mutable char!] #" "
+    while [true] [
+        ch: as char! src/bytes/:idx
+        if ch = #"^@" [break]
+        append out ch
+        idx: idx + 1
+    ]
+    return freeze out
+]
+
+preset-lower: func [
+    "Lowercase one ASCII character, leaving anything else alone."
+    #inline
+    ch [char!] "Character to fold."
+    return: [char!] "Folded character."
+] [
+    return either all [ch >= #"A" ch <= #"Z"] [
+        as char! ((as i32! ch) + 32)
+    ] [ch]
+]
+
+preset-name-slug: func [
+    "Fold one name into a slug: lowercase, with every run of non-alphanumerics collapsed to a single hyphen."
+    :text [c-pointer!] "Borrowed NUL-terminated name."
+    return: [string!] "Owned slug; empty when the name holds nothing foldable."
+] [
+    ; A hyphen is only emitted once a following character arrives, so a name
+    ; never contributes a leading or trailing one, and "OSC 1  Level" and
+    ; "OSC 1 Level" fold to the same key.
+    src: make [#mutable preset-cstr-view!] as preset-cstr-view! :text
+    out: make [#flexible [string! 64]] none
+    pending: make [#mutable logic!] false
+    started: make [#mutable logic!] false
+    idx: make [#mutable i32!] 0
+    ch: make [#mutable char!] #" "
+    while [true] [
+        ch: as char! src/bytes/:idx
+        if ch = #"^@" [break]
+        either any [
+            all [ch >= #"a" ch <= #"z"]
+            all [ch >= #"A" ch <= #"Z"]
+            all [ch >= #"0" ch <= #"9"]
+        ] [
+            if all [pending started] [append out #"-"]
+            append out (preset-lower ch)
+            started: true
+            pending: false
+        ] [
+            pending: true
+        ]
+        idx: idx + 1
+    ]
+    return freeze out
+]
+
+preset-slug-of: func [
+    "Build the key one parameter is stored under, from its module and name."
+    :info [c-pointer!] "Borrowed param-info!."
+    return: [string!] "Owned slug: module and name folded, joined by a hyphen."
+] [
+    p: make [#mutable param-info!] as param-info! :info
+    return rejoin [
+        (preset-name-slug (as c-pointer! p/module))
+        "-"
+        (preset-name-slug (as c-pointer! p/name))
+    ]
+]
+
+; --- writing ----------------------------------------------------------------
+
+preset-format: func [
+    "Render a plug-in's current parameter values as preset text."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed engine instance the values are read from."
+    :title [string!] "Preset name to record."
+    return: [string!] "Owned preset text."
+] [
+    info: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+    unsafe/memset info 0 (as i32! size-of param-info!)
+    p: make [#mutable param-info!] as param-info! info
+
+    out: make [#flexible [string! 8192]] none
+    append out "Recoil-Preset [^/"
+    append out (rejoin [{    name: "} title {"^/}])
+    append out (rejoin ["    version: " BROM-PRESET-VERSION "^/"])
+    ; The plug-in identity is slugged like a parameter key rather than copied
+    ; verbatim: it reads the descriptor's c-string! through the same byte view,
+    ; and a folded name is a stabler thing to compare on load than display text.
+    append out (rejoin [{    plugin: "} (preset-name-slug (as c-pointer! engine/name)) {"^/}])
+    append out "    params: [^/"
+
+    count: engine/param-count
+    repeat index count [
+        if engine/param-info-fn index :info [
+            ; Typed at the binding: the result of a call through a fn-ptr!
+            ; descriptor field carries no inferred type, and rejoin's `form`
+            ; rejects it as unknown!.
+            value: make f64! (engine/get-param-fn :core (as u32! index))
+            ; Only what differs from the default. A preset that says what it
+            ; changes stays readable, survives parameters being added, and
+            ; keeps a plug-in's own default the single source of that value.
+            if value <> p/default-value [
+                append out (rejoin ["        " (preset-slug-of :info) ": " value "^/"])
+            ]
+        ]
+    ]
+
+    append out "    ]^/]^/"
+    unsafe/free :info
+    return freeze out
+]
+
+; --- reading ----------------------------------------------------------------
+
+preset-set-by-slug: func [
+    "Apply one key/value pair, matching the key against each parameter's slug."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed engine instance to write into."
+    :key [string!] "Slug read from the preset text."
+    value [f64!] "Value to store, in engineering units."
+    return: [logic!] "True when a parameter answered to that key."
+] [
+    info: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+    unsafe/memset info 0 (as i32! size-of param-info!)
+    hit: make [#mutable logic!] false
+    count: engine/param-count
+    repeat index count [
+        if not hit [
+            if engine/param-info-fn index :info [
+                if (preset-slug-of :info) = key [
+                    engine/set-param-fn :core (as u32! index) value
+                    hit: true
+                ]
+            ]
+        ]
+    ]
+    unsafe/free :info
+    ; A key this build does not know is not an error. That is what lets a
+    ; preset written by a newer version still load what it can, and a parameter
+    ; to be renamed without invalidating every file on disk.
+    return hit
+]
+
+preset-apply: func [
+    "Read preset text and write its values into an engine instance."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed engine instance to write into."
+    :text [string!] "Borrowed preset text."
+    return: [i32!] "Number of parameters applied; zero for text with no usable keys."
+] [
+    ; Parameters absent from the text keep whatever the instance already holds,
+    ; which is why a caller restoring a preset resets to defaults first.
+    ws: make bitset! charset " ^-^/^M"
+    key-chars: make bitset! charset "abcdefghijklmnopqrstuvwxyz0123456789-"
+    num-chars: make bitset! charset "0123456789+-.eE"
+    key: make [#mutable string!] ""
+    num: make [#mutable string!] ""
+    applied: make [#mutable i32!] 0
+
+    ok: parse text [
+        thru "params: ["
+        any [
+            any ws
+            not ahead "]"
+            copy key some key-chars
+            any ws ":" any ws
+            copy num some num-chars
+            (
+                parsed: make f64! preset-stdlib/strtod (as c-string! num) (as c-pointer! 0)
+                if preset-set-by-slug :engine :core :key parsed [applied: applied + 1]
+            )
+        ]
+        any ws "]"
+        to end
+    ]
+    unused ok
+    return applied
+]
+
+preset-number-text-valid?: func [
+    "Return whether one captured token is exactly a finite-number spelling."
+    :text [string!] "Borrowed numeric token."
+    return: [logic!] "True when the whole token follows decimal/exponent syntax."
+] [
+    digits: make bitset! charset "0123456789"
+    return parse text [
+        opt ["+" | "-"]
+        [some digits [opt ["." any digits]] | "." some digits]
+        opt [["e" | "E"] opt ["+" | "-"] some digits]
+        end
+    ]
+]
+
+preset-value-valid?: func [
+    "Check one engineering-unit value against its parameter schema."
+    :info-raw [c-pointer!] "Borrowed param-info! filled by the engine."
+    value [f64!] "Candidate value."
+    return: [logic!] "True for finite, in-range and canonical discrete values."
+] [
+    if (preset-math/isfinite value) = 0 [return false]
+    info: make [#mutable param-info!] as param-info! :info-raw
+    if any [value < info/range/lo value > info/range/hi] [return false]
+    if info/range/steps > 1 [
+        normalized: param-normalize info/range value
+        canonical: param-denormalize info/range normalized
+        if not preset-values-equal? value canonical [return false]
+    ]
+    return true
+]
+
+preset-prepare-param: func [
+    "Validate and install one known parameter from a parsed preset entry."
+    :engine [engine!] "Borrowed engine descriptor defining the schema."
+    :key [string!] "Borrowed parsed stable parameter key."
+    value [f64!] "Parsed engineering-unit value."
+    :info-raw [c-pointer!] "Borrowed param-info! scratch storage."
+    :snapshot-raw [c-pointer!] "Borrowed canonical snapshot destination."
+    return: [logic!] "False when a known key has invalid schema/value data."
+] [
+    snapshot: make [#mutable preset-snapshot!] as preset-snapshot! :snapshot-raw
+    matched: make [#mutable logic!] false
+    repeat param-index engine/param-count [
+        if not matched [
+            either engine/param-info-fn param-index :info-raw [
+                info: make [#mutable param-info!] as param-info! info-raw
+                if (preset-slug-of :info-raw) = key [
+                    matched: true
+                    if not preset-value-valid? :info-raw value [return false]
+                    snapshot/values/:param-index: value
+                ]
+            ] [return false]
+        ]
+    ]
+    return true
+]
+
+preset-prepare: func [
+    "Validate complete preset text and prepare a default-filled snapshot without mutating an engine."
+    :engine [engine!] "Borrowed engine descriptor defining the schema."
+    :text [string!] "Borrowed complete Recoil-Preset text."
+    :out [c-pointer!] "Borrowed caller-owned preset-snapshot! destination."
+    return: [logic!] "True only when all required framing, metadata and values are valid."
+] [
+    if any [none? out (length? text) = 0 (length? text) >= BROM-PRESET-TEXT-BYTES] [
+        return false
+    ]
+    if any [engine/param-count <= 0 engine/param-count > BROM-MAX-PARAMS] [return false]
+
+    title: preset-name-of :text
+    plugin: preset-quoted-field :text (make string! {plugin: "})
+    if any [(length? title) = 0 (length? plugin) = 0] [return false]
+    expected-plugin: preset-name-slug (as c-pointer! engine/name)
+    if plugin <> expected-plugin [return false]
+
+    version-found: parse text [
+        thru "version:"
+        any [#" " | #"^/" | #"^-" | #"^M"]
+        "1"
+        any [#" " | #"^/" | #"^-" | #"^M"]
+    ]
+    if not version-found [return false]
+
+    snapshot: make [#mutable preset-snapshot!] none
+    snapshot/count: engine/param-count
+    snapshot/index: -1
+    info-raw: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+    if none? info-raw [return false]
+    unsafe/memset info-raw 0 (as i32! size-of param-info!)
+
+    valid: make [#mutable logic!] true
+    repeat param-index engine/param-count [
+        if valid [
+            either engine/param-info-fn param-index :info-raw [
+                info: make [#mutable param-info!] as param-info! info-raw
+                if not preset-value-valid? :info-raw info/default-value [valid: false]
+                snapshot/values/:param-index: info/default-value
+            ] [valid: false]
+        ]
+    ]
+
+    ws: make bitset! charset " ^-^/^M"
+    key-chars: make bitset! charset "abcdefghijklmnopqrstuvwxyz0123456789-"
+    number-chars: make bitset! charset "0123456789+-.eE"
+    key: make [#mutable string!] ""
+    num: make [#mutable string!] ""
+    seen-keys: make [#flexible [string! 256]] none
+    assignments: make [#mutable i32!] 0
+    framed: parse text [
+        "Recoil-Preset ["
+        thru "name: "
+        thru "version:"
+        thru "plugin:"
+        thru "params: ["
+        any [
+            any ws
+            not ahead "]"
+            copy key some key-chars
+            any ws ":" any ws
+            copy num some number-chars
+            (
+                assignments: assignments + 1
+                tag: rejoin ["|" key "|"]
+                if any [assignments > BROM-MAX-PARAMS (length? (find seen-keys tag)) > 0] [
+                    valid: false
+                ]
+                append seen-keys tag
+                if not preset-number-text-valid? :num [valid: false]
+                value: make f64! preset-stdlib/strtod (as c-string! num) (as c-pointer! 0)
+                if not preset-math/isfinite value [valid: false]
+                if valid [
+                    if not preset-prepare-param :engine :key value :info-raw (addr-of snapshot) [
+                        valid: false
+                    ]
+                ]
+            )
+        ]
+        any ws "]"
+        any ws "]"
+        any ws
+        end
+    ]
+    unsafe/free :info-raw
+    if not framed [return false]
+    if not valid [return false]
+
+    destination: make [#mutable preset-snapshot!] as preset-snapshot! :out
+    destination/count: snapshot/count
+    destination/index: snapshot/index
+    repeat param-index snapshot/count [
+        destination/values/:param-index: snapshot/values/:param-index
+    ]
+    return true
+]
+
+; --- files ------------------------------------------------------------------
+
+preset-fs: foreign <sys/stat.h> [
+    mkdir: "mkdir" [c-string! u32! return: [i32!]]
+]
+
+preset-buffer!: make c-struct! [
+    bytes: [c-array! [u8! 16384]]
+]
+
+preset-config-root: func [
+    "Base directory for per-user configuration, following XDG with a HOME fallback."
+    return: [string!] "Owned path with no trailing separator; empty when neither variable is set."
+] [
+    ; std/io's getenv rather than a foreign binding: clean-name lists getenv
+    ; among the C keywords it renames, and applies that to FFI symbols too, so
+    ; `getenv: "getenv"` in a foreign block lowers to a call to _getenv.
+    xdg: getenv (make string! "XDG_CONFIG_HOME")
+    if (length? xdg) > 0 [return xdg]
+    home: getenv (make string! "HOME")
+    if (length? home) = 0 [return make string! ""]
+    return rejoin [home "/.config"]
+]
+
+preset-dir: func [
+    "Directory a plug-in's presets live in, derived from its descriptor name."
+    :engine [engine!] "Borrowed engine descriptor."
+    return: [string!] "Owned path, no trailing separator."
+] [
+    return rejoin [
+        preset-config-root
+        "/"
+        (preset-name-slug (as c-pointer! engine/name))
+        "/presets"
+    ]
+]
+
+preset-path: func [
+    "Full path of one named preset inside a plug-in's directory."
+    :engine [engine!] "Borrowed engine descriptor."
+    :title [string!] "Preset name; folded to a slug so it is safe as a filename."
+    return: [string!] "Owned path."
+] [
+    return rejoin [(preset-dir :engine) "/" title ".preset"]
+]
+
+preset-ensure-dir: func [
+    "Create a plug-in's preset directory, and the config directory above it."
+    :engine [engine!] "Borrowed engine descriptor."
+    return: [logic!] "True when the directory exists afterwards."
+] [
+    ; Each level in turn rather than a recursive walk: the path is exactly three
+    ; deep and mkdir returning -1 for an existing directory is the normal case,
+    ; not a failure worth distinguishing here.
+    root: preset-config-root
+    if (length? root) = 0 [return false]
+    slug: preset-name-slug (as c-pointer! engine/name)
+    ; 493 is octal 755. mkdir returning -1 because the directory already exists
+    ; is the common case, so the result is deliberately not consulted.
+    made-root: preset-fs/mkdir (as c-string! root) (as u32! 493)
+    unused made-root
+    level2: rejoin [root "/" slug]
+    made-level2: preset-fs/mkdir (as c-string! level2) (as u32! 493)
+    unused made-level2
+    level3: rejoin [level2 "/presets"]
+    made-level3: preset-fs/mkdir (as c-string! level3) (as u32! 493)
+    unused made-level3
+    return true
+]
+
+preset-save: func [
+    "Write preset text to a path, replacing whatever was there."
+    :path [string!] "Destination path."
+    :text [string!] "Preset text to write."
+    return: [logic!] "True when every byte was written."
+] [
+    handle: preset-stdio/fopen (as c-string! path) (as c-string! "wb")
+    if none? handle [return false]
+    count: length? text
+    written: preset-stdio/fwrite (as c-pointer! (as c-string! text)) 1 (as size! count) handle
+    closed: preset-stdio/fclose handle
+    unused closed
+    return (as i32! written) = count
+]
+
+preset-load: func [
+    "Read preset text back from a path."
+    :path [string!] "Source path."
+    return: [string!] "Owned text; empty when the file is missing or unreadable."
+] [
+    handle: preset-stdio/fopen (as c-string! path) (as c-string! "rb")
+    if none? handle [return make string! ""]
+    raw: make c-pointer! unsafe/malloc (as i32! size-of preset-buffer!)
+    unsafe/memset raw 0 (as i32! size-of preset-buffer!)
+    got: preset-stdio/fread raw 1 (as size! (BROM-PRESET-TEXT-BYTES - 1)) handle
+    closed: preset-stdio/fclose handle
+    unused closed
+    out: preset-cstr-string raw
+    unsafe/free :raw
+    unused got
+    return out
+]
+
+; --- factory bank -----------------------------------------------------------
+
+preset-quoted-field: func [
+    "Read one quoted string field from preset text."
+    :text [string!] "Borrowed preset text."
+    :marker [string!] "Borrowed marker ending immediately before the field value."
+    return: [string!] "Owned field value; empty when the marker is absent."
+] [
+    value: make [#mutable string!] ""
+    found: parse text [
+        thru marker
+        copy value to {"}
+        to end
+    ]
+    if not found [return make string! ""]
+    return value
+]
+
+preset-name-of: func [
+    "Read the name a preset records for itself."
+    :text [string!] "Borrowed preset text."
+    return: [string!] "Owned name; empty when the text carries none."
+] [
+    return preset-quoted-field :text (make string! {name: "})
+]
+
+preset-key-of: func [
+    "Read a preset's stable load key, falling back to a slug of its name."
+    :text [string!] "Borrowed preset text."
+    return: [string!] "Owned machine key; empty when neither key nor name is usable."
+] [
+    key: preset-quoted-field :text (make string! {key: "})
+    if (length? key) > 0 [return key]
+    title: preset-name-of :text
+    if (length? title) = 0 [return make string! ""]
+    return preset-name-slug (as c-pointer! (as c-string! title))
+]
+
+preset-description-of: func [
+    "Read the optional description recorded in preset text."
+    :text [string!] "Borrowed preset text."
+    return: [string!] "Owned description; empty when the field is absent."
+] [
+    return preset-quoted-field :text (make string! {description: "})
+]
+
+preset-param-count: func [
+    "Count the parameter assignments carried by preset text."
+    :text [string!] "Borrowed preset text."
+    return: [i32!] "Number of syntactically valid key/value assignments."
+] [
+    ws: make bitset! charset " ^-^/^M"
+    key-chars: make bitset! charset "abcdefghijklmnopqrstuvwxyz0123456789-"
+    num-chars: make bitset! charset "0123456789+-.eE"
+    key: make [#mutable string!] ""
+    num: make [#mutable string!] ""
+    count: make [#mutable i32!] 0
+    ok: parse text [
+        thru "params: ["
+        any [
+            any ws
+            not ahead "]"
+            copy key some key-chars
+            any ws ":" any ws
+            copy num some num-chars
+            (count: count + 1)
+        ]
+        any ws "]"
+        to end
+    ]
+    if not ok [return 0]
+    return count
+]
+
+preset-feature-count: func [
+    "Count the feature words in a preset's optional metadata block."
+    :text [string!] "Borrowed preset text."
+    return: [i32!] "Number of feature words; zero when the block is absent or malformed."
+] [
+    ws: make bitset! charset " ^-^/^M"
+    feature-chars: make bitset! charset "abcdefghijklmnopqrstuvwxyz0123456789-"
+    feature: make [#mutable string!] ""
+    count: make [#mutable i32!] 0
+    found: parse text [
+        thru "features: ["
+        any [
+            any ws
+            not ahead "]"
+            copy feature some feature-chars (count: count + 1)
+        ]
+        any ws "]"
+        to end
+    ]
+    if not found [return 0]
+    return count
+]
+
+preset-feature-at: func [
+    "Read one feature word from a preset's optional metadata block."
+    :text [string!] "Borrowed preset text."
+    index [i32!] "Zero-based feature index."
+    return: [string!] "Owned feature word; empty when the index or block is invalid."
+] [
+    if index < 0 [return make string! ""]
+    ws: make bitset! charset " ^-^/^M"
+    feature-chars: make bitset! charset "abcdefghijklmnopqrstuvwxyz0123456789-"
+    feature: make [#mutable string!] ""
+    result: make [#mutable string!] ""
+    seen: make [#mutable i32!] 0
+    found: parse text [
+        thru "features: ["
+        any [
+            any ws
+            not ahead "]"
+            copy feature some feature-chars
+            (
+                if seen = index [result: feature]
+                seen: seen + 1
+            )
+        ]
+        any ws "]"
+        to end
+    ]
+    if not found [return make string! ""]
+    return result
+]
+
+preset-factory-count: func [
+    "How many built-in presets a plug-in ships."
+    :engine [engine!] "Borrowed engine descriptor."
+    return: [i32!] "Zero for a plug-in with no bank."
+] [
+    ; Gated on the count alone. A descriptor declaring a bank must supply the
+    ; function that serves it; testing the fn-ptr! field for none here is what
+    ; the count is already for.
+    if engine/factory-count <= 0 [return 0]
+    return engine/factory-count
+]
+
+preset-factory-text: func [
+    "The text of one built-in preset."
+    :engine [engine!] "Borrowed engine descriptor."
+    index [i32!] "Bank index, zero-based."
+    return: [string!] "Owned text; empty when the index is out of range."
+] [
+    if index < 0 [return make string! ""]
+    if index >= (preset-factory-count :engine) [return make string! ""]
+    return engine/factory-preset-fn index
+]
+
+preset-factory-name: func [
+    "The name of one built-in preset, without applying it."
+    :engine [engine!] "Borrowed engine descriptor."
+    index [i32!] "Bank index, zero-based."
+    return: [string!] "Owned name; empty when the index is out of range."
+] [
+    text: preset-factory-text :engine index
+    if (length? text) = 0 [return make string! ""]
+    return preset-name-of :text
+]
+
+preset-factory-key: func [
+    "Return one built-in preset's stable machine key."
+    :engine [engine!] "Borrowed engine descriptor."
+    index [i32!] "Bank index, zero-based."
+    return: [string!] "Owned key; empty when the index or preset metadata is invalid."
+] [
+    text: preset-factory-text :engine index
+    if (length? text) = 0 [return make string! ""]
+    return preset-key-of :text
+]
+
+preset-factory-index-by-key: func [
+    "Find a built-in preset by its stable machine key."
+    :engine [engine!] "Borrowed engine descriptor."
+    :key [string!] "Borrowed key supplied by a host or editor."
+    return: [i32!] "Zero-based bank index, or -1 when no preset matches."
+] [
+    found: make [#mutable i32!] -1
+    repeat index preset-factory-count :engine [
+        if found = -1 [
+            if (preset-factory-key :engine index) = key [found: index]
+        ]
+    ]
+    return found
+]
+
+preset-factory-apply: func [
+    "Load one built-in preset into an engine instance."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed engine instance to write into."
+    index [i32!] "Bank index, zero-based."
+    return: [i32!] "Parameters applied; zero when the index is out of range."
+] [
+    text: preset-factory-text :engine index
+    if (length? text) = 0 [return 0]
+    return preset-apply :engine :core :text
+]
+
+preset-factory-materialize: func [
+    "Materialize one sparse factory preset into a complete canonical snapshot."
+    :engine [engine!] "Borrowed engine descriptor used to interpret the preset."
+    index [i32!] "Zero-based factory-bank index."
+    :out [c-pointer!] "Borrowed address of caller-owned preset-snapshot! storage."
+    return: [logic!] "True when every default and preset value was canonicalized."
+] [
+    if any [none? out index < 0 index >= (preset-factory-count :engine)] [return false]
+    if engine/param-count > BROM-MAX-PARAMS [return false]
+
+    core: make c-pointer! engine/create-fn
+    if none? core [return false]
+    snapshot: make [#mutable preset-snapshot!] as preset-snapshot! :out
+    snapshot/count: engine/param-count
+    snapshot/index: index
+
+    info-raw: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+    if none? info-raw [engine/destroy-fn core return false]
+    unsafe/memset info-raw 0 (as i32! size-of param-info!)
+    valid: make [#mutable logic!] true
+    repeat param-index engine/param-count [
+        if valid [
+            either engine/param-info-fn param-index :info-raw [
+                info: make [#mutable param-info!] as param-info! info-raw
+                if not engine/set-param-fn core info/id info/default-value [valid: false]
+            ] [
+                valid: false
+            ]
+        ]
+    ]
+    unsafe/free info-raw
+
+    if valid [
+        text: preset-factory-text :engine index
+        if (length? text) = 0 [valid: false]
+        if valid [
+            applied: preset-apply :engine core :text
+            unused applied
+            repeat param-index engine/param-count [
+                snapshot/values/:param-index: make f64!
+                    engine/get-param-fn core (as u32! param-index)
+            ]
+        ]
+    ]
+    engine/destroy-fn core
+    return valid
+]
+
+preset-snapshot-apply: func [
+    "Replace an engine's complete parameter state from a materialized snapshot."
+    :engine [engine!] "Borrowed engine descriptor used to write the values."
+    :core [c-pointer!] "Borrowed mutable engine instance."
+    :snapshot-raw [c-pointer!] "Borrowed preset-snapshot! to apply."
+    return: [logic!] "True when the complete snapshot was accepted."
+] [
+    if any [none? core none? snapshot-raw] [return false]
+    snapshot: make [#mutable preset-snapshot!] as preset-snapshot! :snapshot-raw
+    if snapshot/count <> engine/param-count [return false]
+    valid: make [#mutable logic!] true
+    repeat param-index snapshot/count [
+        if valid [
+            if not engine/set-param-fn :core (as u32! param-index)
+                (make f64! snapshot/values/:param-index) [valid: false]
+        ]
+    ]
+    return valid
+]
+
+preset-snapshot-param-matches: func [
+    "Return whether one value matches its canonical slot in a snapshot."
+    :snapshot-raw [c-pointer!] "Borrowed preset-snapshot! to inspect."
+    param-id [u32!] "Public parameter identifier."
+    value [f64!] "Canonical engineering-unit value to compare."
+    return: [logic!] "True when the slot exists and its value is equivalent."
+] [
+    if none? snapshot-raw [return false]
+    snapshot: make [#mutable preset-snapshot!] as preset-snapshot! :snapshot-raw
+    if param-id >= (as u32! snapshot/count) [return false]
+    return preset-values-equal? value (make f64! snapshot/values/(as i32! param-id))
+]
+
+preset-snapshot-matches: func [
+    "Return whether an engine currently holds every value in a snapshot."
+    :engine [engine!] "Borrowed engine descriptor used to read the values."
+    :core [c-pointer!] "Borrowed engine instance to compare."
+    :snapshot-raw [c-pointer!] "Borrowed preset-snapshot! to compare against."
+    return: [logic!] "True only when the complete parameter state matches."
+] [
+    if any [none? core none? snapshot-raw] [return false]
+    snapshot: make [#mutable preset-snapshot!] as preset-snapshot! :snapshot-raw
+    if snapshot/count <> engine/param-count [return false]
+    matches: make [#mutable logic!] true
+    repeat param-index snapshot/count [
+        if matches [
+            actual: make f64! engine/get-param-fn :core (as u32! param-index)
+            if not preset-values-equal? actual
+                (make f64! snapshot/values/:param-index) [matches: false]
+        ]
+    ]
+    return matches
+]
+
+preset-factory-match: func [
+    "Find the factory preset whose canonical snapshot matches an engine state."
+    :engine [engine!] "Borrowed engine descriptor used to materialize the bank."
+    :core [c-pointer!] "Borrowed engine instance to identify."
+    return: [i32!] "Matching zero-based bank index, or -1 for a custom state."
+] [
+    found: make [#mutable i32!] -1
+    candidate: make [#mutable preset-snapshot!] [count: 0 index: -1 values: []]
+    repeat index preset-factory-count :engine [
+        if found < 0 [
+            if preset-factory-materialize :engine index (addr-of candidate) [
+                if preset-snapshot-matches :engine :core (addr-of candidate) [found: index]
+            ]
+        ]
+    ]
+    return found
+]
+
+; --- host state -------------------------------------------------------------
+;
+; A host streams a plug-in's session as a fixed-size blob, so preset text
+; reaches it NUL-terminated inside a buffer of that size rather than as a
+; length-prefixed payload. That keeps the shell's contract -- it still writes
+; and reads exactly state-size bytes -- while making a saved session and a
+; preset file the same representation, readable with the same eyes.
+
+preset-fill-buffer: func [
+    "Copy preset text into a fixed buffer, NUL-terminated."
+    :text [string!] "Borrowed preset text."
+    :out [c-pointer!] "Borrowed destination buffer."
+    capacity [i32!] "Bytes available in the destination."
+    return: [logic!] "False when the text plus its terminator would not fit."
+] [
+    n: length? text
+    if (n + 1) > capacity [return false]
+    buf: make [#mutable preset-buffer!] as preset-buffer! :out
+    repeat i n [
+        ch: text/:i
+        buf/bytes/:i: as u8! ch
+    ]
+    buf/bytes/:n: as u8! 0
+    return true
+]

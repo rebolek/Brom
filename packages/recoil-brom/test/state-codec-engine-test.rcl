@@ -1,0 +1,181 @@
+Recoil [
+    Title: "state-codec-load-engine and state-codec-save-engine round-trip through the BROM container"
+    Type: module
+    Module: recoil-brom/test/state-codec-engine-test
+    Imports: [
+        brom/plugin/engine [engine! param-info!]
+        brom/plugin/values [param-range! param-linear]
+        brom/plugin/state/codec [
+            BROM-MAGIC BROM-CONTAINER-VERSION
+            state-codec-size state-codec-load-engine state-codec-save-engine
+        ]
+    ]
+    Exports: []
+]
+
+checks: make [#mutable i32!] 0
+failures: make [#mutable i32!] 0
+
+expect: func [
+    :label [string!]
+    actual [logic!]
+    expected [logic!]
+    return: [none!]
+] [
+    checks: checks + 1
+    either actual = expected [
+        print rejoin ["PASS " label]
+    ] [
+        failures: failures + 1
+        print rejoin ["FAIL " label " -- got " actual " want " expected]
+    ]
+    return none
+]
+
+; --- a minimal three-parameter fixture, storage-only, no DSP ----------------
+
+fixture-core!: make c-struct! [values: [c-array! [f64! 3]]]
+
+fixture-param-info: func [
+    index [i32!]
+    :out [c-pointer!]
+    return: [logic!]
+] [
+    if any [index < 0 index >= 3] [return false]
+    info: make [#mutable param-info!] as param-info! :out
+    info/id: as u32! index
+    info/name: as c-string! "p"
+    info/module: as c-string! ""
+    info/default-value: (as f64! index) * 10.0
+    info/range: make param-range! [
+        lo: 0.0 hi: 1000.0 skew: 1.0 symmetric: 0 steps: 0 kind: 0
+    ]
+    return true
+]
+
+fixture-get-param: func [
+    :core [c-pointer!]
+    id [u32!]
+    return: [f64!]
+] [
+    state: make [#mutable fixture-core!] as fixture-core! :core
+    if id >= (as u32! 3) [return 0.0]
+    return state/values/(as i32! id)
+]
+
+fixture-set-param: func [
+    :core [c-pointer!]
+    id [u32!]
+    value [f64!]
+    return: [logic!]
+] [
+    state: make [#mutable fixture-core!] as fixture-core! :core
+    if id >= (as u32! 3) [return false]
+    state/values/(as i32! id): value
+    return true
+]
+
+fixture-a: make engine! [
+    id: (as c-string! "com.recoil-brom.test.fixture-a")
+    name: (as c-string! "Fixture A")
+    vendor: (as c-string! "Recoil")
+    version: (as c-string! "0.0.0")
+    description: (as c-string! "state-codec-engine-test fixture A")
+    param-count: 3
+    max-voices: 0
+    state-size: 44
+    output-capacity: 0
+    editor-width: 0
+    editor-height: 0
+    param-info-fn: :fixture-param-info
+    get-param-fn: :fixture-get-param
+    set-param-fn: :fixture-set-param
+    state-subsystem: 0#41585946   ; "FYXA" reversed byte order -> "AXYF"; see codec.rcl's convention note
+    state-version: 1
+]
+
+fixture-b: make engine! [
+    id: (as c-string! "com.recoil-brom.test.fixture-b")
+    name: (as c-string! "Fixture B")
+    vendor: (as c-string! "Recoil")
+    version: (as c-string! "0.0.0")
+    description: (as c-string! "state-codec-engine-test fixture B")
+    param-count: 3
+    max-voices: 0
+    state-size: 44
+    output-capacity: 0
+    editor-width: 0
+    editor-height: 0
+    param-info-fn: :fixture-param-info
+    get-param-fn: :fixture-get-param
+    set-param-fn: :fixture-set-param
+    state-subsystem: 0#42585946   ; a different subsystem than fixture-a
+    state-version: 1
+]
+
+buf!: make c-struct! [bytes: [c-array! [u8! 64]]]
+buf: make c-pointer! unsafe/malloc (as i32! size-of buf!)
+
+; --- round trip --------------------------------------------------------------
+
+a-core: make c-pointer! unsafe/malloc (as i32! size-of fixture-core!)
+unsafe/memset a-core 0 (as i32! size-of fixture-core!)
+fixture-set-param a-core (as u32! 0) 1.5
+fixture-set-param a-core (as u32! 1) 2.5
+fixture-set-param a-core (as u32! 2) 3.5
+
+unsafe/memset buf 0 (as i32! size-of buf!)
+saved: state-codec-save-engine :fixture-a a-core buf (as size! size-of buf!)
+expect (make string! "save-engine writes the full container") saved true
+
+b-core: make c-pointer! unsafe/malloc (as i32! size-of fixture-core!)
+unsafe/memset b-core 0 (as i32! size-of fixture-core!)
+loaded: state-codec-load-engine :fixture-a b-core buf (as size! size-of buf!)
+expect (make string! "load-engine accepts its own subsystem/version") loaded true
+expect (make string! "round-tripped param 0")
+    ((fixture-get-param b-core (as u32! 0)) = 1.5) true
+expect (make string! "round-tripped param 2")
+    ((fixture-get-param b-core (as u32! 2)) = 3.5) true
+
+; --- count-less-than-param-count defaults the tail --------------------------
+
+view: make [#mutable buf!] as buf! buf
+; Byte 16 is the inner header's count field (8-byte BROM prefix + the
+; existing codec's own 8-byte magic/version pair, both u32! little-endian).
+view/bytes/16: as u8! 2
+view/bytes/17: as u8! 0
+view/bytes/18: as u8! 0
+view/bytes/19: as u8! 0
+unsafe/memset a-core 0 (as i32! size-of fixture-core!)
+fixture-set-param a-core (as u32! 2) 99.0
+partial: state-codec-load-engine :fixture-a a-core buf (as size! size-of buf!)
+expect (make string! "a short count is still accepted") partial true
+expect (make string! "an unmentioned parameter takes its param-info-fn default")
+    ((fixture-get-param a-core (as u32! 2)) = 20.0) true
+
+; --- rejections --------------------------------------------------------------
+
+unsafe/memset buf 0 (as i32! size-of buf!)
+saved-b: state-codec-save-engine :fixture-a a-core buf (as size! size-of buf!)
+unused saved-b
+view/bytes/0: as u8! 0
+wrong-magic: state-codec-load-engine :fixture-a a-core buf (as size! size-of buf!)
+expect (make string! "wrong BROM magic rejected") wrong-magic false
+
+state-codec-save-engine :fixture-a a-core buf (as size! size-of buf!)
+wrong-subsystem: state-codec-load-engine :fixture-b a-core buf (as size! size-of buf!)
+expect (make string! "right magic, wrong subsystem rejected") wrong-subsystem false
+
+state-codec-save-engine :fixture-a a-core buf (as size! size-of buf!)
+view/bytes/12: as u8! 99
+wrong-version: state-codec-load-engine :fixture-a a-core buf (as size! size-of buf!)
+expect (make string! "state-version mismatch rejected") wrong-version false
+
+state-codec-save-engine :fixture-a a-core buf (as size! size-of buf!)
+too-short: state-codec-load-engine :fixture-a a-core buf (as size! 10)
+expect (make string! "a stream shorter than the container is rejected outright") too-short false
+
+unsafe/free a-core
+unsafe/free b-core
+unsafe/free buf
+print rejoin ["checks " checks " failures " failures]

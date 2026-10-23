@@ -1,0 +1,105 @@
+Recoil [
+    Title: "Loos voice allocation invariant"
+    Description: {
+        Loos' allocation changed with the Brom retrofit, so unlike Kapralova
+        there is no old behaviour to compare against -- the old behaviour is the
+        bug. It scanned the shell's voice table, which clears on note-off while
+        the voice keeps sounding through its release tail, so it handed out
+        slots that were still audible.
+
+        What is checked here is the property that failure violated: while any
+        voice is idle, the allocator must return an idle one. And when none is
+        idle, it must prefer a released voice over a held one.
+    }
+    Type: module
+    Module: examples/pokuston/loos/voice-alloc-test
+    Imports: [
+        brom/plugin/engine [engine! brom-voice-state! brom-select-voice]
+        examples/pokuston/loos/core [
+            LOOS_MAX_VOICES
+            loos-create loos-destroy loos-activate
+            loos-voice-state loos-note-on loos-note-off loos-process-block
+        ]
+    ]
+    Exports: []
+]
+
+voice-state-adapter: func [
+    "Descriptor slot forwarding to the core's accessor."
+    :core [c-pointer!] "Borrowed engine state."
+    slot [i32!] "Voice slot."
+    :out [c-pointer!] "Borrowed brom-voice-state! to fill."
+    return: [logic!] "False when the slot is out of range."
+] [
+    return loos-voice-state :core slot :out
+]
+
+probe-engine: make engine! [
+    max-voices: LOOS_MAX_VOICES
+    voice-state-fn: :voice-state-adapter
+    custom-voice-slot: false
+]
+
+failures: make [#mutable i32!] 0
+checks: make [#mutable i32!] 0
+
+check-invariant: func [
+    "Assert the allocator never takes a sounding voice while an idle one exists."
+    :core [c-pointer!] "Borrowed engine state."
+    return: [i32!] "The slot the allocator chose."
+] [
+    vs: make [#mutable brom-voice-state!] make brom-voice-state! [
+        active: false gate: false energy: 0.0 age: 0
+    ]
+    idle-exists: make [#mutable logic!] false
+    repeat i LOOS_MAX_VOICES [
+        if loos-voice-state :core i (addr-of vs) [
+            if not vs/active [idle-exists: true]
+        ]
+    ]
+    chosen: make i32! brom-select-voice :probe-engine :core
+    checks: checks + 1
+    if loos-voice-state :core chosen (addr-of vs) [
+        ; Violated exactly when a sounding voice is taken with an idle one free.
+        if all [idle-exists vs/active] [failures: failures + 1]
+    ]
+    return chosen
+]
+
+inst: make c-pointer! loos-create
+loos-activate inst 48000.0
+
+; Fill the four slots; every pick here must be an idle voice.
+repeat i LOOS_MAX_VOICES [
+    slot: make i32! check-invariant :inst
+    loos-note-on inst slot 220.0 0.8
+    loos-process-block inst 64
+]
+
+; Release two and let them decay. They stay `active` through the tail, which is
+; precisely the window the old policy got wrong.
+loos-note-off inst 0
+loos-note-off inst 1
+repeat i 8 [
+    loos-process-block inst 128
+    slot: make i32! check-invariant :inst
+]
+
+; Every key held: the allocator must still return a slot in range.
+repeat i LOOS_MAX_VOICES [
+    loos-note-on inst i 330.0 0.9
+    loos-process-block inst 32
+]
+repeat i 6 [
+    slot: make i32! check-invariant :inst
+    if slot < 0 [failures: failures + 1]
+    if slot >= LOOS_MAX_VOICES [failures: failures + 1]
+]
+
+loos-destroy inst
+
+print "checks:"
+print checks
+print "failures:"
+print failures
+either failures = 0 [print "PASS"] [print "FAIL"]

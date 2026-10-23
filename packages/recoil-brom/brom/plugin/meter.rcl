@@ -1,0 +1,368 @@
+Recoil [
+    Title: "Brom plug-in meter service"
+    Type: module
+    Module: brom/plugin/meter
+    Exports: [
+        brom-meter-pair! brom-meter-snapshot!
+        BROM-METER-HOLD-NS BROM-METER-RELEASE-NS
+        brom-meter-create brom-meter-destroy brom-meter-reset
+        brom-meter-observe brom-meter-unavailable
+        brom-meter-snapshot-read brom-meter-read
+        brom-meter-snapshot-clear brom-meter-snapshot-reset
+        brom-meter-snapshot-age brom-meter-snapshot-accept
+    ]
+]
+
+; All times are CLOCK_MONOTONIC nanoseconds, shared by source and reader. The
+; host adapters obtain them with their allocation-free platform clock (on POSIX,
+; clock_gettime(CLOCK_MONOTONIC) into a stack timespec; on Windows, convert
+; QueryPerformanceCounter with its fixed frequency to nanoseconds). std/time's current
+; monotonic-nanos allocates, so the audio path deliberately supplies the time.
+BROM-METER-HOLD-NS: 250000000
+BROM-METER-RELEASE-NS: 300000000
+; -400 dBFS is below any visible gauge reading and well above f64 subnormals.
+; One amplitude floor applies to both raw admission and accumulated release.
+BROM-METER-FLOOR: 1.0e-20
+
+; The optional engine source writes only this raw sample-peak pair. The source
+; does not own hold/release policy, timestamps, generations, or publication.
+brom-meter-pair!: make c-struct! [
+    excitation: [f64!]
+    output: [f64!]
+]
+
+; Fixed 56-byte copied transport contract. Levels are the envelope at observed-ns,
+; not at the time a transport happened to poll. Keep hold deadlines intact when
+; coalescing: a reader can then age a skipped or delayed snapshot correctly.
+brom-meter-snapshot!: make c-struct! [
+    excitation: [f64!]
+    output: [f64!]
+    excitation-hold-ns: [i64!]
+    output-hold-ns: [i64!]
+    observed-ns: [i64!]
+    sequence: [u64!]
+    generation: [u64!]
+]
+
+; Only the audio writer touches the reducer fields. Every mailbox payload field
+; is atomic too: a sequence check alone around plain payload reads is a C data
+; race, even when a reader later discards its copy. Recoil #atomic lowers to
+; sequentially consistent C11 atomics; aligned 64-bit scalar operations are
+; lock-free on the native 64-bit plug-in targets. There is no managed heap shared
+; with the reader, no retry on the writer, and only four attempts on a reader.
+;
+; Reset changes only requested-generation. It can race safely with rendering:
+; readers immediately reject the old generation, and the writer starts a fresh
+; reducer at its next observation. An in-flight old publication stays rejected.
+brom-meter-service!: make c-struct! [
+    requested-generation: [#atomic u64!]
+    publication: [#atomic u64!]
+    published-excitation: [#atomic f64!]
+    published-output: [#atomic f64!]
+    published-excitation-hold: [#atomic i64!]
+    published-output-hold: [#atomic i64!]
+    published-observed: [#atomic i64!]
+    published-sequence: [#atomic u64!]
+    published-generation: [#atomic u64!]
+    excitation: [f64!]
+    output: [f64!]
+    excitation-hold-ns: [i64!]
+    output-hold-ns: [i64!]
+    observed-ns: [i64!]
+    sequence: [u64!]
+    generation: [u64!]
+]
+
+meter-math: foreign <math.h> [
+    exp: "exp" [f64!] return: [f64!]
+    finite: "isfinite" [f64!] return: [i32!]
+]
+
+meter-valid-level?: func [
+    "Check whether a raw peak can enter the envelope."
+    value [f64!] "Raw sample-peak magnitude."
+    return: [logic!] "False for NaN or either infinity."
+] [
+    return (meter-math/finite value) <> 0
+]
+
+meter-clamp: func [
+    "Map a finite sample peak onto the gauge's linear full-scale range."
+    value [f64!] "Raw sample-peak magnitude."
+    return: [f64!] "Value clamped to 0.0 through 1.0, flushing peaks below the meter floor."
+] [
+    if value < BROM-METER-FLOOR [return 0.0]
+    if value >= 1.0 [return 1.0]
+    return value
+]
+
+meter-age-level: func [
+    "Age a held level without counting a read as a new observation."
+    level [f64!] "Envelope level at the previous observation."
+    hold-ns [i64!] "Absolute end of the source observation's hold."
+    observed-ns [i64!] "Monotonic time at which level was last evaluated."
+    now-ns [i64!] "Requested monotonic evaluation time."
+    return: [f64!] "Held or exponentially released level."
+] [
+    if not meter-valid-level? level [return 0.0]
+    if level < BROM-METER-FLOOR [return 0.0]
+    if now-ns <= observed-ns [return meter-clamp level]
+    if now-ns <= hold-ns [return meter-clamp level]
+    start-ns: either observed-ns > hold-ns [observed-ns] [hold-ns]
+    elapsed: (as f64! (now-ns - start-ns)) / (as f64! BROM-METER-RELEASE-NS)
+    ; Bound exp's argument for long gaps; the amplitude floor below also
+    ; handles decay accumulated through arbitrarily frequent observations.
+    if elapsed >= 80.0 [return 0.0]
+    released: (meter-clamp level) * (meter-math/exp (0.0 - elapsed))
+    return meter-clamp released
+]
+
+brom-meter-snapshot-clear: func [
+    "Fill caller storage with an empty snapshot for a generation."
+    :out [c-pointer!] "Borrowed address of a brom-meter-snapshot!."
+    generation [u64!] "Generation that the reader must now accept."
+    return: [none!] "No result."
+] [
+    if none? out [return none]
+    snapshot: make [#mutable brom-meter-snapshot!] as brom-meter-snapshot! out
+    snapshot/excitation: 0.0
+    snapshot/output: 0.0
+    snapshot/excitation-hold-ns: 0
+    snapshot/output-hold-ns: 0
+    snapshot/observed-ns: 0
+    snapshot/sequence: 0
+    snapshot/generation: generation
+]
+
+brom-meter-snapshot-reset: func [
+    "Clear a copied reader snapshot at a non-audio generation boundary."
+    :current [c-pointer!] "Borrowed reader-owned brom-meter-snapshot! state."
+    generation [u64!] "Current service generation from a Brom reset notification."
+    return: [logic!] "False unless the notification advances the accepted generation."
+] [
+    if any [none? current generation = 0] [return false]
+    state: make [#mutable brom-meter-snapshot!] as brom-meter-snapshot! current
+    ; Duplicate reset messages may be delivered after a snapshot from this
+    ; generation. Only a newer generation is allowed to erase reader state.
+    if generation <= state/generation [return false]
+    brom-meter-snapshot-clear :current generation
+    return true
+]
+
+brom-meter-create: func [
+    "Allocate an independent meter service outside the audio callback."
+    return: [c-pointer!] "Owned service pointer, or null on allocation failure."
+] [
+    raw: make c-pointer! unsafe/malloc (as i32! size-of brom-meter-service!)
+    if none? raw [return as c-pointer! 0]
+    ; Initialization happens before publishing the instance to other threads.
+    unsafe/memset raw 0 (as i32! size-of brom-meter-service!)
+    service: make [#mutable brom-meter-service!] as brom-meter-service! raw
+    service/requested-generation: 1
+    return raw
+]
+
+brom-meter-destroy: func [
+    "Release a service after all audio and reader callbacks have stopped."
+    :raw [c-pointer!] "Borrowed service pointer; its allocation is released."
+    return: [none!] "No result."
+] [
+    if none? raw [return none]
+    unsafe/free raw
+]
+
+brom-meter-reset: func [
+    "Invalidate pending readings immediately and begin a new generation."
+    :raw [c-pointer!] "Borrowed per-instance service, safe to reset while rendering."
+    return: [u64!] "New generation; zero for a missing service."
+] [
+    if none? raw [return as u64! 0]
+    service: make [#mutable brom-meter-service!] as brom-meter-service! raw
+    previous: atomic-add service/requested-generation (as u64! 1)
+    return previous + (as u64! 1)
+]
+
+meter-publish: func [
+    "Publish the audio-owned reducer through the atomic mailbox."
+    :raw [c-pointer!] "Borrowed service, called only by its single audio writer."
+    return: [none!] "No result."
+] [
+    service: make [#mutable brom-meter-service!] as brom-meter-service! raw
+    atomic-add service/publication (as u64! 1)
+    service/published-excitation: service/excitation
+    service/published-output: service/output
+    service/published-excitation-hold: service/excitation-hold-ns
+    service/published-output-hold: service/output-hold-ns
+    service/published-observed: service/observed-ns
+    service/published-sequence: service/sequence
+    service/published-generation: service/generation
+    atomic-add service/publication (as u64! 1)
+]
+
+meter-observe: func [
+    "Reduce a fresh rendered chunk before transport can coalesce its snapshot."
+    :raw [c-pointer!] "Borrowed service, used only by its single audio writer."
+    excitation [f64!] "Raw stereo sample peak of relative excitation."
+    output [f64!] "Raw stereo sample peak of final output."
+    available [logic!] "Whether the engine supplied a valid source for this chunk."
+    now-ns [i64!] "Nonnegative CLOCK_MONOTONIC observation time in nanoseconds."
+    return: [none!] "No result."
+] [
+    if none? raw [return none]
+    if now-ns < 0 [return none]
+    ; Leave enough headroom for the 250 ms deadline without signed overflow.
+    if now-ns > (as i64! 9223372036604775807) [return none]
+    service: make [#mutable brom-meter-service!] as brom-meter-service! raw
+    generation: make u64! service/requested-generation
+    if service/generation <> generation [
+        service/excitation: 0.0
+        service/output: 0.0
+        service/excitation-hold-ns: 0
+        service/output-hold-ns: 0
+        service/observed-ns: 0
+        service/generation: generation
+    ]
+    ; A caller's clock must never move the reducer backwards.
+    observed: either now-ns > service/observed-ns [now-ns] [service/observed-ns]
+    service/excitation: meter-age-level service/excitation service/excitation-hold-ns service/observed-ns observed
+    service/output: meter-age-level service/output service/output-hold-ns service/observed-ns observed
+    either all [available meter-valid-level? excitation] [
+        peak: meter-clamp excitation
+        if peak >= service/excitation [
+            service/excitation: peak
+            service/excitation-hold-ns: observed + (as i64! BROM-METER-HOLD-NS)
+        ]
+    ] [
+        service/excitation: 0.0
+        service/excitation-hold-ns: observed
+    ]
+    either all [available meter-valid-level? output] [
+        peak: meter-clamp output
+        if peak >= service/output [
+            service/output: peak
+            service/output-hold-ns: observed + (as i64! BROM-METER-HOLD-NS)
+        ]
+    ] [
+        service/output: 0.0
+        service/output-hold-ns: observed
+    ]
+    service/observed-ns: observed
+    service/sequence: service/sequence + (as u64! 1)
+    meter-publish :raw
+]
+
+brom-meter-observe: func [
+    "Observe one fresh raw pair immediately after its rendered chunk."
+    :raw [c-pointer!] "Borrowed service, used only by its single audio writer."
+    excitation [f64!] "Raw relative-excitation sample peak; nonfinite clears it."
+    output [f64!] "Raw final-output sample peak; nonfinite clears it."
+    now-ns [i64!] "Nonnegative CLOCK_MONOTONIC observation time in nanoseconds."
+    return: [none!] "No result."
+] [
+    meter-observe :raw excitation output true now-ns
+]
+
+brom-meter-unavailable: func [
+    "Publish zero when an engine has no available meter source."
+    :raw [c-pointer!] "Borrowed service, used only by its single audio writer."
+    now-ns [i64!] "Nonnegative CLOCK_MONOTONIC observation time in nanoseconds."
+    return: [none!] "No result."
+] [
+    meter-observe :raw 0.0 0.0 false now-ns
+]
+
+brom-meter-snapshot-read: func [
+    "Copy a coherent processed snapshot without aging or extending its hold."
+    :raw [c-pointer!] "Borrowed service; any non-audio reader may call."
+    :out [c-pointer!] "Borrowed caller-owned brom-meter-snapshot! destination."
+    return: [logic!] "False for a missing service or a busy mailbox; out is unchanged."
+] [
+    if any [none? raw none? out] [return false]
+    service: make [#mutable brom-meter-service!] as brom-meter-service! raw
+    repeat attempt 4 [
+        generation: make u64! service/requested-generation
+        ; A reset must clear a reader even while an old writer is publishing.
+        if service/published-generation <> generation [
+            brom-meter-snapshot-clear :out generation
+            return true
+        ]
+        before: make u64! service/publication
+        if (before & (as u64! 1)) <> (as u64! 0) [continue]
+        ; Each scalar load is atomic; this local copy is never shared.
+        snapshot: make [#mutable brom-meter-snapshot!] [
+            excitation: 0.0 output: 0.0
+            excitation-hold-ns: 0 output-hold-ns: 0 observed-ns: 0
+            sequence: 0 generation: 0
+        ]
+        snapshot/excitation: service/published-excitation
+        snapshot/output: service/published-output
+        snapshot/excitation-hold-ns: service/published-excitation-hold
+        snapshot/output-hold-ns: service/published-output-hold
+        snapshot/observed-ns: service/published-observed
+        snapshot/sequence: service/published-sequence
+        snapshot/generation: service/published-generation
+        after: make u64! service/publication
+        if generation <> service/requested-generation [continue]
+        if before <> after [continue]
+        if snapshot/generation <> generation [
+            brom-meter-snapshot-clear :out generation
+            return true
+        ]
+        unsafe/memcpy out (addr-of snapshot) (as i32! size-of brom-meter-snapshot!)
+        return true
+    ]
+    return false
+]
+
+brom-meter-snapshot-age: func [
+    "Age a caller-owned snapshot, including elapsed transport or closed-editor time."
+    :raw [c-pointer!] "Borrowed private brom-meter-snapshot! copy, never the mailbox."
+    now-ns [i64!] "Current CLOCK_MONOTONIC time in nanoseconds."
+    return: [none!] "No result; sequence and generation stay unchanged."
+] [
+    if none? raw [return none]
+    snapshot: make [#mutable brom-meter-snapshot!] as brom-meter-snapshot! raw
+    if now-ns <= snapshot/observed-ns [return none]
+    snapshot/excitation: meter-age-level snapshot/excitation snapshot/excitation-hold-ns snapshot/observed-ns now-ns
+    snapshot/output: meter-age-level snapshot/output snapshot/output-hold-ns snapshot/observed-ns now-ns
+    snapshot/observed-ns: now-ns
+]
+
+brom-meter-read: func [
+    "Read a coherent envelope and age its private copy for immediate display."
+    :raw [c-pointer!] "Borrowed per-instance service."
+    now-ns [i64!] "Current CLOCK_MONOTONIC time in nanoseconds."
+    :out [c-pointer!] "Borrowed caller-owned brom-meter-snapshot! destination."
+    return: [logic!] "False for a missing service or busy mailbox; out is unchanged."
+] [
+    if not brom-meter-snapshot-read :raw :out [return false]
+    brom-meter-snapshot-age :out now-ns
+    return true
+]
+
+brom-meter-snapshot-accept: func [
+    "Accept a newer copied transport snapshot without refreshing its source hold."
+    :current [c-pointer!] "Borrowed reader-owned brom-meter-snapshot! state."
+    :incoming [c-pointer!] "Borrowed immutable copied brom-meter-snapshot! message."
+    return: [logic!] "False for a duplicate, older identity, or malformed snapshot."
+] [
+    if any [none? current none? incoming] [return false]
+    state: make [#mutable brom-meter-snapshot!] as brom-meter-snapshot! current
+    next: make [#mutable brom-meter-snapshot!] as brom-meter-snapshot! incoming
+    if next/generation < state/generation [return false]
+    if all [next/generation = state/generation next/sequence <= state/sequence] [return false]
+    if any [next/observed-ns < 0 next/excitation-hold-ns < 0 next/output-hold-ns < 0] [return false]
+    ; A valid source can hold at most 250 ms beyond its observation. Validate
+    ; differences only after their ordering, avoiding signed overflow.
+    if next/excitation-hold-ns > next/observed-ns [
+        if (next/excitation-hold-ns - next/observed-ns) > (as i64! BROM-METER-HOLD-NS) [return false]
+    ]
+    if next/output-hold-ns > next/observed-ns [
+        if (next/output-hold-ns - next/observed-ns) > (as i64! BROM-METER-HOLD-NS) [return false]
+    ]
+    if not meter-valid-level? next/excitation [return false]
+    if not meter-valid-level? next/output [return false]
+    if any [next/excitation < 0.0 next/excitation > 1.0 next/output < 0.0 next/output > 1.0] [return false]
+    unsafe/memcpy current incoming (as i32! size-of brom-meter-snapshot!)
+    return true
+]

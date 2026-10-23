@@ -1,0 +1,6 @@
+Recoil [
+    Title: "Pugl native backend marker (macOS)"
+    Type: module
+    Module: recoil/pugl/backend/darwin
+    Exports: []
+]

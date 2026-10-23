@@ -1,0 +1,1228 @@
+Recoil [
+    Title: "Widgets drawn with Draw"
+    Description: {
+        Reusable pieces of interface, written in the Draw dialect. A widget
+        here is two things and no more: a function that renders it, and a
+        function that answers whether a point is inside it. It owns no state
+        and decides nothing about what a click means -- the caller keeps the
+        value, reads the mouse, and calls back in. That boundary is what lets
+        one knob serve three plug-ins whose gestures and parameter models
+        differ.
+
+        Every position, size and offset here is one `fpair!` or `rect!` from
+        std/geometry rather than a run of loose scalars. That is not tidiness:
+        `widget-knob-hit?` used to take four unpaired numbers in an order only
+        its docstring defended, and a caller that swapped the point for the
+        centre got a plausible wrong answer. Paired, the same mistake does not
+        typecheck.
+
+        The knob is the shape every synthesiser front end needs: a track, the
+        swept portion of it, a body, and a pointer. Its one option is an
+        envelope preview drawn inside the face, which is how a control that
+        applies an envelope can show the envelope it is applying.
+    }
+    Type: module
+    Module: gui/widget
+    Imports: [
+        gui/gui [
+            gui-context-measure-text
+            gui-path-begin gui-path-move-to gui-path-line-to gui-path-quad-to
+            gui-path-stroke gui-path-stroke-color gui-path-stroke-width
+            gui-path-save gui-path-restore gui-path-scissor
+            gui-path-translate gui-path-scale
+        ]
+        gui/draw [draw]
+        std/geometry [fpair! rect! fxy rect-of rect-right pair-sub]
+    ]
+    Exports: [
+        knob-style! knob-style-default knob-style-mach knob-style-loos
+        knob-style-kapralova knob-style-kapralova-choice knob-style-punkva
+        fader-style! fader-style-default fader-style-loos fader-geometry!
+        envelope-shape! envelope-points!
+        widget-knob widget-knob-punkva-overlay widget-knob-with-envelope widget-knob-hit? widget-image-frame widget-image-frame-width
+        widget-knob-label-band widget-knob-ring-overspill
+        widget-fader widget-fader-hit? widget-fader-geometry
+        widget-envelope-curve widget-envelope-curve-path widget-envelope-geometry
+        envelope-editor-layout! widget-envelope-editor-layout
+        widget-envelope-editor widget-envelope-editor-hit
+        widget-envelope-knob-centre
+        widget-text-centred widget-text-centred-on-tape widget-text-wrapped widget-format-number widget-colour
+        WIDGET-ENVELOPE-STAGES
+        LOOS-BOARD LOOS-PAPER LOOS-ROOM LOOS-INK LOOS-MUTED
+        LOOS-CONSTRUCTION LOOS-OXBLOOD LOOS-OXBLOOD-BRIGHT
+    ]
+]
+
+; Three quarters of a turn, opening at the bottom: the angle a pointer reads
+; unambiguously at both ends.
+WIDGET-KNOB-START: 2.35619449
+WIDGET-KNOB-SPAN: 4.71238898
+
+widget-fmt: foreign <stdio.h> [
+    snprintf: "snprintf" [c-pointer! size! c-string! f64! return: [i32!]]
+]
+
+widget-image-frame-width: func [
+    "Validate a horizontal sprite sheet and return the width of one frame."
+    image-width [i32!] "Decoded sheet width in pixels."
+    frame-count [i32!] "Number of equally sized horizontal frames."
+    return: [i32!] "Positive frame width, or zero for an invalid sheet."
+] [
+    if any [image-width <= 0 frame-count <= 0 frame-count > image-width] [return 0]
+    if (image-width % frame-count) <> 0 [return 0]
+    return image-width / frame-count
+]
+
+widget-image-frame: func [
+    "Map a finite normalized value to the nearest sprite frame."
+    value [f32!] "Normalized control value; non-finite values select zero."
+    frame-count [i32!] "Number of horizontal frames, at least one."
+    return: [i32!] "Frame ordinal between zero and frame-count minus one."
+] [
+    if frame-count <= 1 [return 0]
+    ; Subtracting infinity from itself yields NaN, as does a NaN input.
+    finite-check: value - value
+    if finite-check <> finite-check [return 0]
+    if value <= (as f32! 0.0) [return 0]
+    if value >= (as f32! 1.0) [return frame-count - 1]
+    return as i32! ((value * as f32! (frame-count - 1)) + as f32! 0.5)
+]
+
+knob-style!: make c-struct! [
+    track: [u32!]
+    accent: [u32!]
+    pointer-color: [u32!]
+    body: [u32!]
+    inner: [u32!]
+    line-width: [f64!]
+    ; Pixels between the body and the track arc drawn outside it.
+    track-gap: [f64!]
+    ; The pointer, as three numbers rather than as a second draw routine.
+    ; `pointer-base` and `pointer-tip` are insets from the RIM, so a knob
+    ; twice the size keeps its proportions where it should and its pixel
+    ; margins where those matter. A base inset of 0 means the pointer is a
+    ; spoke from the centre, which is what a large knob wants; a positive one
+    ; makes it a tick on the ring, which is what a small dense grid of them
+    ; wants, since a full spoke would run straight through the value printed
+    ; in the middle.
+    pointer-width: [f64!]
+    pointer-base: [f64!]
+    pointer-tip: [f64!]
+    ; Inset of the darker inner disc, and the radius of the filled dot at the
+    ; centre. A dot of 0 is no dot -- again what a knob with a number in the
+    ; middle needs.
+    inner-inset: [f64!]
+    centre-dot: [f64!]
+    ; Where the two lines under a knob sit, measured down from the bottom of
+    ; the body, and how big they are. A NEGATIVE readout drop puts the value
+    ; inside the knob instead of below it. These live in the style for the
+    ; reason the caption colours do: a front end that restyles the knob
+    ; restyles its captions with it, and a 22-pixel knob in a six-wide grid
+    ; cannot letter itself like a 52-pixel one with a row to itself.
+    caption-drop: [f64!]
+    caption-size: [i32!]
+    readout-drop: [f64!]
+    readout-size: [i32!]
+    ; Width one caption line may occupy before it is broken over two, or 0 to
+    ; never break. Mach's parameter names are sentences ("Oscillator 1 Pulse
+    ; Width"), which is why it needs this and the two big synths do not.
+    caption-wrap: [f64!]
+    ; The two lines under the knob: its name, and its value. They live in the
+    ; style rather than at the call site because a front end that restyles the
+    ; knob restyles its captions with it -- and because the caller drawing them
+    ; separately is how a knob ends up looking different in two panels of the
+    ; same window.
+    caption: [u32!]
+    readout: [u32!]
+    caption-back: [u32!]
+    readout-back: [u32!]
+]
+
+; A rectangular control keeps its drawing choices separate from knob-style!:
+; the two controls share parameter behaviour in VID, not physical geometry.
+fader-style!: make c-struct! [
+    background: [u32!]
+    rail: [u32!]
+    ticks: [u32!]
+    handle: [u32!]
+    handle-edge: [u32!]
+    caption: [u32!]
+    readout: [u32!]
+    readout-fill: [u32!]
+    rail-width: [f64!]
+    handle-width: [f64!]
+    handle-height: [f64!]
+    caption-size: [i32!]
+    readout-size: [i32!]
+]
+
+; Resolved once per draw and independently callable by layout/hit tests.
+fader-geometry!: make c-struct! [
+    rail-top: [fpair!]
+    rail-bottom: [fpair!]
+    handle: [rect!]
+    readout: [rect!]
+]
+
+; Loos' drawing sheet. Exported as values as well as palette names so custom
+; Draw actors and VID faces use exactly the same ink.
+LOOS-BOARD: 40.38.33.255
+LOOS-PAPER: 233.225.211.255
+LOOS-ROOM: 213.204.189.255
+LOOS-INK: 41.39.34.255
+LOOS-MUTED: 117.110.100.255
+LOOS-CONSTRUCTION: 165.156.142.255
+LOOS-OXBLOOD: 140.59.45.255
+LOOS-OXBLOOD-BRIGHT: 182.83.62.255
+
+; The control net of the envelope curve, as points rather than as a bag of
+; loose x and y values. Eight `fpair!`s in the order the path visits them, so
+; the struct is the path: `move start`, `quad attack-ctrl peak`, and so on.
+; Shared by both curve entry points, so the plot and the in-knob preview cannot
+; drift apart.
+envelope-points!: make c-struct! [
+    start:        [fpair!]
+    attack-ctrl:  [fpair!]
+    peak:         [fpair!]
+    decay-ctrl:   [fpair!]
+    sustain-in:   [fpair!]
+    sustain-out:  [fpair!]
+    release-ctrl: [fpair!]
+    release-end:  [fpair!]
+]
+
+envelope-shape!: make c-struct! [
+    attack: [f64!]
+    decay: [f64!]
+    sustain: [f64!]
+    release: [f64!]
+]
+
+knob-style-default: func [
+    "Return the neutral dark knob style."
+    return: [knob-style!] "Style by value."
+] [
+    return make knob-style! [
+        track: 89.97.106.255
+        accent: 214.155.56.255
+        pointer-color: 214.155.56.255
+        body: 40.45.51.255
+        inner: 26.30.35.255
+        ; Four, because that is what every knob in this tree has always
+        ; drawn. Both hand-written editors computed `radius > 55 ? 5 : 4`
+        ; and neither ever had a knob wider than 52, so the heavy branch was
+        ; dead in both. A front end that wants a heavier track asks for one
+        ; here rather than getting it as a side effect of its radius.
+        line-width: 4.0
+        track-gap: 12.0
+        ; A spoke from the centre to ten pixels inside the rim, and a dot on
+        ; top of it: the knob Loos and Kaprálová both drew.
+        pointer-width: 4.0
+        pointer-base: 0.0
+        pointer-tip: 10.0
+        inner-inset: 8.0
+        centre-dot: 7.0
+        caption-drop: 17.0
+        caption-size: 13
+        readout-drop: 35.0
+        readout-size: 14
+        caption-wrap: 0.0
+        caption: 229.224.212.255
+        readout: 214.155.56.255
+        caption-back: 0
+        readout-back: 0
+    ]
+]
+
+knob-style-kapralova: func [
+    "Return Kaprálová's compact gold-on-charcoal knob style."
+    return: [knob-style!] "Style by value."
+] [
+    return make knob-style! [
+        track: 89.97.106.255
+        accent: 214.155.56.255
+        pointer-color: 214.155.56.255
+        body: 40.45.51.255
+        inner: 26.30.35.255
+        line-width: 3.0
+        track-gap: 9.0
+        pointer-width: 3.0
+        pointer-base: 0.0
+        pointer-tip: 10.0
+        inner-inset: 8.0
+        centre-dot: 5.0
+        caption-drop: 16.0
+        caption-size: 10
+        readout-drop: 32.0
+        readout-size: 12
+        caption-wrap: 0.0
+        caption: 229.224.212.255
+        readout: 214.155.56.255
+        caption-back: 0
+        readout-back: 0
+    ]
+]
+
+knob-style-kapralova-choice: func [
+    "Return Kaprálová's header style for the compact stepped controls."
+    return: [knob-style!] "Style by value."
+] [
+    return make knob-style! [
+        track: 89.97.106.255
+        accent: 214.155.56.255
+        pointer-color: 214.155.56.255
+        body: 40.45.51.255
+        inner: 26.30.35.255
+        line-width: 3.0
+        track-gap: 6.0
+        pointer-width: 3.0
+        pointer-base: 5.0
+        pointer-tip: 1.0
+        inner-inset: 5.0
+        centre-dot: 0.0
+        caption-drop: 8.0
+        caption-size: 9
+        readout-drop: -26.0
+        readout-size: 9
+        caption-wrap: 72.0
+        caption: 229.224.212.255
+        readout: 214.155.56.255
+        caption-back: 0
+        readout-back: 0
+    ]
+]
+
+knob-style-mach: func [
+    "Mach's palette, for a front end that wants its accent rather than Loos'."
+    return: [knob-style!] "Style by value."
+] [
+    return make knob-style! [
+        track: 89.97.106.255
+        accent: 122.178.211.255
+        pointer-color: 122.178.211.255
+        body: 40.45.51.255
+        inner: 26.30.35.255
+        line-width: 4.0
+        ; Mach's knob is 22 pixels across in a six-wide grid, so everything
+        ; below differs from the big synths' knob for the same reason: there
+        ; is no room. The track sits 8 out rather than 12, the pointer is a
+        ; tick on the ring rather than a spoke, there is no centre dot, and
+        ; the value is printed INSIDE the body with the name wrapped beneath.
+        track-gap: 8.0
+        pointer-width: 3.0
+        pointer-base: 6.0
+        pointer-tip: 1.0
+        inner-inset: 7.0
+        centre-dot: 0.0
+        caption-drop: 14.0
+        caption-size: 11
+        readout-drop: -28.0
+        readout-size: 11
+        caption-wrap: 102.0
+        caption: 229.224.212.255
+        readout: 122.178.211.255
+        caption-back: 0
+        readout-back: 0
+    ]
+]
+
+knob-style-loos: func [
+    "Loos' paper drafting dial, without a dark hardware disc."
+    return: [knob-style!] "Style by value."
+] [
+    return make knob-style! [
+        track: LOOS-CONSTRUCTION
+        accent: LOOS-OXBLOOD
+        pointer-color: LOOS-OXBLOOD
+        body: LOOS-PAPER
+        inner: LOOS-PAPER
+        line-width: 2.0
+        track-gap: 6.0
+        pointer-width: 2.0
+        pointer-base: 0.0
+        pointer-tip: 6.0
+        ; The second fill is the same paper and therefore reads as one cut-out
+        ; dial, not the inner hardware disc used by the dark styles.
+        inner-inset: 0.0
+        centre-dot: 2.0
+        caption-drop: 10.0
+        caption-size: 10
+        readout-drop: 25.0
+        readout-size: 11
+        caption-wrap: 0.0
+        caption: LOOS-INK
+        readout: LOOS-OXBLOOD
+        caption-back: 0
+        readout-back: 0
+    ]
+]
+
+knob-style-punkva: func [
+    "Return Punkva's ink-black, hot-pink and safety-yellow tape style."
+    return: [knob-style!] "Style by value."
+] [
+    return make knob-style! [
+        track: 45.42.42.255
+        accent: 255.24.112.255
+        pointer-color: 255.226.52.255
+        body: 26.25.25.255
+        inner: 12.12.12.255
+        line-width: 4.0
+        track-gap: 8.0
+        pointer-width: 4.0
+        pointer-base: 0.0
+        pointer-tip: 9.0
+        inner-inset: 8.0
+        centre-dot: 3.0
+        caption-drop: 17.0
+        caption-size: 13
+        readout-drop: 35.0
+        readout-size: 14
+        caption-wrap: 0.0
+        caption: 12.12.12.255
+        readout: 12.12.12.255
+        caption-back: 255.226.52.255
+        readout-back: 255.226.52.255
+    ]
+]
+
+fader-style-default: func [
+    "Return the neutral dark fader style."
+    return: [fader-style!] "Style by value."
+] [
+    return make fader-style! [
+        background: 40.45.51.255
+        rail: 89.97.106.255
+        ticks: 89.97.106.255
+        handle: 214.155.56.255
+        handle-edge: 240.186.92.255
+        caption: 229.224.212.255
+        readout: 214.155.56.255
+        readout-fill: 26.30.35.255
+        rail-width: 1.0
+        handle-width: 22.0
+        handle-height: 8.0
+        caption-size: 9
+        readout-size: 10
+    ]
+]
+
+fader-style-loos: func [
+    "Return Loos' drafting-rail fader style."
+    return: [fader-style!] "Style by value."
+] [
+    return make fader-style! [
+        background: LOOS-ROOM
+        rail: LOOS-INK
+        ticks: LOOS-CONSTRUCTION
+        handle: LOOS-OXBLOOD
+        handle-edge: LOOS-OXBLOOD-BRIGHT
+        caption: LOOS-INK
+        readout: LOOS-OXBLOOD
+        readout-fill: LOOS-PAPER
+        rail-width: 1.0
+        handle-width: 22.0
+        handle-height: 8.0
+        caption-size: 9
+        readout-size: 10
+    ]
+]
+
+widget-fader-geometry: func [
+    "Resolve a rectangular fader's rail, handle, and fixed readout box."
+    bounds [rect!] "Full fader face rectangle."
+    value [f64!] "Normalized position; values outside 0..1 are clamped."
+    :style [c-pointer!] "Borrowed fader-style! supplying handle dimensions."
+    return: [fader-geometry!] "Resolved drawing geometry."
+] [
+    st: make [#mutable fader-style!] as fader-style! :style
+    v: make [#mutable f64!] value
+    if v < 0.0 [v: 0.0]
+    if v > 1.0 [v: 1.0]
+    centre-x: bounds/origin/x + (bounds/size/x / 2.0)
+    top-y: bounds/origin/y + 25.0
+    bottom-y: bounds/origin/y + bounds/size/y - 32.0
+    handle-y: bottom-y - ((bottom-y - top-y) * v)
+    rail-top: fxy centre-x top-y
+    rail-bottom: fxy centre-x bottom-y
+    handle-origin: fxy
+        (centre-x - (st/handle-width / 2.0))
+        (handle-y - (st/handle-height / 2.0))
+    handle-size: fxy st/handle-width st/handle-height
+    readout-origin: fxy (bounds/origin/x + 4.0)
+        (bounds/origin/y + bounds/size/y - 22.0)
+    readout-size: fxy (bounds/size/x - 8.0) 18.0
+    handle-rect: rect-of handle-origin/x handle-origin/y handle-size/x handle-size/y
+    readout-rect: rect-of readout-origin/x readout-origin/y readout-size/x readout-size/y
+    return make fader-geometry! [
+        rail-top: rail-top
+        rail-bottom: rail-bottom
+        handle: handle-rect
+        readout: readout-rect
+    ]
+]
+
+widget-fader-hit?: func [
+    "True when a point falls anywhere inside a fader face."
+    mouse [fpair!] "Pointer position."
+    bounds [rect!] "Full rectangular grab area."
+    return: [logic!] "True when the point is inside the face."
+] [
+    return all [
+        mouse/x >= bounds/origin/x
+        mouse/x < (bounds/origin/x + bounds/size/x)
+        mouse/y >= bounds/origin/y
+        mouse/y < (bounds/origin/y + bounds/size/y)
+    ]
+]
+
+widget-fader: func [
+    "Draw a vertical fader with construction ticks, caption, and fixed readout."
+    :context [c-pointer!] "Borrowed live context."
+    :style [c-pointer!] "Borrowed fader-style!."
+    bounds [rect!] "Full face rectangle."
+    value [f64!] "Normalized position, with one at the top."
+    :caption [string!] "Borrowed uppercase caption."
+    :readout [string!] "Borrowed formatted value."
+    return: [none!] "No value."
+] [
+    st: make [#mutable fader-style!] as fader-style! :style
+    g: make [#mutable fader-geometry!]
+        widget-fader-geometry bounds value :style
+
+    draw context [
+        fill-pen st/background
+        box bounds/origin bounds/size
+
+        pen st/ticks
+        line-width 1.0
+    ]
+    repeat i 7 [
+        share: (as f64! i) / 6.0
+        tick-y: g/rail-top/y + ((g/rail-bottom/y - g/rail-top/y) * share)
+        half: either any [i = 0 i = 3 i = 6] [10.0] [6.0]
+        draw context [
+            pen st/ticks
+            line-width 1.0
+            line (fxy (g/rail-top/x - half) tick-y)
+                (fxy (g/rail-top/x + half) tick-y)
+        ]
+    ]
+    draw context [
+        pen st/rail
+        line-width st/rail-width
+        line g/rail-top g/rail-bottom
+
+        fill-pen st/readout-fill
+        box g/readout/origin g/readout/size
+
+        fill-pen st/handle-edge
+        rounded-box g/handle/origin g/handle/size 2
+    ]
+    inset-origin: fxy (g/handle/origin/x + 1.0) (g/handle/origin/y + 1.0)
+    inset-size: fxy (g/handle/size/x - 2.0) (g/handle/size/y - 2.0)
+    draw context [
+        fill-pen st/handle
+        rounded-box inset-origin inset-size 1
+    ]
+    widget-text-centred :context :caption
+        (as i32! (bounds/origin/x + (bounds/size/x / 2.0)))
+        (as i32! (bounds/origin/y + 4.0)) st/caption-size st/caption
+    widget-text-centred :context :readout
+        (as i32! (bounds/origin/x + (bounds/size/x / 2.0)))
+        (as i32! (g/readout/origin/y + 4.0)) st/readout-size st/readout
+    return none
+]
+
+widget-knob-hit?: func [
+    "True when a point falls within a knob's grab area."
+    mouse [fpair!] "Pointer position."
+    centre [fpair!] "Knob centre."
+    radius [f64!] "Knob radius."
+    return: [logic!] "True when the point is close enough to grab."
+] [
+    ; Ten pixels beyond the drawn edge, so the grab area matches what the knob
+    ; looks like rather than exactly where it stops.
+    d: pair-sub mouse centre
+    reach: radius + 10.0
+    return ((d/x * d/x) + (d/y * d/y)) <= (reach * reach)
+]
+
+widget-colour: func [
+    {The Pokuston palettes, named. The original eight colours were spelled out as
+     literals 32 times across the editors in this tree -- `ink` six times on
+     its own, the accent eight -- which is how two panels of one window come
+     to disagree about what "muted" means. A front end that wants a different
+     look changes it here and every control that asked by name follows.}
+    name [word!] "Default or loos-* palette entry."
+    return: [u32!] "Packed 0xRRGGBBAA; `ink` for a name that is not in the palette."
+] [
+    if name = 'panel [return 22.25.29.255]
+    if name = 'wash-top [return 49.54.60.255]
+    if name = 'wash-bottom [return 28.32.37.255]
+    if name = 'muted [return 146.152.159.255]
+    if name = 'rule [return 89.97.106.255]
+    if name = 'accent [return 214.155.56.255]
+    if name = 'accent-bright [return 240.186.92.255]
+    if name = 'loos-board [return LOOS-BOARD]
+    if name = 'loos-paper [return LOOS-PAPER]
+    if name = 'loos-room [return LOOS-ROOM]
+    if name = 'loos-ink [return LOOS-INK]
+    if name = 'loos-muted [return LOOS-MUTED]
+    if name = 'loos-construction [return LOOS-CONSTRUCTION]
+    if name = 'loos-oxblood [return LOOS-OXBLOOD]
+    if name = 'loos-oxblood-bright [return LOOS-OXBLOOD-BRIGHT]
+    return 229.224.212.255
+]
+
+widget-text-centred: func [
+    "Draw a line of text centred on an x position, measuring it first."
+    :context [c-pointer!] "Borrowed live context."
+    :text [string!] "Borrowed line to draw."
+    centre-x [i32!] "The x the line is centred on."
+    y [i32!] "Top of the line."
+    size [i32!] "Point size."
+    colour [u32!] "Packed 0xRRGGBBAA."
+    return: [none!] "No value."
+] [
+    width: gui-context-measure-text :context :text size
+    origin: fxy (as f64! (centre-x - (width / 2))) (as f64! y)
+    draw context [
+        fill-pen colour
+        text origin size text
+    ]
+    return none
+]
+
+widget-text-centred-on-tape: func [
+    "Draw centred text on a padded tape strip when a fill colour is supplied."
+    :context [c-pointer!] "Borrowed live context."
+    :text [string!] "Borrowed line to draw."
+    centre-x [i32!] "The x the line is centred on."
+    y [i32!] "Top of the line."
+    size [i32!] "Point size."
+    colour [u32!] "Packed 0xRRGGBBAA text colour."
+    background [u32!] "Packed 0xRRGGBBAA tape fill; zero disables the strip."
+    return: [none!] "No value."
+] [
+    width: gui-context-measure-text :context :text size
+    if background <> 0 [
+        tape-origin: fxy (as f64! (centre-x - (width / 2) - 4)) (as f64! (y - 2))
+        tape-size: fxy (as f64! (width + 8)) (as f64! (size + 5))
+        draw context [
+            fill-pen background
+            rounded-box tape-origin tape-size 2
+        ]
+    ]
+    widget-text-centred :context :text centre-x y size colour
+    return none
+]
+
+widget-split-index: func [
+    "Where to break a caption over two lines: the space nearest its middle."
+    :text [string!] "Borrowed caption."
+    return: [i32!] "Character index of the chosen space, or -1 when there is none."
+] [
+    n: as i32! length? :text
+    best: make [#mutable i32!] -1
+    best-gap: make [#mutable i32!] (n * 2)
+    repeat i n [
+        if text/:i = #" " [
+            ; Distance from the middle, doubled so it stays integer arithmetic.
+            gap: make [#mutable i32!] ((i * 2) - n)
+            if gap < 0 [gap: 0 - gap]
+            if gap < best-gap [
+                best: i
+                best-gap: gap
+            ]
+        ]
+    ]
+    return best
+]
+
+widget-substring: func [
+    "Copy a half-open character range out of a caption."
+    :text [string!] "Borrowed caption."
+    start [i32!] "First character, inclusive."
+    stop [i32!] "One past the last character."
+    return: [string!] "Owned copy of the range."
+] [
+    out: make [#flexible [string! 48]] none
+    repeat i (stop - start) [append out text/(start + i)]
+    return freeze out
+]
+
+widget-text-wrapped: func [
+    {Draw a caption centred, over two lines when one will not fit. A knob
+     whose parameter is called "Oscillator 1 Pulse Width" has to letter
+     itself somehow, and the alternative -- letting it run into its
+     neighbours -- is what a grid layout exists to prevent.}
+    :context [c-pointer!] "Borrowed live context."
+    :caption [string!] "Borrowed caption."
+    centre-x [i32!] "Centre to align on."
+    top [i32!] "Top of the first line."
+    limit [i32!] "Width one line may occupy; 0 never breaks."
+    size [i32!] "Point size."
+    colour [u32!] "Packed 0xRRGGBBAA."
+    return: [none!] "No value."
+] [
+    if limit <= 0 [
+        widget-text-centred :context :caption centre-x top size colour
+        return none
+    ]
+    if (gui-context-measure-text :context :caption size) <= limit [
+        widget-text-centred :context :caption centre-x top size colour
+        return none
+    ]
+    split: widget-split-index :caption
+    if split < 0 [
+        widget-text-centred :context :caption centre-x top size colour
+        return none
+    ]
+    n: as i32! length? :caption
+    head-line: widget-substring :caption 0 split
+    tail-line: widget-substring :caption (split + 1) n
+    widget-text-centred :context :head-line centre-x top size colour
+    widget-text-centred :context :tail-line centre-x (top + size + 1) size colour
+    return none
+]
+
+widget-format-number: func [
+    "Render one f64! through a printf format into an owned string!."
+    value [f64!] "The number to render."
+    :spec [string!] {Borrowed printf format taking exactly one double, e.g. "%.2f kHz".}
+    return: [string!] "Owned text, truncated at 31 characters."
+] [
+    ; A caller-supplied format and a fixed buffer, rather than a per-unit
+    ; formatter here: how a value reads (kHz, ms, per cent) is the plug-in's
+    ; business, but snprintf-into-a-buffer-and-copy-out is not, and it was
+    ; written three times before this.
+    buf: make c-pointer! unsafe/malloc 32
+    unsafe/memset buf 0 32
+    written: widget-fmt/snprintf buf (as size! 32) (as c-string! :spec) value
+    unused written
+    out: make string! as c-string! buf
+    unsafe/free buf
+    return out
+]
+
+; Module level, not nested inside widget-envelope-geometry: a func defined
+; inside another func body emits a call to a function C never sees declared.
+envelope-stage-share: func [
+    "The share of a plot's width one timed stage occupies, capped at a quarter."
+    seconds [f64!] "Stage duration."
+    limit [f64!] "Duration that fills the whole quarter."
+    return: [f64!] "Fraction of the plot width, 0 .. 0.25."
+] [
+    if seconds <= 0.0 [return 0.0]
+    share: make [#mutable f64!] seconds / limit
+    if share > 1.0 [share: 1.0]
+    return share * 0.25
+]
+
+widget-envelope-geometry: func [
+    "Resolve an ADSR shape into the points that draw it."
+    :shape [c-pointer!] "Borrowed envelope-shape!."
+    bounds [rect!] "Plot rectangle."
+    max-time [f64!] "Duration that fills a stage's whole quarter of the width."
+    :out [c-pointer!] "Borrowed envelope-points! to fill."
+    return: [none!] "No value; the points are written."
+] [
+    ; Each of attack, decay and release owns a quarter of the width and maps
+    ; its own duration into it INDEPENDENTLY. Sustain takes whatever the three
+    ; leave, so it runs from a quarter of the plot (all three at full) to the
+    ; whole of it (all three at zero).
+    ;
+    ; This is a deliberate departure from Mach's JUCE editor, which scales all
+    ; four stages against their sum: there, lengthening the attack visibly
+    ; shrinks the decay and release even though neither changed, because every
+    ; stage is drawn as a fraction of a total that just moved. Turning one knob
+    ; should move one part of the picture. Here it moves the sustain, which is
+    ; the stage that has no duration of its own to misrepresent.
+    e: make [#mutable envelope-shape!] as envelope-shape! :shape
+    p: make [#mutable envelope-points!] as envelope-points! :out
+
+    limit: make [#mutable f64!] max-time
+    if limit <= 0.0 [limit: 1.0]
+
+    attack-share: envelope-stage-share e/attack limit
+    decay-share: envelope-stage-share e/decay limit
+    release-share: envelope-stage-share e/release limit
+    sustain-share: 1.0 - (attack-share + decay-share + release-share)
+
+    sustain: make [#mutable f64!] e/sustain
+    if sustain < 0.0 [sustain: 0.0]
+    if sustain > 1.0 [sustain: 1.0]
+
+    x: bounds/origin/x
+    w: bounds/size/x
+    h: bounds/size/y
+
+    top-y: bounds/origin/y
+    bottom-y: top-y + h
+    sustain-y: bottom-y - (sustain * h)
+
+    attack-x: x + (w * attack-share)
+    decay-x: attack-x + (w * decay-share)
+    hold-x: decay-x + (w * sustain-share)
+    ; Lands on the right edge by construction: the four shares sum to one, so
+    ; the curve always spans the plot however the stages are set.
+    release-x: hold-x + (w * release-share)
+
+    ; Each curved stage bends a fifth of the way along itself, which leans the
+    ; attack instead of ramping it straight.
+    p/start:        fxy x bottom-y
+    p/attack-ctrl:  fxy (x + (w * attack-share * 0.2)) top-y
+    p/peak:         fxy attack-x top-y
+    p/decay-ctrl:   fxy (attack-x + (w * decay-share * 0.2)) sustain-y
+    p/sustain-in:   fxy decay-x sustain-y
+    p/sustain-out:  fxy hold-x sustain-y
+    p/release-ctrl: fxy (hold-x + (w * release-share * 0.2)) bottom-y
+    p/release-end:  fxy release-x bottom-y
+    return none
+]
+
+widget-envelope-curve-path: func [
+    "Trace an ADSR envelope as path segments, without beginning or painting them."
+    :context [c-pointer!] "Borrowed live context."
+    :shape [c-pointer!] "Borrowed envelope-shape!."
+    bounds [rect!] "Plot rectangle."
+    max-time [f64!] "Duration that fills a stage's whole quarter of the width."
+    return: [none!] "No value; the caller began the path and paints it."
+] [
+    ; Segments only, so a caller can clip, transform and paint around them --
+    ; which the in-knob preview does and a `shape` block could not, its body
+    ; being dialect rather than Recoil.
+    raw: make c-pointer! unsafe/malloc (as i32! size-of envelope-points!)
+    unsafe/memset raw 0 (as i32! size-of envelope-points!)
+    widget-envelope-geometry :shape bounds max-time :raw
+    p: make [#mutable envelope-points!] as envelope-points! raw
+
+    gui-path-move-to :context (as f32! p/start/x) (as f32! p/start/y)
+    gui-path-quad-to :context (as f32! p/attack-ctrl/x) (as f32! p/attack-ctrl/y)
+        (as f32! p/peak/x) (as f32! p/peak/y)
+    gui-path-quad-to :context (as f32! p/decay-ctrl/x) (as f32! p/decay-ctrl/y)
+        (as f32! p/sustain-in/x) (as f32! p/sustain-in/y)
+    gui-path-line-to :context (as f32! p/sustain-out/x) (as f32! p/sustain-out/y)
+    gui-path-quad-to :context (as f32! p/release-ctrl/x) (as f32! p/release-ctrl/y)
+        (as f32! p/release-end/x) (as f32! p/release-end/y)
+
+    unsafe/free :raw
+    return none
+]
+
+widget-envelope-curve: func [
+    "Draw an ADSR envelope across a rectangle, stroked in one colour."
+    :context [c-pointer!] "Borrowed live context."
+    :shape [c-pointer!] "Borrowed envelope-shape!."
+    bounds [rect!] "Plot rectangle."
+    max-time [f64!] "Duration that fills a stage's whole quarter of the width."
+    colour [u32!] "Stroke colour."
+    width [f64!] "Stroke width."
+    return: [none!] "No value."
+] [
+    raw: make c-pointer! unsafe/malloc (as i32! size-of envelope-points!)
+    unsafe/memset raw 0 (as i32! size-of envelope-points!)
+    widget-envelope-geometry :shape bounds max-time :raw
+    p: make [#mutable envelope-points!] as envelope-points! raw
+
+    ; The dialect's `shape` block: a path built from segments, which is what an
+    ; envelope needs and what the whole-shape words cannot express. With points
+    ; rather than coordinates, the block reads as the control net it is.
+    draw context [
+        pen colour
+        line-width width
+        shape [
+            move p/start
+            quad p/attack-ctrl p/peak
+            quad p/decay-ctrl p/sustain-in
+            line p/sustain-out
+            quad p/release-ctrl p/release-end
+        ]
+    ]
+    unsafe/free :raw
+    return none
+]
+
+widget-knob-ring-overspill: func [
+    {Pixels a knob's track ring paints OUTSIDE its body, on every side.
+
+     The body is the face; the ring is not. It is drawn `track-gap` beyond the
+     rim with a stroke of `line-width`, half of which falls outside again, so a
+     radius-34 knob in the default style paints a circle 96 pixels across
+     inside a face 68 pixels across. Packing those faces edge to edge overlaps
+     the rings by twenty-eight pixels, which is exactly what it looks like.}
+    :style [c-pointer!] "Borrowed knob-style!."
+    return: [i32!] "Pixels beyond the body radius, on every side."
+] [
+    ks: make [#mutable knob-style!] as knob-style! :style
+    return as i32! (ks/track-gap + (ks/line-width / 2.0))
+]
+
+widget-knob-label-band: func [
+    {Pixels a knob paints BELOW its body, for its caption and its readout.
+
+     A knob face is square: the body IS the face. The two lines it prints
+     under itself are not inside it, so a layout that packs faces by their
+     size packs knobs about fifty pixels too tightly and one row's readout
+     lands on the next row's caption. This is the number that closes that gap,
+     derived from the style rather than stated as a constant because the two
+     styles put the lines in different places -- the small Mach knob prints its
+     value INSIDE the body and wraps its name beneath, while the default one
+     prints both below, on a line each.}
+    :style [c-pointer!] "Borrowed knob-style!."
+    return: [i32!] "Pixels below the body, never negative."
+] [
+    ks: make [#mutable knob-style!] as knob-style! :style
+    ; A wrapping caption is allowed the two lines it can wrap onto.
+    lines: either ks/caption-wrap > 0.0 [2.0] [1.0]
+    caption-bottom: make [#mutable f64!]
+        (ks/caption-drop + ((as f64! ks/caption-size) * lines))
+    if ks/caption-back <> 0 [caption-bottom: caption-bottom + 3.0]
+    readout-bottom: make [#mutable f64!]
+        (ks/readout-drop + (as f64! ks/readout-size))
+    if ks/readout-back <> 0 [readout-bottom: readout-bottom + 3.0]
+    deepest: either caption-bottom > readout-bottom [caption-bottom] [readout-bottom]
+    if deepest < 0.0 [return 0]
+    return as i32! deepest
+]
+
+widget-knob: func [
+    "Draw a knob: its track, the swept portion, the body and its pointer."
+    :context [c-pointer!] "Borrowed live context."
+    :style [c-pointer!] "Borrowed knob-style!."
+    centre [fpair!] "Knob centre."
+    radius [f64!] "Body radius."
+    value [f64!] "Position in 0..1."
+    return: [none!] "No value."
+] [
+    s: make [#mutable knob-style!] as knob-style! :style
+    track-radius: radius + s/track-gap
+    swept: WIDGET-KNOB-START + (value * WIDGET-KNOB-SPAN)
+    ; The pointer is drawn in a frame already translated to the centre, so it
+    ; runs along that frame's x axis. A base inset of nought means a spoke
+    ; from the origin; anything else lifts the near end off the centre and
+    ; makes it a tick on the ring.
+    pivot: fxy (either s/pointer-base = 0.0 [0.0] [radius - s/pointer-base]) 0.0
+    tip: fxy (radius - s/pointer-tip) 0.0
+
+    draw context [
+        ; The track and its swept portion are scoped so their pen does not
+        ; reach the filled shapes below -- Draw decides stroke and fill
+        ; lexically. See "Divergence from Red" in docs/user/draw.md.
+        push [
+            pen s/track
+            line-width s/line-width
+            line-cap round
+            arc centre track-radius WIDGET-KNOB-START
+                (WIDGET-KNOB-START + WIDGET-KNOB-SPAN)
+
+            pen s/pointer-color
+            arc centre track-radius WIDGET-KNOB-START swept
+        ]
+
+        fill-pen s/body
+        circle centre radius
+
+        fill-pen s/inner
+        circle centre (radius - s/inner-inset)
+
+        ; A line up the x axis of a frame rotated to the value's angle, so no
+        ; trigonometry appears here.
+        push [
+            translate centre
+            rotate swept
+            pen s/accent
+            line-width s/pointer-width
+            line-cap round
+            line pivot tip
+        ]
+    ]
+    ; The dot is its own block rather than a branch inside the one above:
+    ; Draw lowers at compile time, so a shape cannot be conditional within a
+    ; block, and a style that asks for no dot must emit no circle at all
+    ; rather than one of radius nought.
+    if s/centre-dot > 0.0 [
+        draw context [
+            fill-pen s/pointer-color
+            circle centre s/centre-dot
+        ]
+    ]
+    return none
+]
+
+widget-knob-punkva-overlay: func [
+    "Draw Punkva's live pink sweep and yellow pointer over its rotating image."
+    :context [c-pointer!] "Borrowed live context."
+    :style [c-pointer!] "Borrowed knob-style!."
+    centre [fpair!] "Knob centre."
+    radius [f64!] "Body radius."
+    value [f64!] "Position in 0..1."
+    return: [none!] "No value."
+] [
+    s: make [#mutable knob-style!] as knob-style! :style
+    track-radius: radius + s/track-gap
+    swept: WIDGET-KNOB-START + (value * WIDGET-KNOB-SPAN)
+    pivot: fxy (either s/pointer-base = 0.0 [0.0] [radius - s/pointer-base]) 0.0
+    tip: fxy (radius - s/pointer-tip) 0.0
+    draw context [
+        push [
+            pen s/track
+            line-width s/line-width
+            line-cap round
+            arc centre track-radius WIDGET-KNOB-START
+                (WIDGET-KNOB-START + WIDGET-KNOB-SPAN)
+            pen s/accent
+            arc centre track-radius WIDGET-KNOB-START swept
+        ]
+        push [
+            translate centre
+            rotate swept
+            pen s/pointer-color
+            line-width s/pointer-width
+            line-cap round
+            line pivot tip
+        ]
+    ]
+    if s/centre-dot > 0.0 [
+        draw context [fill-pen s/pointer-color circle centre s/centre-dot]
+    ]
+    return none
+]
+
+widget-knob-with-envelope: func [
+    "Draw a knob with an envelope preview inside its face, scaled by the knob's own value."
+    :context [c-pointer!] "Borrowed live context."
+    :style [c-pointer!] "Borrowed knob-style!."
+    centre [fpair!] "Knob centre."
+    radius [f64!] "Body radius."
+    value [f64!] "Position in 0..1."
+    amount [f64!] "Envelope amount in -1..1; sign mirrors the curve, magnitude scales it."
+    :shape [c-pointer!] "Borrowed envelope-shape!."
+    return: [none!] "No value."
+] [
+    ; What the preview is for: a control that applies an envelope shows the
+    ; envelope it applies, and how hard. The magnitude scales the drawing so a
+    ; zero amount draws nothing, and the sign flips it under the baseline so a
+    ; negative amount reads as one.
+    widget-knob :context :style centre radius value
+
+    magnitude: make [#mutable f64!] amount
+    if magnitude < 0.0 [magnitude: 0.0 - magnitude]
+    if magnitude > 1.0 [magnitude: 1.0]
+    if magnitude <= 0.0 [return none]
+
+    s: make [#mutable knob-style!] as knob-style! :style
+    ; The aperture is the body's inner disc, inset so the curve cannot ride up
+    ; against the ring.
+    span: radius - 14.0
+    if span <= 0.0 [return none]
+    left: centre/x - span
+    width: span * 2.0
+    height: span * 0.9 * magnitude
+    base-y: centre/y
+    flip: either amount < 0.0 [0.0 - 1.0] [1.0]
+
+    ; Written as explicit state calls rather than `push [...]`, because a push
+    ; body is Draw vocabulary and what has to sit inside this one is a call to
+    ; widget-envelope-curve. The sequence is what push would have emitted.
+    gui-path-save :context
+    ; clip intersects, so a preview drawn inside a knob cannot escape the knob
+    ; by asking for a wider region.
+    gui-path-scissor :context (as f32! left) (as f32! (base-y - span))
+        (as f32! width) (as f32! (span * 2.0))
+    ; A negative amount is the same curve reflected about the baseline, which
+    ; a scale of -1 on y expresses without a second copy of the geometry.
+    gui-path-translate :context (as f32! 0.0) (as f32! base-y)
+    gui-path-scale :context (as f32! 1.0) (as f32! flip)
+    gui-path-translate :context (as f32! 0.0) (as f32! (0.0 - base-y))
+
+    gui-path-stroke-color :context s/accent
+    gui-path-stroke-width :context (as f32! 2.0)
+    gui-path-begin :context
+    aperture: rect-of left (base-y - height) width height
+    widget-envelope-curve-path :context :shape aperture 5.0
+    gui-path-stroke :context
+
+    gui-path-restore :context
+    return none
+]
+
+; --- envelope editor ---------------------------------------------------------
+
+WIDGET-ENVELOPE-STAGES: make i32! 4
+
+; Where the editor's parts land inside its panel. Resolved once and used by
+; both the drawing and the hit-testing, so the two cannot disagree about where
+; a knob is -- the same reason the curve has one geometry resolver.
+;
+; The knob row is a scalar array plus one shared y rather than an array of
+; `fpair!`: a `c-array!` whose element is a struct mis-lowers (it emits a
+; managed-series `->data` read against a plain C array). widget-envelope-knob-centre
+; is the paired read, so callers never see the split.
+envelope-editor-layout!: make c-struct! [
+    plot: [rect!]
+    title: [fpair!]
+    knob-y: [f64!]
+    knob-radius: [f64!]
+    knob-x: [c-array! [f64! 4]]
+]
+
+widget-envelope-editor-layout: func [
+    "Resolve an editor panel into a plot rectangle and four knob positions."
+    panel [rect!] "The panel to lay out."
+    :out [c-pointer!] "Borrowed envelope-editor-layout! to fill."
+    return: [none!] "No value; the layout is written."
+] [
+    l: make [#mutable envelope-editor-layout!] as envelope-editor-layout! :out
+    inset: 20.0
+    title-band: 40.0
+    knob-band: 120.0
+
+    left: panel/origin/x + inset
+    top: panel/origin/y + inset
+    width: panel/size/x - (inset * 2.0)
+    height: panel/size/y - (inset * 2.0)
+
+    l/title: fxy left top
+    l/plot: rect-of left (top + title-band) width (height - title-band - knob-band)
+
+    ; Four knobs across the width with three gaps between them, which is the
+    ; arrangement Mach's editor uses and the one that reads as a row.
+    gap: 10.0
+    cell: (width - (gap * 3.0)) / 4.0
+    radius: make [#mutable f64!] cell / 2.0
+    ; Kept small enough that the caption below a knob stays inside the panel.
+    if radius > 34.0 [radius: 34.0]
+    l/knob-radius: radius
+    l/knob-y: (top + height) - (knob-band / 2.0) + 6.0
+    repeat i WIDGET-ENVELOPE-STAGES [
+        l/knob-x/(i): left + ((cell + gap) * (as f64! i)) + (cell / 2.0)
+    ]
+    return none
+]
+
+widget-envelope-knob-centre: func [
+    "One stage knob's centre, read out of a resolved layout as a point."
+    :layout [c-pointer!] "Borrowed envelope-editor-layout!."
+    stage [i32!] "Stage index 0..3."
+    return: [fpair!] "The knob centre."
+] [
+    l: make [#mutable envelope-editor-layout!] as envelope-editor-layout! :layout
+    return fxy l/knob-x/(stage) l/knob-y
+]
+
+widget-envelope-editor-hit: func [
+    "Which of the four knobs a point falls on, or -1."
+    mouse [fpair!] "Pointer position."
+    panel [rect!] "The editor panel, laid out the same way it is drawn."
+    return: [i32!] "Stage index 0..3 for attack, decay, sustain, release; -1 for none."
+] [
+    raw: make c-pointer! unsafe/malloc (as i32! size-of envelope-editor-layout!)
+    unsafe/memset raw 0 (as i32! size-of envelope-editor-layout!)
+    widget-envelope-editor-layout panel :raw
+
+    found: make [#mutable i32!] -1
+    l: make [#mutable envelope-editor-layout!] as envelope-editor-layout! raw
+    repeat i WIDGET-ENVELOPE-STAGES [
+        if found = -1 [
+            centre: widget-envelope-knob-centre :raw i
+            if widget-knob-hit? mouse centre l/knob-radius [found: i]
+        ]
+    ]
+    unsafe/free :raw
+    return found
+]
+
+widget-envelope-stage-value: func [
+    "One stage's knob position in 0..1."
+    :shape [c-pointer!] "Borrowed envelope-shape!."
+    stage [i32!] "0 attack, 1 decay, 2 sustain, 3 release."
+    max-time [f64!] "Duration a timed stage's knob reads as full."
+    return: [f64!] "Position in 0..1."
+] [
+    e: make [#mutable envelope-shape!] as envelope-shape! :shape
+    ; Sustain is already a level; the other three are durations read against
+    ; the same limit the plot lays them out by, so a knob and the picture above
+    ; it agree about what "full" means.
+    if stage = 2 [
+        v: make [#mutable f64!] e/sustain
+        if v < 0.0 [v: 0.0]
+        if v > 1.0 [v: 1.0]
+        return v
+    ]
+    seconds: either stage = 0 [e/attack] [either stage = 1 [e/decay] [e/release]]
+    limit: make [#mutable f64!] max-time
+    if limit <= 0.0 [limit: 1.0]
+    share: make [#mutable f64!] seconds / limit
+    if share < 0.0 [share: 0.0]
+    if share > 1.0 [share: 1.0]
+    return share
+]
+
+widget-envelope-editor: func [
+    "Draw an ADSR editor: a titled panel, a grid, the curve, and a knob per stage."
+    :context [c-pointer!] "Borrowed live context."
+    :style [c-pointer!] "Borrowed knob-style!."
+    :shape [c-pointer!] "Borrowed envelope-shape!."
+    panel [rect!] "The panel to draw into."
+    :title [string!] "Borrowed panel caption."
+    max-time [f64!] "Duration a timed stage reads as full."
+    return: [none!] "No value."
+] [
+    st: make [#mutable knob-style!] as knob-style! :style
+    raw: make c-pointer! unsafe/malloc (as i32! size-of envelope-editor-layout!)
+    unsafe/memset raw 0 (as i32! size-of envelope-editor-layout!)
+    widget-envelope-editor-layout panel :raw
+    l: make [#mutable envelope-editor-layout!] as envelope-editor-layout! raw
+
+    grid: 49.54.60.255
+    label: 229.224.212.255
+
+    ; The panel edge as four strokes rather than a filled box, so the editor
+    ; sits on whatever background its host already painted.
+    top-left: panel/origin
+    top-right: fxy (panel/origin/x + panel/size/x) panel/origin/y
+    bottom-left: fxy panel/origin/x (panel/origin/y + panel/size/y)
+    bottom-right: fxy (panel/origin/x + panel/size/x) (panel/origin/y + panel/size/y)
+
+    draw context [
+        pen grid
+        line-width 1
+        line bottom-left bottom-right
+        line top-left top-right
+        line top-left bottom-left
+        line top-right bottom-right
+    ]
+
+    ; Five rules across the plot: enough to read a level against, few enough
+    ; not to compete with the curve.
+    plot-left: l/plot/origin/x
+    plot-right: rect-right l/plot
+    plot-top: l/plot/origin/y
+    plot-height: l/plot/size/y
+    repeat i 5 [
+        rule-y: plot-top + (plot-height * (as f64! i) * 0.25)
+        draw context [
+            pen grid
+            line-width 1
+            line (fxy plot-left rule-y) (fxy plot-right rule-y)
+        ]
+    ]
+
+    draw context [
+        fill-pen label
+        text l/title 16 title
+    ]
+
+    widget-envelope-curve :context :shape l/plot max-time st/accent 2.5
+
+    repeat i WIDGET-ENVELOPE-STAGES [
+        centre: widget-envelope-knob-centre :raw i
+        widget-knob :context :style centre l/knob-radius
+            (widget-envelope-stage-value :shape i max-time)
+    ]
+
+    unsafe/free :raw
+    return none
+]

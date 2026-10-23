@@ -1,0 +1,9 @@
+Recoil-Project [
+    Name: au-brom-probe-effect
+    Version: 0.1.0
+    Dependencies: [
+        [package: recoil-brom source: [path %../../../]]
+        [package: brom-probe-effect source: [path %../]]
+        [package: pokuston-audio-unit-sdk source: [path %../../../../pokuston-audio-unit-sdk/]]
+    ]
+]

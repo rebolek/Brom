@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>@BROM_AU_EXECUTABLE@</string>
+    <key>CFBundleIdentifier</key>
+    <string>@BROM_AU_BUNDLE_ID@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>@POKUSTON_PLUGIN_NAME@</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@POKUSTON_PLUGIN_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@POKUSTON_PLUGIN_VERSION@</string>
+    <key>AudioComponents</key>
+    <array>
+        <dict>
+            <key>type</key>
+            <string>@BROM_AU_TYPE@</string>
+            <key>subtype</key>
+            <string>@BROM_AU_SUBTYPE@</string>
+            <key>manufacturer</key>
+            <string>@BROM_AU_MANUFACTURER@</string>
+            <key>name</key>
+            <string>@POKUSTON_PLUGIN_VENDOR@: @POKUSTON_PLUGIN_NAME@</string>
+            <key>description</key>
+            <string>@POKUSTON_PLUGIN_VENDOR@ @POKUSTON_PLUGIN_NAME@</string>
+            <key>version</key>
+            <integer>@BROM_AU_VERSION@</integer>
+            <key>factoryFunction</key>
+            <string>BromEffectAUFactory</string>
+            <key>sandboxSafe</key>
+            <true/>
+            <key>tags</key>
+            <array>
+@BROM_AU_TAGS_XML@
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

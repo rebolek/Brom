@@ -1,0 +1,7 @@
+Recoil [
+    Title: "Loos VST3 package root"
+    Type: module
+    Module: examples/pokuston/loos/vst3/project
+    Imports: []
+    Exports: []
+]

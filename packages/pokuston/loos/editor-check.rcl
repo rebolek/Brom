@@ -1,0 +1,220 @@
+Recoil [
+    Title: "Loos editor headless layout check"
+    Description: {
+        Runs loos's real layout block with no window, then interrogates it
+        the way a player does: every control the block declares is clicked at
+        its own centre and must answer with the parameter it claims to drive.
+
+        This is the check the whole VID rewrite went without. Every other test
+        asserts on emitted C, which cannot see arithmetic -- and the layout IS
+        arithmetic: grid pitches, panel origins, and the indexing of the face
+        store. A one-slot error in that store made every editor render nothing
+        and two of them segfault, while ten transpile tests stayed green.
+    }
+    Type: module
+    Module: examples/pokuston/loos/editor-check
+    Ffi: [c-string]
+    Imports: [
+        gui/vid [
+            actor actor-data actor-edit actor-default actor-value actor-format
+            actor-frame view-build view-parameter-tally view-hit-parameter
+        ]
+        gui/widget [widget-format-number]
+        examples/pokuston/loos/editor-params [Param!]
+    ]
+    Exports: []
+]
+
+on-value-of: func ["Stub value query." id [u32!] return: [f64!]] [ unused id return 0.5 ]
+on-default-of: func ["Stub default query." id [u32!] return: [f64!]] [ unused id return 0.5 ]
+on-edited: func [
+    "Stub gesture sink."
+    id [u32!] n [f64!] p [i32!] return: [none!]
+] [ unused id unused n unused p return none ]
+on-shown: func [
+    "Stub formatter."
+    id [u32!] n [f64!] return: [string!]
+] [ unused id return widget-format-number n "%.2f" ]
+on-tick: func ["Stub frame actor." return: [none!]] [ return none ]
+on-prev: func ["Stub click actor." return: [none!]] [ return none ]
+on-next: func ["Stub click actor." return: [none!]] [ return none ]
+on-paged: func ["Stub page actor." v [f64!] return: [none!]] [ unused v return none ]
+
+check-coverage: func [
+    "Every parameter the layout claims must be driven by exactly one face."
+    total [i32!] "Parameter count to check."
+    return: [i32!] "Number of parameters with the wrong tally."
+] [
+    bad: make [#mutable i32!] 0
+    repeat step total [
+        tally: view-parameter-tally step
+        if tally <> 1 [
+            bad: bad + 1
+            if bad <= 6 [print rejoin ["  coverage: param " step " tally=" tally]]
+        ]
+    ]
+    return bad
+]
+
+check-hit: func [
+    {Click one point and require a given parameter back. This is what catches
+     a layout whose controls are drawn in one place and grabbed in another.}
+    x [i32!] "Point x." y [i32!] "Point y."
+    want [i32!] "Parameter the point should resolve to."
+    return: [i32!] "0 when it matched, 1 when it did not."
+] [
+    got: view-hit-parameter x y
+    if got = want [return 0]
+    print rejoin ["  hit: " x "x" y " gave " got ", wanted " want]
+    return 1
+]
+
+run: func [
+    "Build the layout, then check coverage and hit-testing."
+    return: [i32!] "Zero."
+] [
+    actor-edit 'edited :on-edited
+    actor-default 'defaulted :on-default-of
+    actor-value 'reads :on-value-of
+    actor-format 'shown :on-shown
+    actor-frame 'tick :on-tick
+    actor 'preset-prev :on-prev
+    actor 'preset-next :on-next
+    actor-data 'paged :on-paged
+
+    view-build [
+
+        panel 0x0 760x576 colour loos-board [
+            panel 12x12 736x552 colour loos-paper
+            panel 24x78 712x1 colour loos-construction
+
+            at 32x24 text "POKUSTON" font 12 colour loos-muted
+            at 32x40 text "LOOS" font 30 colour loos-ink
+            at 214x24 button "<" 24x26 colour loos-oxblood on-click 'preset-prev
+            at 394x24 button ">" 24x26 colour loos-oxblood on-click 'preset-next
+            at 252x31 preset: text "" font 12 colour loos-oxblood
+            at 504x35 text "POLYPHONIC 4-VOICE SYNTH" font 10 colour loos-muted
+
+            ; Five unequal rooms make a section rather than a control panel.
+            ; Their contents flow from one cursor per row; only the rooms and
+            ; the modulation routes own coordinates.
+            panel 24x126 152x164 colour loos-room [
+                panel 0x0 152x2 colour loos-ink
+                panel 0x0 2x164 colour loos-ink
+                panel 0x162 152x2 colour loos-ink
+                panel 150x0 2x164 colour loos-ink
+                panel 12x30 128x1 colour loos-construction
+                at 12x9 text "OSCILLATOR" font 10 colour loos-ink
+                at 12x20 text "ALWAYS + OCTAVE BELOW" font 8 colour loos-muted
+                at 35x42 across
+                knob "SHAPE" radius 34 style loos param (as i32! Param!/morph)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            ]
+            panel 196x96 332x210 colour loos-room [
+                panel 0x0 332x2 colour loos-ink
+                panel 0x0 2x210 colour loos-ink
+                panel 0x208 332x2 colour loos-ink
+                panel 330x0 2x210 colour loos-ink
+                panel 12x34 308x1 colour loos-construction
+                at 12x10 text "FILTER" font 10 colour loos-ink
+                at 76x10 text "ONE PER VOICE" font 9 colour loos-muted
+                at 14x48 across
+                knob "CUTOFF" radius 34 style loos param (as i32! Param!/cutoff)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                knob "RESONANCE" radius 34 style loos param (as i32! Param!/resonance)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                knob "ENV AMOUNT" radius 34 style loos param (as i32! Param!/env-amount)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            ]
+            panel 548x126 188x164 colour loos-room [
+                panel 0x0 188x2 colour loos-ink
+                panel 0x0 2x164 colour loos-ink
+                panel 0x162 188x2 colour loos-ink
+                panel 186x0 2x164 colour loos-ink
+                panel 12x30 164x1 colour loos-construction
+                at 12x9 text "AMPLIFIER" font 10 colour loos-ink
+                at 20x55 below
+                text "VELOCITY" font 13 colour loos-ink
+                text "x ENVELOPE" font 13 colour loos-oxblood
+                text "NO CONTROL OF ITS OWN" font 9 colour loos-muted
+            ]
+
+            ; The straight charcoal path is audio: oscillator, filter, gain.
+            panel 176x207 20x2 colour loos-ink
+            panel 528x207 20x2 colour loos-ink
+
+            panel 24x330 220x174 colour loos-room [
+                panel 0x0 220x2 colour loos-ink
+                panel 0x0 2x174 colour loos-ink
+                panel 0x172 220x2 colour loos-ink
+                panel 218x0 2x174 colour loos-ink
+                panel 12x31 196x1 colour loos-construction
+                at 12x9 text "LFO" font 10 colour loos-ink
+                at 20x43 across
+                knob "RATE" radius 30 style loos param (as i32! Param!/lfo-rate)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                knob "CUTOFF DEPTH" radius 30 style loos
+                    param (as i32! Param!/lfo-cutoff-depth)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            ]
+            panel 264x326 472x194 colour loos-room [
+                panel 0x0 472x2 colour loos-ink
+                panel 0x0 2x194 colour loos-ink
+                panel 0x192 472x2 colour loos-ink
+                panel 470x0 2x194 colour loos-ink
+                panel 12x34 448x1 colour loos-construction
+                at 12x9 text "ENVELOPE" font 10 colour loos-ink
+                at 84x9 text "ONE CONTOUR / FILTER + GAIN" font 9 colour loos-oxblood
+                at 16x48 canvas 148x82 on-draw 'envelope-contour
+                at 180x43 across
+                fader "ATTACK" 56x132 style loos param (as i32! Param!/attack)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                fader "DECAY" 56x132 style loos param (as i32! Param!/decay)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                fader "SUSTAIN" 56x132 style loos param (as i32! Param!/sustain)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                fader "RELEASE" 56x132 style loos param (as i32! Param!/release)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            ]
+
+            ; Oxblood is modulation: the LFO reaches cutoff, and the one ADSR
+            ; rises into both the filter and amplifier rooms.
+            panel 104x306 2x24 colour loos-oxblood
+            panel 104x310 148x2 colour loos-oxblood
+            panel 250x306 2x6 colour loos-oxblood
+            at 112x313 text "TO CUTOFF" font 8 colour loos-oxblood
+            panel 320x306 2x20 colour loos-oxblood
+            at 328x310 text "TO FILTER" font 8 colour loos-oxblood
+            panel 646x290 2x36 colour loos-oxblood
+            at 654x310 text "TO GAIN" font 8 colour loos-oxblood
+
+            at 190x542 text "VERTICAL DRAG   SHIFT: FINE   DOUBLE-CLICK: RESET"
+                font 10 colour loos-muted
+        ]
+    ]
+    bad: make [#mutable i32!] check-coverage 10
+    ; Six drafting dials and four rectangular faders, all placed by flow from
+    ; one cursor per room. These points are their resolved centres.
+    bad: bad + check-hit 100 209 9
+    bad: bad + check-hit 251 185 0
+    bad: bad + check-hit 341 185 1
+    bad: bad + check-hit 431 185 2
+    bad: bad + check-hit 81 410 7
+    bad: bad + check-hit 163 410 8
+    bad: bad + check-hit 472 435 3
+    bad: bad + check-hit 536 435 4
+    bad: bad + check-hit 600 435 5
+    bad: bad + check-hit 664 435 6
+    ; Gaps between dials and faders, the live contour, the amplifier, the
+    ; modulation routing, and the footer claim no parameter.
+    bad: bad + check-hit 296 185 -1
+    bad: bad + check-hit 504 435 -1
+    bad: bad + check-hit 350 420 -1
+    bad: bad + check-hit 646 194 -1
+    bad: bad + check-hit 320 315 -1
+    bad: bad + check-hit 380 540 -1
+    print rejoin ["loos-layout mismatched=" bad]
+    return 0
+]
+
+run

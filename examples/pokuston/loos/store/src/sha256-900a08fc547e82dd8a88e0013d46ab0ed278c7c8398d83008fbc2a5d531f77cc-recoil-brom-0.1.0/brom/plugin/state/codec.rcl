@@ -1,0 +1,274 @@
+Recoil [
+    Title: "Pokuston shared versioned parameter-state codec"
+    Description: {
+        The shared byte format every Brom-based plug-in's binary saved state
+        uses. A binary blob always opens with the universal, codec-owned
+        BROM-MAGIC and BROM-CONTAINER-VERSION -- a fixed identity every
+        subsystem shares -- followed by that subsystem's own FourCC and
+        schema version as separate header fields (IFF-style: a fixed
+        container identity, then a chunk naming what is inside). There is no
+        per-plug-in top-level magic.
+
+        state-codec-load-engine / state-codec-save-engine are the entry
+        points a plug-in's shell code should use: they read state-subsystem,
+        state-version, param-count, param-info-fn, get-param-fn and
+        set-param-fn straight from an engine! descriptor, so no plug-in
+        writes its own encode/decode loop. A parameter absent from a loaded
+        blob's own saved count keeps its param-info-fn default -- this is how
+        a pure append (a new parameter past the old count) never needs a
+        state-version bump, and is mainly useful to regeneration/conversion
+        tooling, not to loading an unconverted old stream: the shell that
+        calls state-codec-load-engine always hands it exactly state-size
+        bytes, and a stream shorter than that is rejected before this
+        function ever sees it. A schema-affecting change -- reordering ids,
+        or changing what an existing id means -- is what state-version still
+        exists to catch, and is expected to regenerate the handful of
+        affected saved presets rather than preserve every old byte layout.
+
+        The five lower-level functions below (state-codec-write-header
+        onward) are the fixed 12-byte inner header/payload layout this
+        builds on, unchanged. state-codec-load-engine/-save-engine read and
+        write the 8-byte BROM prefix themselves, then call these exact,
+        unmodified functions on a pointer shifted 8 bytes past it -- no
+        offset math changes for a caller (Loos) still using them directly.
+    }
+    Type: module
+    Module: brom/plugin/state/codec
+    Imports: [
+        brom/plugin/engine [engine! param-info!]
+    ]
+    Exports: [
+        state-codec-size state-codec-write-header state-codec-read-count
+        state-codec-read-version state-codec-read-parameter-count
+        state-codec-write-f64 state-codec-read-f64
+        BROM-MAGIC BROM-CONTAINER-VERSION
+        state-codec-load-engine state-codec-save-engine
+    ]
+]
+
+STATE_CODEC_HEADER_SIZE: 12
+STATE_CODEC_MAX_PARAMETERS: 4096
+state-codec-bytes!: make c-struct! [data: [c-array! [u8! 32780]]]
+
+state-codec-size: func [
+    "Return the serialized byte size for a parameter-state payload."
+    parameter-count [u32!]
+    return: [size!]
+] [
+    if parameter-count > (as u32! STATE_CODEC_MAX_PARAMETERS) [return as size! 0]
+    return as size! (STATE_CODEC_HEADER_SIZE + ((as i32! parameter-count) * 8))
+]
+
+write-u32-le: func [
+    "Write one unsigned 32-bit value to a borrowed state buffer in little-endian order."
+    :buffer [state-codec-bytes!]
+    offset [i32!]
+    value [u32!]
+    return: [none!]
+] [
+    p1: offset + 1
+    p2: offset + 2
+    p3: offset + 3
+    buffer/data/:offset: as u8! (value & (as u32! 255))
+    buffer/data/:p1: as u8! ((value >> (as u32! 8)) & (as u32! 255))
+    buffer/data/:p2: as u8! ((value >> (as u32! 16)) & (as u32! 255))
+    buffer/data/:p3: as u8! ((value >> (as u32! 24)) & (as u32! 255))
+    return none
+]
+
+read-u32-le: func [
+    "Read one unsigned 32-bit value from a borrowed state buffer in little-endian order."
+    :buffer [state-codec-bytes!]
+    offset [i32!]
+    return: [u32!]
+] [
+    p1: offset + 1
+    p2: offset + 2
+    p3: offset + 3
+    b0: as u32! buffer/data/:offset
+    b1: (as u32! buffer/data/:p1) << (as u32! 8)
+    b2: (as u32! buffer/data/:p2) << (as u32! 16)
+    b3: (as u32! buffer/data/:p3) << (as u32! 24)
+    return ((b0 | b1) | (b2 | b3))
+]
+
+state-codec-write-header: func [
+    "Write a validated magic, schema version, and parameter count to a state payload."
+    :bytes [c-pointer!]
+    capacity [size!]
+    magic [u32!]
+    version [u32!]
+    parameter-count [u32!]
+    return: [logic!]
+] [
+    required: state-codec-size parameter-count
+    if any [none? bytes required = (as size! 0) capacity < required] [return false]
+    buffer: make [#mutable state-codec-bytes!] as state-codec-bytes! bytes
+    write-u32-le :buffer 0 magic
+    write-u32-le :buffer 4 version
+    write-u32-le :buffer 8 parameter-count
+    return true
+]
+
+state-codec-read-count: func [
+    "Validate a state header and return its encoded parameter count."
+    :bytes [c-pointer!]
+    size [size!]
+    magic [u32!]
+    version [u32!]
+    return: [i32!]
+] [
+    if any [none? bytes size < (as size! STATE_CODEC_HEADER_SIZE)] [return -1]
+    buffer: make [#mutable state-codec-bytes!] as state-codec-bytes! bytes
+    if (read-u32-le :buffer 0) <> magic [return -1]
+    if (read-u32-le :buffer 4) <> version [return -1]
+    return state-codec-read-parameter-count :bytes size
+]
+
+state-codec-read-version: func [
+    "Read the schema version from a state header without accepting it."
+    :bytes [c-pointer!] "Borrowed state bytes containing at least the header."
+    size [size!] "Available bytes in the state buffer."
+    return: [i32!] "Encoded version, or -1 when the header is truncated."
+] [
+    if any [none? bytes size < (as size! STATE_CODEC_HEADER_SIZE)] [return -1]
+    buffer: make [#mutable state-codec-bytes!] as state-codec-bytes! bytes
+    return as i32! read-u32-le :buffer 4
+]
+
+state-codec-read-parameter-count: func [
+    "Read and validate the parameter count from a state header."
+    :bytes [c-pointer!] "Borrowed state bytes containing at least the header."
+    size [size!] "Available bytes in the state buffer."
+    return: [i32!] "Encoded parameter count, or -1 when it cannot fit the codec."
+] [
+    if any [none? bytes size < (as size! STATE_CODEC_HEADER_SIZE)] [return -1]
+    buffer: make [#mutable state-codec-bytes!] as state-codec-bytes! bytes
+    count: read-u32-le :buffer 8
+    if count > (as u32! STATE_CODEC_MAX_PARAMETERS) [return -1]
+    required: state-codec-size count
+    if size < required [return -1]
+    return as i32! count
+]
+
+state-codec-write-f64: func [
+    "Write one parameter value to its canonical little-endian state slot."
+    :bytes [c-pointer!]
+    capacity [size!]
+    parameter [u32!]
+    value [f64!]
+    return: [logic!]
+] [
+    offset: STATE_CODEC_HEADER_SIZE + ((as i32! parameter) * 8)
+    if any [none? bytes capacity < (as size! (offset + 8))] [return false]
+    buffer: make [#mutable state-codec-bytes!] as state-codec-bytes! bytes
+    bits: make [#mutable u64!] as u64! 0
+    unsafe/memcpy (addr-of bits) (addr-of value) 8
+    repeat byte 8 [
+        shift: as u64! (byte * 8)
+        index: offset + byte
+        buffer/data/:index: as u8! ((bits >> shift) & (as u64! 255))
+    ]
+    return true
+]
+
+state-codec-read-f64: func [
+    "Read one parameter value from its canonical little-endian state slot."
+    :bytes [c-pointer!]
+    size [size!]
+    parameter [u32!]
+    return: [f64!]
+] [
+    offset: STATE_CODEC_HEADER_SIZE + ((as i32! parameter) * 8)
+    if any [none? bytes size < (as size! (offset + 8))] [return 0.0]
+    buffer: make [#mutable state-codec-bytes!] as state-codec-bytes! bytes
+    bits: make [#mutable u64!] as u64! 0
+    repeat byte 8 [
+        shift: as u64! (byte * 8)
+        index: offset + byte
+        bits: bits | ((as u64! buffer/data/:index) << shift)
+    ]
+    value: make [#mutable f64!] 0.0
+    unsafe/memcpy (addr-of value) (addr-of bits) 8
+    return value
+]
+
+; The container every binary Brom state opens with, ahead of the inner
+; 12-byte header above. Owned here, not by any plug-in -- see the module
+; description. Bumped only if this 8-byte prefix's own layout changes.
+BROM-MAGIC: 0#4D4F5242
+BROM-CONTAINER-VERSION: 1
+
+state-codec-load-engine: func [
+    "Read a BROM-prefixed binary state blob into an engine instance, defaulting any parameter past the blob's own saved count to its param-info-fn default."
+    :engine [engine!] "Borrowed engine descriptor supplying state-subsystem/state-version and the get/set-param-fn table."
+    :core [c-pointer!] "Borrowed mutable engine instance to write into."
+    :bytes [c-pointer!] "Borrowed source bytes, opening with the BROM container prefix."
+    size [size!] "Available source bytes."
+    return: [logic!] "True when the container, subsystem and version all matched and every parameter was applied."
+] [
+    if any [none? bytes size < (as size! 8)] [return false]
+    prefix: make [#mutable state-codec-bytes!] as state-codec-bytes! bytes
+    if (read-u32-le :prefix 0) <> (as u32! BROM-MAGIC) [return false]
+    if (read-u32-le :prefix 4) <> (as u32! BROM-CONTAINER-VERSION) [return false]
+
+    body: bytes + 8
+    body-size: as size! ((as i32! size) - 8)
+    count: state-codec-read-count :body body-size engine/state-subsystem engine/state-version
+    if count < 0 [return false]
+
+    info: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+    if none? info [return false]
+    unsafe/memset info 0 (as i32! size-of param-info!)
+
+    valid: make [#mutable logic!] true
+    repeat index engine/param-count [
+        if valid [
+            either index < count [
+                either engine/param-info-fn index info [
+                    value: state-codec-read-f64 :body body-size (as u32! index)
+                    if not engine/set-param-fn :core (as u32! index) value [valid: false]
+                ] [
+                    valid: false
+                ]
+            ] [
+                either engine/param-info-fn index info [
+                    p: make [#mutable param-info!] as param-info! info
+                    if not engine/set-param-fn :core (as u32! index) p/default-value [valid: false]
+                ] [
+                    valid: false
+                ]
+            ]
+        ]
+    ]
+    unsafe/free info
+    return valid
+]
+
+state-codec-save-engine: func [
+    "Write an engine's complete parameter state as a BROM-prefixed binary blob."
+    :engine [engine!] "Borrowed engine descriptor supplying state-subsystem/state-version and the get-param-fn table."
+    :core [c-pointer!] "Borrowed engine instance the values are read from."
+    :out [c-pointer!] "Borrowed destination bytes."
+    capacity [size!] "Destination capacity in bytes."
+    return: [logic!] "True when the whole container fitted and was written."
+] [
+    if any [none? out capacity < (as size! 8)] [return false]
+    prefix: make [#mutable state-codec-bytes!] as state-codec-bytes! out
+    write-u32-le :prefix 0 (as u32! BROM-MAGIC)
+    write-u32-le :prefix 4 (as u32! BROM-CONTAINER-VERSION)
+
+    body: out + 8
+    body-capacity: as size! ((as i32! capacity) - 8)
+    if not state-codec-write-header :body body-capacity
+        engine/state-subsystem engine/state-version (as u32! engine/param-count) [return false]
+
+    ok: make [#mutable logic!] true
+    repeat index engine/param-count [
+        if ok [
+            value: make f64! engine/get-param-fn :core (as u32! index)
+            if not state-codec-write-f64 :body body-capacity (as u32! index) value [ok: false]
+        ]
+    ]
+    return ok
+]

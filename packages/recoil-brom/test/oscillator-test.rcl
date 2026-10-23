@@ -1,0 +1,401 @@
+Recoil [
+    Title: "brom/dsp/oscillator exercise"
+    Description: {
+        Checks the sawtooth's defining properties rather than replaying stored
+        samples: it ramps upward within a period, spans the full -1..1 range,
+        carries no DC offset over a cycle, and the PolyBLEP correction is active
+        only within one step of the discontinuity.
+
+        Loos' render gate proves the extraction was bit-exact, but that is a
+        property of Loos. This gives the oscillator coverage of its own.
+
+        Also checks that the wavetable read treats phase as circular. FM is the
+        only caller that drives it negative, and it is the caller least likely
+        to make a wrong answer obvious, so the invariant is asserted directly
+        rather than inferred from how something sounds.
+    }
+    Type: module
+    Module: recoil-brom/test/oscillator-test
+    Imports: [
+        brom/dsp/oscillator [
+            brom-poly-blep brom-blep-saw
+            brom-wrap-phase
+            brom-wavetable! brom-wavetable-bytes brom-wavetable-fill
+            brom-wavetable-read brom-wavetable-read-fast
+            BROM-BLAMP-HALF
+            brom-blamp-table-bytes brom-blamp-table-fill brom-blamp-residual
+            brom-morph-osc! brom-morph-osc-reset brom-morph-osc-tick
+        ]
+        brom/dsp/utils [brom-abs-f64]
+    ]
+    Exports: []
+]
+
+; 100 samples per cycle -- coarse enough that one step is a visible fraction of
+; the period, so the BLEP window is easy to reason about.
+TEST-STEP: 0.01
+
+check: func [
+    "Record one assertion as a PASS or FAIL line."
+    ok? [logic!] "Whether the assertion held."
+    return: [none!] "No value; the marker is written to stdout."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+near?: func [
+    "Whether two values agree to within a tolerance."
+    a [f64!] "First value."
+    b [f64!] "Second value."
+    tolerance [f64!] "Largest accepted absolute difference."
+    return: [logic!] "True when the values are close enough."
+] [
+    return (brom-abs-f64 (a - b)) <= tolerance
+]
+
+check-phase-read: func [
+    "Check one wavetable read is finite, bounded, and invariant under wrapping."
+    :table [c-pointer!] "Borrowed filled sine or cosine wavetable."
+    phase [f64!] "Input phase to check, including values outside one cycle."
+    return: [none!] "No value; the assertions are written to stdout."
+] [
+    direct: brom-wavetable-read :table phase
+    wrapped: brom-wavetable-read :table (brom-wrap-phase phase)
+    check (near? direct wrapped 1e-12)
+    check (all [
+        direct = direct direct >= -1.0 direct <= 1.0
+        wrapped = wrapped wrapped >= -1.0 wrapped <= 1.0
+    ])
+    return none
+]
+
+check-phase-read-fast: func [
+    "Check the fast reader against the arbitrary-phase reader."
+    :table [c-pointer!] "Borrowed filled sine or cosine wavetable."
+    phase [f64!] "Input phase, including the guarded fallback range."
+    return: [none!] "No value; the assertions are written to stdout."
+] [
+    direct: brom-wavetable-read-fast :table phase
+    wrapped: brom-wavetable-read :table phase
+    check (near? direct wrapped 1e-12)
+    check (all [
+        direct = direct direct >= -1.0 direct <= 1.0
+        wrapped = wrapped wrapped >= -1.0 wrapped <= 1.0
+    ])
+    return none
+]
+
+; --- the correction is local to the discontinuity ----------------------------
+; Away from the edge a PolyBLEP saw must be exactly the naive ramp, or the
+; correction is smearing the whole waveform rather than just its jump.
+check (brom-poly-blep 0.5 TEST-STEP) = 0.0
+check (brom-poly-blep 0.25 TEST-STEP) = 0.0
+check (brom-poly-blep 0.75 TEST-STEP) = 0.0
+check (near? (brom-blep-saw 0.5 TEST-STEP) 0.0 0.0)
+check (near? (brom-blep-saw 0.75 TEST-STEP) 0.5 0.0)
+
+; --- and non-zero inside one step of it --------------------------------------
+check (brom-poly-blep 0.0 TEST-STEP) <> 0.0
+check (brom-poly-blep 0.999 TEST-STEP) <> 0.0
+
+; --- the ramp rises across the period ----------------------------------------
+; Sampled clear of both edges so the comparison is against the ramp itself.
+rising: make [#mutable logic!] true
+previous: make [#mutable f64!] -2.0
+repeat i 90 [
+    phase: 0.05 + ((as f64! i) * 0.01)
+    sample: brom-blep-saw phase TEST-STEP
+    if sample <= previous [rising: false]
+    previous: sample
+]
+check rising
+
+; --- and stays in range ------------------------------------------------------
+; The correction overshoots slightly by design, so this is a sanity bound rather
+; than a tight one -- an unbounded oscillator is the failure worth catching.
+bounded: make [#mutable logic!] true
+repeat i 100 [
+    phase: (as f64! i) * 0.01
+    sample: brom-blep-saw phase TEST-STEP
+    if (brom-abs-f64 sample) > 1.5 [bounded: false]
+    if sample <> sample [bounded: false]
+]
+check bounded
+
+; --- no DC offset over a full cycle ------------------------------------------
+; A saw is symmetric about zero; a correction that biased it would push a
+; constant into everything downstream, which a filter would then have to remove.
+total: make [#mutable f64!] 0.0
+repeat i 100 [
+    phase: (as f64! i) * 0.01
+    total: total + (brom-blep-saw phase TEST-STEP)
+]
+check (near? total 0.0 0.05)
+
+; --- a finer step narrows the corrected region -------------------------------
+; At step 0.001 the phase 0.005 is five steps past the edge and must be clean,
+; while at step 0.01 the same phase is inside the window.
+check (brom-poly-blep 0.005 0.001) = 0.0
+check (brom-poly-blep 0.005 0.01) <> 0.0
+
+; --- the wavetable read treats phase as circular -----------------------------
+; Phase is an angle, so reading at p and at p - 1 must give the same sample.
+; The negative half is what FM produces, and a read that clamped it instead of
+; wrapping would pin the whole half to entry zero -- audible as a timbre, not
+; as a failure, which is why it is asserted rather than listened for.
+table: make c-pointer! unsafe/malloc (as i32! brom-wavetable-bytes)
+brom-wavetable-fill :table false
+
+wraps: make [#mutable logic!] true
+repeat i 32 [
+    phase: (as f64! i) * 0.03125
+    here: brom-wavetable-read :table phase
+    below: brom-wavetable-read :table (phase - 1.0)
+    above: brom-wavetable-read :table (phase + 1.0)
+    unless near? here below 0.000001 [wraps: false]
+    unless near? here above 0.000001 [wraps: false]
+]
+check wraps
+
+; A negative phase must land where its positive image does, interpolation and
+; all -- so the check is made off the grid, where truncation and floor differ.
+check (near? (brom-wavetable-read :table -0.25) (brom-wavetable-read :table 0.75) 0.000001)
+check (near? (brom-wavetable-read :table -0.3333) (brom-wavetable-read :table 0.6667) 0.0001)
+
+; And the whole negative range has to move, not sit on one entry.
+frozen: make [#mutable logic!] true
+first-value: brom-wavetable-read :table -0.99
+repeat i 32 [
+    value: brom-wavetable-read :table (-0.99 + ((as f64! i) * 0.03))
+    unless near? value first-value 0.000001 [frozen: false]
+]
+check (frozen = false)
+
+; The caller-side normalization in brom-sum-harmonics must remain redundant at
+; the boundaries where truncation, negative zero, or rounding could change the
+; table index. Both table shapes use the same phase addressing contract.
+cosine-table: make c-pointer! unsafe/malloc (as i32! brom-wavetable-bytes)
+brom-wavetable-fill :cosine-table true
+check-phase-read :table -1.0
+check-phase-read :table -1.0E-16
+check-phase-read :table -0.0
+check-phase-read :table 0.0
+check-phase-read :table 0.9999999999999999
+check-phase-read :table 1.0
+check-phase-read :table 1.0000000000000002
+check-phase-read :table 2.0
+check-phase-read :table -2.0
+check-phase-read :table -127.5
+check-phase-read :table 128.5
+check-phase-read :cosine-table -1.0
+check-phase-read :cosine-table -1.0E-16
+check-phase-read :cosine-table -0.0
+check-phase-read :cosine-table 0.0
+check-phase-read :cosine-table 0.9999999999999999
+check-phase-read :cosine-table 1.0
+check-phase-read :cosine-table 1.0000000000000002
+check-phase-read :cosine-table 2.0
+check-phase-read :cosine-table -2.0
+check-phase-read :cosine-table -127.5
+check-phase-read :cosine-table 128.5
+
+; Harmonic phases are bounded by the 64-partial cap, drift offset and spread
+; depth. Exercise both endpoints, wrap crossings and a dense sweep of that
+; domain against the public arbitrary-phase reader.
+check-phase-read-fast :table -0.0625
+check-phase-read-fast :table 0.0
+check-phase-read-fast :table 0.9999999999999999
+check-phase-read-fast :table 1.0
+check-phase-read-fast :table 1.0000000000000002
+check-phase-read-fast :table 63.99999999999999
+check-phase-read-fast :table 64.0
+check-phase-read-fast :table 64.5
+check-phase-read-fast :table 64.5625
+check-phase-read-fast :table -131071.0
+check-phase-read-fast :table 131071.0
+check-phase-read-fast :table -131071.0001
+check-phase-read-fast :table 131071.0001
+check-phase-read-fast :table 1048576.0
+check-phase-read-fast :table -1048576.0
+check-phase-read-fast :cosine-table -0.0625
+check-phase-read-fast :cosine-table 0.0
+check-phase-read-fast :cosine-table 0.9999999999999999
+check-phase-read-fast :cosine-table 1.0
+check-phase-read-fast :cosine-table 1.0000000000000002
+check-phase-read-fast :cosine-table 63.99999999999999
+check-phase-read-fast :cosine-table 64.0
+check-phase-read-fast :cosine-table 64.5
+check-phase-read-fast :cosine-table 64.5625
+check-phase-read-fast :cosine-table -131071.0
+check-phase-read-fast :cosine-table 131071.0
+check-phase-read-fast :cosine-table -131071.0001
+check-phase-read-fast :cosine-table 131071.0001
+check-phase-read-fast :cosine-table 1048576.0
+check-phase-read-fast :cosine-table -1048576.0
+fast-reader-equivalent: make [#mutable logic!] true
+repeat i 1025 [
+    phase: -0.0625 + ((as f64! i) * (64.625 / 1024.0))
+    sine-fast: brom-wavetable-read-fast :table phase
+    sine-public: brom-wavetable-read :table phase
+    cosine-fast: brom-wavetable-read-fast :cosine-table phase
+    cosine-public: brom-wavetable-read :cosine-table phase
+    unless all [
+        near? sine-fast sine-public 1e-12
+        near? cosine-fast cosine-public 1e-12
+        sine-fast = sine-fast sine-fast >= -1.0 sine-fast <= 1.0
+        cosine-fast = cosine-fast cosine-fast >= -1.0 cosine-fast <= 1.0
+    ] [fast-reader-equivalent: false]
+]
+check fast-reader-equivalent
+
+unsafe/free :table
+unsafe/free :cosine-table
+
+print "PASS"
+
+; ---------------------------------------------------------------------------
+; The morphing ramp and its slope correction
+; ---------------------------------------------------------------------------
+
+osc-test-math: foreign <math.h> [
+    sin: "sin" [f64! return: [f64!]]
+    cos: "cos" [f64! return: [f64!]]
+    sqrt: "sqrt" [f64! return: [f64!]]
+]
+
+MORPH-TAU: 6.283185307179586
+; A fundamental at 0.0798611 of the sample rate: high enough that the seventh
+; harmonic is over Nyquist and folds back, and chosen so the fold lands at
+; 0.440972 -- which is not itself a harmonic, so the two can be told apart.
+MORPH-STEP: 0.0798611111111111
+MORPH-ALIAS-FREQ: 0.440972222222222
+MORPH-FRAMES: 4096
+
+blamp-table: make c-pointer! unsafe/malloc brom-blamp-table-bytes
+brom-blamp-table-fill :blamp-table
+
+; --- the residual has decayed by the edges of its window --------------------
+; A correction that has not returned to zero by the end of the window would put
+; a step at the window edge -- trading the discontinuity being corrected for a
+; smaller one further out.
+check (near? (brom-blamp-residual :blamp-table 0.0) 0.0 0.000001)
+check (near? (brom-blamp-residual :blamp-table 8192.0) 0.0 0.000001)
+check (brom-blamp-residual :blamp-table -1.0) = 0.0
+
+morph-osc: make [#mutable brom-morph-osc!] []
+morph-handle: addr-of morph-osc
+
+; --- the output trails the input by the window's half-width -----------------
+; Corrections reach backwards from a break, so a sample cannot be final until
+; every break touching it has been seen. That is a latency, and it is better
+; asserted than discovered.
+brom-morph-osc-reset :morph-handle
+silent: make [#mutable logic!] true
+repeat i BROM-BLAMP-HALF [
+    if (brom-morph-osc-tick :morph-handle :blamp-table MORPH-STEP 0.9) <> 0.0 [
+        silent: false
+    ]
+]
+check silent
+check (brom-morph-osc-tick :morph-handle :blamp-table MORPH-STEP 0.9) <> 0.0
+
+; --- a single-bin measurement of the fold -----------------------------------
+; The claim this oscillator exists to make is numerical, so it is asserted
+; numerically rather than left to a render hash. One bin of a DFT is enough:
+; correlate against the alias frequency and against the fundamental, and
+; compare the ratio with and without the correction.
+morph-buffer!: make c-struct! [
+    values: [c-array! [f64! 4096]]
+]
+
+morph-bin: func [
+    "Magnitude at one normalized frequency, Hann-windowed to contain leakage."
+    :samples [c-pointer!] "Borrowed buffer of MORPH-FRAMES doubles."
+    frequency [f64!] "Frequency as a fraction of the sample rate."
+    return: [f64!] "Unnormalized magnitude at that frequency."
+] [
+    buf: make [#mutable morph-buffer!] as morph-buffer! :samples
+    real: make [#mutable f64!] 0.0
+    imaginary: make [#mutable f64!] 0.0
+    repeat i MORPH-FRAMES [
+        position: (as f64! i) / (as f64! MORPH-FRAMES)
+        window: 0.5 - (0.5 * (osc-test-math/cos (MORPH-TAU * position)))
+        value: (make f64! buf/values/:i) * window
+        angle: MORPH-TAU * frequency * (as f64! i)
+        real: real + (value * (osc-test-math/cos angle))
+        imaginary: imaginary - (value * (osc-test-math/sin angle))
+    ]
+    return osc-test-math/sqrt ((real * real) + (imaginary * imaginary))
+]
+
+morph-render: func [
+    "Fill a buffer with the morphing ramp, corrected or raw."
+    :out [c-pointer!] "Borrowed morph-buffer! to fill."
+    :osc [c-pointer!] "Borrowed brom-morph-osc! to drive."
+    morph [f64!] "Rising fraction of the cycle."
+    corrected? [logic!] "False renders the naive shape, for the comparison."
+    return: [none!] "No value; the buffer is filled in place."
+] [
+    buf: make [#mutable morph-buffer!] as morph-buffer! :out
+    o: make [#mutable brom-morph-osc!] as brom-morph-osc! :osc
+    brom-morph-osc-reset :osc
+    either corrected? [
+        repeat i MORPH-FRAMES [
+            buf/values/:i: brom-morph-osc-tick :osc :blamp-table MORPH-STEP morph
+        ]
+    ] [
+        ; The same shape with no correction at all, generated here rather than
+        ; exported, so the comparison is against this oscillator's own naive
+        ; form and not against some other approximation of it.
+        rise: 2.0 / morph
+        fall: 0.0 - (2.0 / (1.0 - morph))
+        phase: make [#mutable f64!] 0.0
+        repeat i MORPH-FRAMES [
+            buf/values/:i: either phase < morph [
+                (rise * phase) - 1.0
+            ] [
+                ((1.0 - phase) * (0.0 - fall)) - 1.0
+            ]
+            next-phase: phase + MORPH-STEP
+            phase: either next-phase >= 1.0 [next-phase - 1.0] [next-phase]
+        ]
+    ]
+    return none
+]
+
+morph-store: make c-pointer! unsafe/malloc (as i32! size-of morph-buffer!)
+
+morph-render :morph-store :morph-handle 0.9 false
+raw-fold: (morph-bin :morph-store MORPH-ALIAS-FREQ) / (morph-bin :morph-store MORPH-STEP)
+morph-render :morph-store :morph-handle 0.9 true
+fixed-fold: (morph-bin :morph-store MORPH-ALIAS-FREQ) / (morph-bin :morph-store MORPH-STEP)
+
+; Measured off-line the correction is worth about 36 dB here. Twenty is
+; asserted, so the test reports the correction having stopped working rather
+; than the last decibel of it having moved.
+check (fixed-fold < (raw-fold * 0.1))
+check (raw-fold > 0.0)
+
+; --- the shape is still the shape -------------------------------------------
+; A correction that quietly changed level or polarity would pass an alias test
+; and fail every ear. The fundamental has to survive it.
+morph-render :morph-store :morph-handle 0.9 false
+raw-fundamental: morph-bin :morph-store MORPH-STEP
+morph-render :morph-store :morph-handle 0.9 true
+fixed-fundamental: morph-bin :morph-store MORPH-STEP
+check (near? fixed-fundamental raw-fundamental (raw-fundamental * 0.05))
+
+; --- a triangle carries no even harmonics -----------------------------------
+; At the midpoint the ramp is symmetric, and a symmetric wave has only odd
+; harmonics. This is what distinguishes a real morph from a crossfade: nothing
+; blended from a saw would null its second harmonic.
+morph-render :morph-store :morph-handle 0.5 true
+tri-fundamental: morph-bin :morph-store MORPH-STEP
+tri-second: morph-bin :morph-store (MORPH-STEP * 2.0)
+tri-third: morph-bin :morph-store (MORPH-STEP * 3.0)
+check (tri-second < (tri-fundamental * 0.01))
+check (tri-third > (tri-fundamental * 0.05))
+
+unsafe/free :morph-store
+unsafe/free :blamp-table

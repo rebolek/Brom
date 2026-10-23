@@ -1,0 +1,459 @@
+Recoil [
+    Title: "Brom reverb lifecycle and quantizer exercise"
+    Type: module
+    Module: recoil-brom/test/reverb-test
+    Imports: [
+        std/io [arg-count]
+        brom/dsp/audio [brom-audio-f32! BROM-AUDIO-CAPACITY]
+        brom/dsp/reverb [
+            brom-reverb-state! brom-reverb-params!
+            brom-reverb-activate brom-reverb-deactivate brom-reverb-reset
+            brom-reverb-tail-samples brom-reverb-memory-bytes brom-reverb-quantize
+            brom-reverb-process
+        ]
+    ]
+    Exports: []
+]
+
+allocation: foreign <punkva-allocation.c> [
+    fail-next: "punkva_allocation_fail_next" [return: [none!]]
+    live: "punkva_allocation_live" [return: [i32!]]
+    calls: "punkva_allocation_calls" [return: [i32!]]
+    layout: "punkva_audio_layout" [size! size! size! return: [logic!]]
+    dirty: "punkva_storage_dirty" [:c-pointer! size! return: [none!]]
+    clear?: "punkva_storage_clear" [:c-pointer! size! return: [logic!]]
+]
+
+libm: foreign <math.h> [
+    sqrt: "sqrt" [f64! return: [f64!]]
+    exp: "exp" [f64! return: [f64!]]
+    abs: "fabsf" [f32! return: [f32!]]
+    sin: "sinf" [f32! return: [f32!]]
+]
+
+check: func [
+    "Record an assertion as a PASS or FAIL marker."
+    ok? [logic!] "Whether the assertion held."
+    return: [none!] "No value; writes a marker."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+lifecycle-test: func [
+    "Exercise caller storage, allocation failure and repeated lifecycle calls."
+    return: [none!] "No value; writes assertion markers."
+] [
+    state: make [#mutable brom-reverb-state!] []
+    check (allocation/layout (size-of brom-audio-f32!)
+        (offset-of brom-audio-f32! left) (offset-of brom-audio-f32! right))
+    check BROM-AUDIO-CAPACITY = 512
+    check (brom-reverb-memory-bytes :state) = (as size! 0)
+    check (brom-reverb-tail-samples :state) = (as u32! 0)
+    brom-reverb-reset :state
+    brom-reverb-deactivate :state
+    brom-reverb-deactivate :state
+    check allocation/live = 0
+
+    check brom-reverb-activate :state 32000.0 1
+    check state/active
+    check state/max-frames = 1
+    check (brom-reverb-memory-bytes :state) > (as size! 0)
+    check (brom-reverb-memory-bytes :state) <= (as size! 2147483647)
+    check (brom-reverb-tail-samples :state) = (as u32! 522989)
+    calls-before: allocation/calls
+    memory: as c-pointer! state/storage
+    allocation/dirty :memory state/memory-bytes
+    state/write-index: 17
+    state/damping/0: as f32! 1.0
+    brom-reverb-reset :state
+    brom-reverb-reset :state
+    check allocation/calls = calls-before
+    check allocation/clear? :memory state/memory-bytes
+    check state/write-index = 0
+    check state/damping/0 = (as f32! 0.0)
+    check state/active
+
+    check brom-reverb-activate :state 44100.0 512
+    check state/max-frames = 512
+    check state/sample-rate = (as f32! 44100.0)
+    check allocation/live = 1
+    check state/write-index = 0
+    memory-next: as c-pointer! state/storage
+    check allocation/clear? :memory-next state/memory-bytes
+    check brom-reverb-activate :state 192000.0 4096
+    check state/max-frames = 512
+    check (brom-reverb-tail-samples :state) = (as u32! 3137933)
+    check (brom-reverb-memory-bytes :state) <= (as size! 2147483647)
+    check allocation/live = 1
+
+    check (brom-reverb-activate :state 0.0 512) = false
+    check state/active = false
+    check allocation/live = 0
+    check (brom-reverb-activate :state 31999.0 512) = false
+    check (brom-reverb-activate :state 192001.0 512) = false
+    check (brom-reverb-activate :state (libm/sqrt -1.0) 512) = false
+    check (brom-reverb-activate :state (libm/exp 1000.0) 512) = false
+    check (brom-reverb-activate :state 44100.0 0) = false
+    check (brom-reverb-activate :state 44100.0 -1) = false
+    ; Huge rates must fail before a narrowing conversion or size multiplication.
+    check (brom-reverb-activate :state 100000000000000000000.0 512) = false
+    check (brom-reverb-memory-bytes :state) = (as size! 0)
+    check (brom-reverb-tail-samples :state) = (as u32! 0)
+    check state/storage = (as c-pointer! 0)
+
+    allocation/fail-next
+    check (brom-reverb-activate :state 48000.0 512) = false
+    check state/active = false
+    check state/storage = (as c-pointer! 0)
+    check allocation/live = 0
+    brom-reverb-reset :state
+    brom-reverb-deactivate :state
+    check allocation/live = 0
+    check brom-reverb-activate :state 48000.0 2147483647
+    check state/max-frames = 512
+    ; Failing a reactivation must release the preceding allocation too.
+    allocation/fail-next
+    check (brom-reverb-activate :state 96000.0 512) = false
+    check state/active = false
+    check allocation/live = 0
+    brom-reverb-deactivate :state
+    check allocation/live = 0
+    return none
+]
+
+quantizer-test: func [
+    "Pin zero, ties away from zero and the signed twelve-bit rails."
+    return: [none!] "No value; writes assertion markers."
+] [
+    step: as f32! (2.0 / 2048.0)
+    check (brom-reverb-quantize (as f32! 0.0)) = (as f32! 0.0)
+    check (brom-reverb-quantize (step * (as f32! 0.5))) = step
+    check (brom-reverb-quantize (step * (as f32! -0.5))) = (step * (as f32! -1.0))
+    check (brom-reverb-quantize (as f32! 100.0)) = ((as f32! 2047.0) * step)
+    check (brom-reverb-quantize (as f32! -100.0)) = ((as f32! -2048.0) * step)
+    return none
+]
+
+
+default-params: func [
+    "Set nominal controls without allocating."
+    :params [brom-reverb-params!] "Caller-owned parameter block."
+    return: [none!] "No value; controls are filled in place."
+] [
+    params/mix: as f32! 1.0
+    params/decay-seconds: as f32! 2.0
+    params/damping-hz: as f32! 6000.0
+    params/size: as f32! 1.0
+    params/diffusion: as f32! 0.75
+    params/predelay-ms: as f32! 20.0
+    params/bypass: false
+    return none
+]
+
+render!: make c-struct! [
+    left: [c-array! [f32! 24000]]
+    right: [c-array! [f32! 24000]]
+]
+
+render-stream: func [
+    "Render one sample-indexed stimulus and control schedule."
+    :render [render!] "Caller-owned capture buffer."
+    partition [i32!] "Maximum processing frames."
+    alias? [logic!] "Use the exact same input and output block."
+    right? [logic!] "Swap excitation channels."
+    return: [none!] "No value; capture is filled in place."
+] [
+    state: make [#mutable brom-reverb-state!] []
+    input: make [#mutable brom-audio-f32!] []
+    output: make [#mutable brom-audio-f32!] []
+    params: make [#mutable brom-reverb-params!] []
+    default-params :params
+    brom-reverb-activate :state 48000.0 512
+    cursor: make [#mutable i32!] 0
+    ; Drain up to the next event or partition boundary, whichever comes first.
+    while [cursor < 24000] [
+        section: cursor / 4000
+        params/size: either (section % 2) = 0 [as f32! 0.5] [as f32! 2.0]
+        params/predelay-ms: either (section % 2) = 0 [as f32! 0.0] [as f32! 200.0]
+        params/diffusion: (as f32! section) / (as f32! 5.0)
+        params/decay-seconds: either section < 3 [as f32! 8.0] [as f32! 0.1]
+        frames: make [#mutable i32!] partition
+        until-event: ((section + 1) * 4000) - cursor
+        if frames > until-event [frames: until-event]
+        repeat i frames [
+            n: cursor + i
+            value: either n < 12000 [(as f32! 0.05) * (libm/sin ((as f32! n) * (as f32! 0.057)))] [as f32! 0.0]
+            input/left/:i: either right? [as f32! 0.0] [value]
+            input/right/:i: either right? [value] [as f32! 0.0]
+        ]
+        either alias? [
+            brom-reverb-process :state :input :input 2 frames :params
+            repeat i frames [
+                slot: cursor + i
+                render/left/:slot: input/left/:i
+                render/right/:slot: input/right/:i
+            ]
+        ] [
+            brom-reverb-process :state :input :output 2 frames :params
+            repeat i frames [
+                slot: cursor + i
+                render/left/:slot: output/left/:i
+                render/right/:slot: output/right/:i
+            ]
+        ]
+        cursor: cursor + frames
+    ]
+    brom-reverb-deactivate :state
+    return none
+]
+
+streaming-test: func [
+    "Catch dry quantization, wrong layouts, overwritten input and block-rate controls."
+    return: [none!] "No value; writes assertion markers."
+] [
+    state: make [#mutable brom-reverb-state!] []
+    input: make [#mutable brom-audio-f32!] []
+    output: make [#mutable brom-audio-f32!] []
+    params: make [#mutable brom-reverb-params!] []
+    default-params :params
+    check brom-reverb-activate :state 48000.0 512
+    params/mix: as f32! 0.0
+    input/left/0: as f32! 0.00001
+    input/right/0: as f32! -0.00002
+    check brom-reverb-process :state :input :output 2 1 :params
+    check output/left/0 = input/left/0
+    check output/right/0 = input/right/0
+    check brom-reverb-process :state :input :output 1 1 :params
+    check output/right/0 = input/left/0
+    index-before: state/write-index
+    calls-before: allocation/calls
+    output/left/0: as f32! 0.125
+    check (brom-reverb-process :state :input :output 0 1 :params) = false
+    check (brom-reverb-process :state :input :output 3 1 :params) = false
+    check (brom-reverb-process :state :input :output 2 -1 :params) = false
+    check (brom-reverb-process :state :input :output 2 513 :params) = false
+    check state/write-index = index-before
+    check output/left/0 = (as f32! 0.125)
+    check brom-reverb-process :state :input :output 2 0 :params
+    check state/write-index = index-before
+    check allocation/calls = calls-before
+    brom-reverb-deactivate :state
+    check (brom-reverb-process :state :input :output 2 1 :params) = false
+
+    ; Independent impulse timing: 20ms + 37.1ms = 2740.8 samples at 48k.
+    default-params :params
+    check brom-reverb-activate :state 48000.0 512
+    early: make [#mutable logic!] true
+    audible: make [#mutable logic!] false
+    stereo: make [#mutable logic!] false
+    repeat sample 8000 [
+        input/left/0: either sample = 0 [as f32! 1.0] [as f32! 0.0]
+        input/right/0: as f32! 0.0
+        brom-reverb-process :state :input :output 2 1 :params
+        if sample < 2740 [
+            if any [output/left/0 <> (as f32! 0.0) output/right/0 <> (as f32! 0.0)] [early: false]
+        ]
+        if output/left/0 <> (as f32! 0.0) [audible: true]
+        if output/left/0 <> output/right/0 [stereo: true]
+    ]
+    check early
+    check audible
+    check stereo
+    brom-reverb-deactivate :state
+
+    ; Same absolute event boundaries for each partition and for aliasing.
+    reference-memory: make c-pointer! unsafe/malloc (as i32! size-of render!)
+    candidate-memory: make c-pointer! unsafe/malloc (as i32! size-of render!)
+    reference: make [#mutable render!] as render! reference-memory
+    candidate: make [#mutable render!] as render! candidate-memory
+    render-stream :reference 1 false false
+    partitions: make [c-array! [i32! 4]] [1 17 64 512]
+    repeat part 4 [
+        repeat alias 2 [
+            render-stream :candidate partitions/:part (alias = 1) false
+            equal-stream: make [#mutable logic!] true
+            repeat i 24000 [
+                if (libm/abs (candidate/left/:i - reference/left/:i)) > (as f32! 0.000001) [equal-stream: false]
+                if (libm/abs (candidate/right/:i - reference/right/:i)) > (as f32! 0.000001) [equal-stream: false]
+            ]
+            check equal-stream
+        ]
+    ]
+    render-stream :candidate 64 false true
+    different: make [#mutable logic!] false
+    repeat i 24000 [
+        if candidate/left/:i <> reference/left/:i [different: true]
+    ]
+    check different
+    unsafe/free :reference-memory
+    unsafe/free :candidate-memory
+    return none
+]
+
+test-cell!: make c-struct! [sample: [f32!]]
+
+matrix-test: func [
+    "Measure unit norm and compare real feedback writes with orthogonal rotations."
+    return: [none!] "No value; writes assertion markers."
+] [
+    ; Keep standalone ABI arrays outside the loop: the current compiler's
+    ; loop-local declaration hoisting redeclares standalone C arrays.
+    values: make [c-array! [f32! 4]] [0.25 -0.5 0.75 -0.25]
+    writes: make [#mutable [c-array! [i32! 4]]] []
+    expected: make [#mutable [c-array! [f32! 4]]] []
+    repeat setting 3 [
+        state: make [#mutable brom-reverb-state!] []
+        input: make [#mutable brom-audio-f32!] []
+        output: make [#mutable brom-audio-f32!] []
+        params: make [#mutable brom-reverb-params!] []
+        default-params :params
+        params/diffusion: (as f32! setting) * (as f32! 0.5)
+        brom-reverb-activate :state 48000.0 512
+        brom-reverb-process :state :input :output 2 1 :params
+        ; Hold coefficients and inject known read values directly into all
+        ; ring cells. This isolates scattering from decay and interpolation.
+        state/scalar-step: as f32! 0.0
+        state/tap-step: as f32! 0.0
+        state/damping-coefficient: as f32! 1.0
+        memory: as c-pointer! state/storage
+        repeat line 4 [
+            state/gains/:line: as f32! 1.0
+            writes/:line: state/line-writes/:line
+            repeat i state/line-capacities/:line [
+                cell: make [#mutable test-cell!] as test-cell! (memory + ((state/line-offsets/:line + i) * 4))
+                cell/sample: values/:line
+            ]
+        ]
+        c: state/rotation-cos
+        t: state/rotation-sin
+        a: (c * (as f32! 0.25)) - (t * (as f32! -0.5))
+        b: (t * (as f32! 0.25)) + (c * (as f32! -0.5))
+        d: (c * (as f32! 0.75)) - (t * (as f32! -0.25))
+        e: (t * (as f32! 0.75)) + (c * (as f32! -0.25))
+        expected/0: (c * a) - (t * d)
+        expected/1: (c * b) - (t * e)
+        expected/2: (t * a) + (c * d)
+        expected/3: (t * b) + (c * e)
+        norm: make [#mutable f32!] 0.0
+        repeat line 4 [norm: norm + (expected/:line * expected/:line)]
+        check (libm/abs (norm - (as f32! 0.9375))) < (as f32! 0.00001)
+        brom-reverb-process :state :input :output 2 1 :params
+        repeat line 4 [
+            cell: make [#mutable test-cell!] as test-cell! (memory + ((state/line-offsets/:line + writes/:line) * 4))
+            check (libm/abs (cell/sample - expected/:line)) <= (as f32! 0.000489)
+        ]
+        brom-reverb-deactivate :state
+    ]
+    return none
+]
+
+stability-test: func [
+    "Catch overload poisoning, dead zones, tap jumps, bypass loss and stuck tails."
+    return: [none!] "No value; writes assertion markers."
+] [
+    matrix-test
+    rates: make [c-array! [f64! 3]] [32000.0 48000.0 192000.0]
+    repeat rate-index 3 [
+        repeat extreme 2 [
+            state: make [#mutable brom-reverb-state!] []
+            input: make [#mutable brom-audio-f32!] []
+            output: make [#mutable brom-audio-f32!] []
+            params: make [#mutable brom-reverb-params!] []
+            default-params :params
+            params/decay-seconds: either extreme = 0 [as f32! 0.1] [as f32! 8.0]
+            params/size: either extreme = 0 [as f32! 0.5] [as f32! 2.0]
+            params/damping-hz: either extreme = 0 [as f32! 200.0] [as f32! 16000.0]
+            params/diffusion: as f32! extreme
+            params/predelay-ms: either extreme = 0 [as f32! 0.0] [as f32! 200.0]
+            check brom-reverb-activate :state rates/:rate-index 512
+            tail: brom-reverb-tail-samples :state
+            bounded: make [#mutable logic!] true
+            exact-silence: make [#mutable logic!] true
+            peak: make [#mutable f32!] 0.0
+            cursor: make [#mutable i32!] 0
+            end: (as i32! tail) + 1024
+            while [cursor < end] [
+                count: either (end - cursor) < 512 [end - cursor] [512]
+                repeat i count [
+                    n: cursor + i
+                    input/left/:i: either n < 64 [as f32! 15.848932] [as f32! 0.0]
+                    input/right/:i: either n < 64 [as f32! -15.848932] [as f32! 0.0]
+                ]
+                brom-reverb-process :state :input :output 2 count :params
+                repeat i count [
+                    left: as f32! output/left/:i
+                    right: as f32! output/right/:i
+                    if any [left <> left right <> right (libm/abs left) > (as f32! 4.0) (libm/abs right) > (as f32! 4.0)] [bounded: false]
+                    if (libm/abs left) > peak [peak: libm/abs left]
+                    if (cursor + i) >= ((as i32! tail) + 64) [
+                        if any [left <> (as f32! 0.0) right <> (as f32! 0.0)] [exact-silence: false]
+                    ]
+                ]
+                cursor: cursor + count
+            ]
+            check bounded
+            check peak > (as f32! 0.0)
+            check exact-silence
+            repeat line 4 [check state/damping/:line = (as f32! 0.0)]
+            check (brom-reverb-tail-samples :state) = tail
+            brom-reverb-deactivate :state
+        ]
+    ]
+
+    state: make [#mutable brom-reverb-state!] []
+    input: make [#mutable brom-audio-f32!] []
+    output: make [#mutable brom-audio-f32!] []
+    params: make [#mutable brom-reverb-params!] []
+    default-params :params
+    params/predelay-ms: as f32! 0.0
+    brom-reverb-activate :state 48000.0 512
+    low-audible: make [#mutable logic!] false
+    repeat n 16000 [
+        input/left/0: as f32! 0.004
+        input/right/0: as f32! -0.004
+        brom-reverb-process :state :input :output 2 1 :params
+        if output/left/0 <> (as f32! 0.0) [low-audible: true]
+    ]
+    check low-audible
+    calls-before: allocation/calls
+    horizon: brom-reverb-tail-samples :state
+    params/bypass: true
+    params/decay-seconds: as f32! 0.1
+    params/size: as f32! 2.0
+    params/predelay-ms: as f32! 200.0
+    tail-remains: make [#mutable logic!] false
+    taps-bounded: make [#mutable logic!] true
+    repeat n 32000 [
+        previous: as f32! state/taps/0
+        previous-pre: state/predelay-tap
+        brom-reverb-process :state :input :output 2 1 :params
+        if (libm/abs (state/taps/0 - previous)) > (as f32! 0.250001) [taps-bounded: false]
+        if (libm/abs (state/predelay-tap - previous-pre)) > (as f32! 0.250001) [taps-bounded: false]
+        if n < 1000 [
+            if output/left/0 <> input/left/0 [tail-remains: true]
+        ]
+    ]
+    check tail-remains
+    check taps-bounded
+    check state/excitation = (as f32! 0.0)
+    check (brom-reverb-tail-samples :state) = horizon
+    check allocation/calls = calls-before
+    ; Non-finite controls and samples must not poison subsequent audio.
+    params/mix: as f32! libm/sqrt -1.0
+    params/decay-seconds: as f32! libm/exp 1000.0
+    params/size: as f32! libm/sqrt -1.0
+    input/left/0: as f32! libm/exp 1000.0
+    input/right/0: as f32! libm/sqrt -1.0
+    check brom-reverb-process :state :input :output 2 1 :params
+    check output/left/0 = output/left/0
+    check output/right/0 = output/right/0
+    brom-reverb-deactivate :state
+    return none
+]
+
+either arg-count = 0 [lifecycle-test] [
+    either arg-count = 2 [streaming-test] [
+        either arg-count = 3 [stability-test] [quantizer-test]
+    ]
+]

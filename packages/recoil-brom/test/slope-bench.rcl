@@ -1,0 +1,160 @@
+Recoil [
+    Title: "Slope-table rebuild benchmark"
+    Description: {
+        Times the workload brom-fast-exp exists for: rebuilding a 129-entry
+        harmonic slope table. Four variants, because there are two independent
+        levers and timing only one of them would misattribute the result --
+        libm exp or the approximation, each with ln(h) computed or read from a
+        precomputed table. Mach's Rust core does both.
+
+        Build with --release. At the default optimisation level the memcpy
+        inside brom-fast-exp is a real call and the comparison is meaningless.
+    }
+    Type: module
+    Module: recoil-brom/test/slope-bench
+    Imports: [
+        brom/dsp/utils [brom-fast-exp]
+        brom/dsp/oscillator [
+            BROM-MAX-HARMONICS
+            brom-ln-table! brom-ln-table-bytes brom-ln-table-fill
+            brom-slope-table! brom-slope-table-bytes brom-slope-table-fill
+        ]
+    ]
+    Exports: []
+]
+
+bench-math: foreign <math.h> [
+    log: "log" [f64! return: [f64!]]
+    exp: "exp" [f64! return: [f64!]]
+]
+bench-clock: foreign <time.h> [
+    clock: "clock" [return: [i64!]]
+]
+
+REBUILDS: 20000
+SLOPE: 0.25
+
+; ln(h) for every harmonic, built once. This is the other half of what makes
+; the Rust rebuild cheap, and without it the log dominates whatever the exp
+; costs.
+ln-table!: make c-struct! [
+    values: [c-array! [f64! 129]]
+]
+ln-store: make c-pointer! unsafe/malloc (as i32! size-of ln-table!)
+ln-view: make [#mutable ln-table!] as ln-table! ln-store
+ln-view/values/0: 0.0
+repeat step 128 [
+    h: step + 1
+    ln-view/values/(h): bench-math/log (as f64! h)
+]
+
+slope-exact: func [
+    "One harmonic's slope amplitude, through libm exp."
+    harmonic [i32!] "Harmonic number."
+    slope-param [f64!] "Slope in -1..+1."
+    return: [f64!] "Amplitude multiplier."
+] [
+    if harmonic <= 1 [return 1.0]
+    exponent: (slope-param * 8.0) + 1.0
+    scaled: (0.0 - exponent) * (bench-math/log (as f64! harmonic))
+    return bench-math/exp scaled
+]
+
+slope-fast: func [
+    "One harmonic's slope amplitude, through the approximation."
+    harmonic [i32!] "Harmonic number."
+    slope-param [f64!] "Slope in -1..+1."
+    return: [f64!] "Amplitude multiplier."
+] [
+    if harmonic <= 1 [return 1.0]
+    exponent: (slope-param * 8.0) + 1.0
+    scaled: (0.0 - exponent) * (bench-math/log (as f64! harmonic))
+    return brom-fast-exp scaled
+]
+
+slope-table-exact: func [
+    "One harmonic's slope amplitude, tabulated ln and libm exp."
+    harmonic [i32!] "Harmonic number."
+    slope-param [f64!] "Slope in -1..+1."
+    return: [f64!] "Amplitude multiplier."
+] [
+    if harmonic <= 1 [return 1.0]
+    exponent: (slope-param * 8.0) + 1.0
+    scaled: (0.0 - exponent) * (make f64! ln-view/values/(harmonic))
+    return bench-math/exp scaled
+]
+
+slope-table-fast: func [
+    "One harmonic's slope amplitude, tabulated ln and the approximation."
+    harmonic [i32!] "Harmonic number."
+    slope-param [f64!] "Slope in -1..+1."
+    return: [f64!] "Amplitude multiplier."
+] [
+    if harmonic <= 1 [return 1.0]
+    exponent: (slope-param * 8.0) + 1.0
+    scaled: (0.0 - exponent) * (make f64! ln-view/values/(harmonic))
+    return brom-fast-exp scaled
+]
+
+; Accumulated and printed so neither loop can be optimised away entirely.
+sink: make [#mutable f64!] 0.0
+
+start-exact: bench-clock/clock
+repeat r REBUILDS [
+    repeat step BROM-MAX-HARMONICS [
+        sink: sink + (slope-exact (step + 1) SLOPE)
+    ]
+]
+end-exact: bench-clock/clock
+
+start-fast: bench-clock/clock
+repeat r REBUILDS [
+    repeat step BROM-MAX-HARMONICS [
+        sink: sink + (slope-fast (step + 1) SLOPE)
+    ]
+]
+end-fast: bench-clock/clock
+
+start-tex: bench-clock/clock
+repeat r REBUILDS [
+    repeat step BROM-MAX-HARMONICS [
+        sink: sink + (slope-table-exact (step + 1) SLOPE)
+    ]
+]
+end-tex: bench-clock/clock
+
+; The shipped path: brom-slope-table-fill over a tabulated ln.
+shipped-ln: make c-pointer! unsafe/malloc brom-ln-table-bytes
+shipped-out: make c-pointer! unsafe/malloc brom-slope-table-bytes
+brom-ln-table-fill :shipped-ln
+shipped-view: make [#mutable brom-slope-table!] as brom-slope-table! shipped-out
+
+start-shipped: bench-clock/clock
+repeat r REBUILDS [
+    brom-slope-table-fill :shipped-out :shipped-ln SLOPE
+]
+end-shipped: bench-clock/clock
+sink: sink + (make f64! shipped-view/values/32)
+
+start-tfa: bench-clock/clock
+repeat r REBUILDS [
+    repeat step BROM-MAX-HARMONICS [
+        sink: sink + (slope-table-fast (step + 1) SLOPE)
+    ]
+]
+end-tfa: bench-clock/clock
+
+print "rebuilds:"
+print REBUILDS
+print "log + libm exp, microseconds:"
+print (end-exact - start-exact)
+print "log + fast exp, microseconds:"
+print (end-fast - start-fast)
+print "ln table + libm exp, microseconds:"
+print (end-tex - start-tex)
+print "ln table + fast exp, microseconds:"
+print (end-tfa - start-tfa)
+print "brom-slope-table-fill, microseconds:"
+print (end-shipped - start-shipped)
+print "checksum:"
+print sink

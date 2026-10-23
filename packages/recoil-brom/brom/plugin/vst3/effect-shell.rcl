@@ -1,0 +1,518 @@
+Recoil [
+    Title: "Brom effect shell interface"
+    Description: {
+        The C entry points a C++ effect shell (VST3, and AU through the VST3
+        SDK's wrapper) drives a brom-effect! through. brom/plugin/effect.h
+        declares them.
+
+        A Recoil fn-ptr! is an {env, invoke} pair whose layout is a Recoil ABI
+        detail, so the C++ shell never reads the effect table itself. Each
+        trampoline calls through the table on this side; appending a slot or
+        changing how callables are stored never touches C++.
+
+        Every trampoline acts on the engine linked into the binary, through
+        the same `brom_engine_ptr` contract the CLAP shell uses (see
+        brom/plugin/clap/entry.rcl), so none takes a descriptor. That symbol
+        exists only in plug-in binaries, which is why this is its own module
+        that only a shell's entry imports: an executable importing
+        brom/plugin/effect does not link it.
+
+        Parameter values crossing param-get / param-set are in engineering
+        units, as on engine!; param-normalize / param-denormalize apply the
+        parameter's own taper, so a VST3 host's normalized value and the
+        editor's knob agree by construction.
+    }
+    Type: module
+    Module: brom/plugin/vst3/effect-shell
+    Ffi: [c-string]
+    Imports: [
+        brom/plugin/engine [engine! param-info! engine-param-info]
+        brom/plugin/values [param-range! param-normalize param-denormalize]
+        brom/plugin/effect [brom-effect! brom-effect-valid? BROM-SAMPLE-F32 BROM-SAMPLE-F64]
+        brom/dsp/audio [brom-audio-f32! brom-audio-f64!]
+        brom/plugin/preset [preset-snapshot! preset-factory-count preset-factory-name preset-factory-materialize preset-fill-buffer]
+        brom/plugin/state/dispatch [brom-state-load brom-state-save]
+    ]
+    Exports: []
+]
+
+; Defined by the plug-in: `#export [brom-engine-ptr]` beside its engine!.
+#extern c-pointer! brom_engine_ptr
+
+shell-engine: func [
+    "Address of the engine linked into this binary."
+    return: [c-pointer!] "Borrowed engine! descriptor."
+] [
+    return brom_engine_ptr
+]
+
+; Mirrors brom_effect_info in brom/plugin/effect.h, field for field. Named
+; apart from the C typedef so the two can never meet in one translation unit.
+shell-effect-info!: make c-struct! [
+    sample-format: [u32!]
+    input-layouts: [u32!]
+    sidechain-channels: [u32!]
+    bypass-param-id: [u32!]
+    flags: [u32!]
+    param-count: [i32!]
+    state-size: [i32!]
+    id: [c-string!]
+    name: [c-string!]
+    vendor: [c-string!]
+    version: [c-string!]
+    category: [c-string!]
+]
+
+static-assert ((offset-of shell-effect-info! param-count) = 20) "Effect info param_count offset"
+static-assert ((offset-of shell-effect-info! state-size) = 24) "Effect info state_size offset"
+static-assert (((offset-of shell-effect-info! category) - (offset-of shell-effect-info! id)) = (4 * size-of c-pointer!)) "Effect info string run"
+static-assert ((size-of shell-effect-info!) = ((offset-of shell-effect-info! category) + size-of c-pointer!)) "Effect info size"
+
+; Mirrors brom_effect_param in brom/plugin/effect.h.
+shell-effect-param!: make c-struct! [
+    id: [u32!]
+    steps: [i32!]
+    min-value: [f64!]
+    max-value: [f64!]
+    default-value: [f64!]
+    name: [c-string!]
+    module: [c-string!]
+]
+
+static-assert ((offset-of shell-effect-param! steps) = 4) "Effect param steps offset"
+static-assert ((offset-of shell-effect-param! min-value) = 8) "Effect param min offset"
+static-assert ((offset-of shell-effect-param! default-value) = 24) "Effect param default offset"
+static-assert ((offset-of shell-effect-param! name) = 32) "Effect param name offset"
+static-assert ((size-of shell-effect-param!) = (32 + (2 * size-of c-pointer!))) "Effect param size"
+
+; Filled once by brom-effect-init and served by brom-effect-describe.
+shell-info: make [#mutable shell-effect-info!] []
+
+shell-blank-info: func [
+    "A zeroed param-info! for a lookup that may miss."
+    return: [param-info!] "All fields zero, unit range, empty strings."
+] [
+    return make param-info! [
+        id: 0
+        name: (as c-string! "")
+        module: (as c-string! "")
+        default-value: 0.0
+        range: make param-range! [
+            lo: 0.0 hi: 1.0 skew: 1.0 symmetric: 0 steps: 0 kind: 0
+        ]
+    ]
+]
+
+shell-lookup-param: func [
+    "Fill `out` with the description of the parameter carrying `param-id`."
+    param-id [u32!] "Parameter id, as the host sent it."
+    :out [c-pointer!] "Borrowed caller-owned param-info!."
+    return: [logic!] "False when no parameter carries that id."
+] [
+    eng: make [#mutable engine!] as engine! shell-engine
+    ; Ids are scanned rather than assumed to be indexes, as in the CLAP shell;
+    ; every current plug-in numbers them 0..n-1, so the first probe hits.
+    if param-id < (as u32! eng/param-count) [
+        if engine-param-info :eng (as i32! param-id) :out [
+            probe-info: make [#mutable param-info!] as param-info! :out
+            if probe-info/id = param-id [return true]
+        ]
+    ]
+    repeat index eng/param-count [
+        if engine-param-info :eng index :out [
+            info: make [#mutable param-info!] as param-info! :out
+            if info/id = param-id [return true]
+        ]
+    ]
+    return false
+]
+
+brom-effect-init: func [
+    "Validate the linked effect and fill the info record. Called once per module load, before any instance exists."
+    #export
+    return: [logic!] "False when the engine is not a valid effect; the shell then exposes no plug-in."
+] [
+    eng: make [#mutable engine!] as engine! shell-engine
+    if not brom-effect-valid? :eng [return false]
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    shell-info/sample-format: effect/sample-format
+    shell-info/input-layouts: effect/input-layouts
+    shell-info/sidechain-channels: effect/sidechain-channels
+    shell-info/bypass-param-id: effect/bypass-param-id
+    shell-info/flags: effect/flags
+    shell-info/param-count: eng/param-count
+    shell-info/state-size: eng/state-size
+    shell-info/id: eng/id
+    shell-info/name: eng/name
+    shell-info/vendor: eng/vendor
+    shell-info/version: eng/version
+    shell-info/category: effect/category
+    return true
+]
+
+brom-effect-describe: func [
+    "The info record brom-effect-init filled."
+    #export
+    return: [c-pointer!] "Borrowed brom_effect_info; all zero before a successful init."
+] [
+    return addr-of shell-info
+]
+
+brom-effect-create: func [
+    "Create one effect instance."
+    #export
+    return: [c-pointer!] "Owned core, released by brom-effect-destroy; null on failure."
+] [
+    eng: make [#mutable engine!] as engine! shell-engine
+    core: make c-pointer! eng/create-fn
+    return core
+]
+
+brom-effect-destroy: func [
+    "Release an instance."
+    #export
+    :core [c-pointer!] "Borrowed core; invalid after this call. Null is ignored."
+    return: [none!] "No value."
+] [
+    if none? core [return none]
+    eng: make [#mutable engine!] as engine! shell-engine
+    eng/destroy-fn core
+    return none
+]
+
+brom-effect-activate: func [
+    "Prepare an instance for processing."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    sample-rate [f64!] "Host sample rate."
+    max-frames [i32!] "Host block capacity."
+    return: [logic!] "False when the effect refuses; it released what it acquired."
+] [
+    if none? core [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    return eng/activate-fn core sample-rate max-frames
+]
+
+brom-effect-reset: func [
+    "Clear an instance's audio history, keeping its controls."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    return: [none!] "No value."
+] [
+    if none? core [return none]
+    eng: make [#mutable engine!] as engine! shell-engine
+    eng/reset-fn core
+    return none
+]
+
+brom-effect-deactivate: func [
+    "Release what activate acquired. Only after a successful activate."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    return: [none!] "No value."
+] [
+    if none? core [return none]
+    eng: make [#mutable engine!] as engine! shell-engine
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    effect/effect-deactivate-fn core
+    return none
+]
+
+brom-effect-process-f32: func [
+    "Render one chunk of at most 512 frames through an f32 effect."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    :input [brom-audio-f32!] "Main input; the right plane is zero for mono."
+    :sidechain [brom-audio-f32!] "Sidechain; zero planes where nothing was read."
+    :output [brom-audio-f32!] "Stereo output."
+    channels [i32!] "Main input planes read."
+    sidechain-channels [i32!] "Sidechain planes read."
+    frames [i32!] "Frames to render."
+    return: [logic!] "False when the effect refused the chunk, or processes f64."
+] [
+    if none? core [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    if effect/sample-format <> BROM-SAMPLE-F32 [return false]
+    return effect/effect-process-fn core :input :sidechain :output channels sidechain-channels frames
+]
+
+brom-effect-process-f64: func [
+    "Render one chunk of at most 512 frames through an f64 effect."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    :input [brom-audio-f64!] "Main input; the right plane is zero for mono."
+    :sidechain [brom-audio-f64!] "Sidechain; zero planes where nothing was read."
+    :output [brom-audio-f64!] "Stereo output."
+    channels [i32!] "Main input planes read."
+    sidechain-channels [i32!] "Sidechain planes read."
+    frames [i32!] "Frames to render."
+    return: [logic!] "False when the effect refused the chunk, or processes f32."
+] [
+    if none? core [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    if effect/sample-format <> BROM-SAMPLE-F64 [return false]
+    return effect/effect-process-f64-fn core :input :sidechain :output channels sidechain-channels frames
+]
+
+brom-effect-midi: func [
+    "Forward one MIDI message."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    status [u32!] "Status byte."
+    data1 [u32!] "First data byte."
+    data2 [u32!] "Second data byte."
+    return: [logic!] "True when the effect applied it."
+] [
+    if none? core [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    return effect/effect-midi-fn core status data1 data2
+]
+
+brom-effect-program: func [
+    "Forward a program change."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    index [u32!] "Program number."
+    return: [logic!] "True when the effect applied it."
+] [
+    if none? core [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    return effect/effect-program-fn core index
+]
+
+brom-effect-current-program: func [
+    "The effect's current program."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    return: [i32!] "Program index, or -1 for none."
+] [
+    if none? core [return -1]
+    eng: make [#mutable engine!] as engine! shell-engine
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    return effect/effect-current-program-fn core
+]
+
+brom-effect-latency: func [
+    "The effect's latency word: applied samples, with BROM-LATENCY-PENDING."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    return: [u32!] "Latency word; zero for a null core."
+] [
+    if none? core [return as u32! 0]
+    eng: make [#mutable engine!] as engine! shell-engine
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    return effect/effect-latency-fn core
+]
+
+brom-effect-tail: func [
+    "The effect's tail."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    return: [u32!] "Tail in samples, or BROM-TAIL-INFINITE; zero for a null core."
+] [
+    if none? core [return as u32! 0]
+    eng: make [#mutable engine!] as engine! shell-engine
+    effect: make [#mutable brom-effect!] as brom-effect! eng/effect-api
+    return effect/effect-tail-fn core
+]
+
+brom-effect-param-info: func [
+    "Describe the parameter at `index`."
+    #export
+    index [u32!] "Zero-based parameter index."
+    :out [c-pointer!] "Borrowed brom_effect_param to fill."
+    return: [logic!] "False when the index is out of range."
+] [
+    if none? out [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    if index >= (as u32! eng/param-count) [return false]
+    info: make [#mutable param-info!] shell-blank-info
+    if not engine-param-info :eng (as i32! index) (addr-of info) [return false]
+    param: make [#mutable shell-effect-param!] as shell-effect-param! :out
+    param/id: info/id
+    param/steps: info/range/steps
+    param/min-value: info/range/lo
+    param/max-value: info/range/hi
+    param/default-value: info/default-value
+    param/name: info/name
+    param/module: info/module
+    return true
+]
+
+brom-effect-param-get: func [
+    "Read a parameter in engineering units."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    id [u32!] "Parameter id."
+    return: [f64!] "Value; zero for a null core or an unknown id."
+] [
+    if none? core [return 0.0]
+    eng: make [#mutable engine!] as engine! shell-engine
+    if id >= (as u32! eng/param-count) [return 0.0]
+    return eng/get-param-fn core id
+]
+
+brom-effect-param-set: func [
+    "Write a parameter in engineering units, clamped to its range; NaN sets the default."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    id [u32!] "Parameter id."
+    value [f64!] "Value in engineering units."
+    return: [logic!] "False for a null core, an unknown id, or a refused value."
+] [
+    if none? core [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    info: make [#mutable param-info!] shell-blank-info
+    if not shell-lookup-param id (addr-of info) [return false]
+    clamped: make [#mutable f64!] value
+    if value <> value [clamped: info/default-value]
+    if clamped < info/range/lo [clamped: info/range/lo]
+    if clamped > info/range/hi [clamped: info/range/hi]
+    return eng/set-param-fn core id clamped
+]
+
+brom-effect-param-normalize: func [
+    "Map a value in engineering units to the parameter's normalized position."
+    #export
+    id [u32!] "Parameter id."
+    value [f64!] "Value in engineering units."
+    return: [f64!] "Normalized 0.0-1.0; zero for an unknown id."
+] [
+    info: make [#mutable param-info!] shell-blank-info
+    if not shell-lookup-param id (addr-of info) [return 0.0]
+    return param-normalize info/range value
+]
+
+brom-effect-param-denormalize: func [
+    "Map a normalized position to engineering units, applying the parameter's taper and steps."
+    #export
+    id [u32!] "Parameter id."
+    normalized [f64!] "Normalized 0.0-1.0."
+    return: [f64!] "Value in engineering units; zero for an unknown id."
+] [
+    info: make [#mutable param-info!] shell-blank-info
+    if not shell-lookup-param id (addr-of info) [return 0.0]
+    return param-denormalize info/range normalized
+]
+
+brom-effect-param-text: func [
+    "Render a value as text through the engine, when it renders its own."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    id [u32!] "Parameter id."
+    value [f64!] "Value in engineering units."
+    :out [c-pointer!] "Borrowed destination."
+    capacity [u32!] "Destination bytes."
+    return: [logic!] "False when the engine has no text of its own; the shell then formats the number."
+] [
+    if any [none? core none? out] [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    if not eng/custom-param-text [return false]
+    if id >= (as u32! eng/param-count) [return false]
+    return eng/param-text-fn core id value out capacity
+]
+
+brom-effect-param-parse: func [
+    "Parse text into a value through the engine, when it parses its own."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    id [u32!] "Parameter id."
+    text [c-string!] "Text to parse."
+    :out [c-pointer!] "Borrowed f64 destination."
+    return: [logic!] "False when the engine has no parser of its own or refused the text."
+] [
+    if any [none? core none? out none? text] [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    if not eng/custom-param-text [return false]
+    if id >= (as u32! eng/param-count) [return false]
+    return eng/param-parse-fn core id text :out
+]
+
+brom-effect-state-save: func [
+    "Write an instance's state: exactly the info record's state_size bytes."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    :out [c-pointer!] "Borrowed destination."
+    capacity [size!] "Destination bytes."
+    return: [logic!] "False when the destination is short or the save failed."
+] [
+    if any [none? core none? out] [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    if capacity < (as size! eng/state-size) [return false]
+    return brom-state-save :eng core :out (as size! eng/state-size)
+]
+
+brom-effect-state-load: func [
+    "Load an instance's state from either Brom state format."
+    #export
+    :core [c-pointer!] "Borrowed core."
+    :bytes [c-pointer!] "Borrowed source."
+    size [size!] "Source bytes."
+    return: [logic!] "False when the blob was not recognized."
+] [
+    if any [none? core none? bytes] [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    return brom-state-load :eng core :bytes size
+]
+
+brom-effect-factory-count: func [
+    "How many factory presets the effect ships."
+    #export
+    return: [u32!] "Zero for no bank."
+] [
+    eng: make [#mutable engine!] as engine! shell-engine
+    return as u32! (preset-factory-count :eng)
+]
+
+brom-effect-factory-name: func [
+    "Copy one factory preset's name, NUL-terminated."
+    #export
+    index [u32!] "Bank index."
+    :out [c-pointer!] "Borrowed destination."
+    capacity [u32!] "Destination bytes."
+    return: [logic!] "False for an unknown index or a short destination."
+] [
+    if none? out [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    if index >= (as u32! (preset-factory-count :eng)) [return false]
+    name: preset-factory-name :eng (as i32! index)
+    return preset-fill-buffer :name :out (as i32! capacity)
+]
+
+brom-effect-factory-values: func [
+    "Every parameter's value under one factory preset, in engineering units, by parameter index."
+    #export
+    index [u32!] "Bank index."
+    :out [c-pointer!] "Borrowed f64 destination."
+    count [u32!] "Values the destination holds; must cover param_count."
+    return: [logic!] "False for an unknown index, a short destination, or a preset that does not apply."
+] [
+    if none? out [return false]
+    eng: make [#mutable engine!] as engine! shell-engine
+    if count < (as u32! eng/param-count) [return false]
+    snapshot: make [#mutable preset-snapshot!] [count: 0 index: -1 values: []]
+    if not preset-factory-materialize :eng (as i32! index) (addr-of snapshot) [return false]
+    unsafe/memcpy out ((addr-of snapshot) + offset-of preset-snapshot! values) (eng/param-count * 8)
+    return true
+]
+
+brom-effect-editor-size: func [
+    "Whether the engine has an editor, and its fixed size."
+    #export
+    :width [c-pointer!] "Borrowed i32 destination for the width."
+    :height [c-pointer!] "Borrowed i32 destination for the height."
+    return: [logic!] "False when the engine declares no editor; the sizes are then untouched."
+] [
+    eng: make [#mutable engine!] as engine! shell-engine
+    if not eng/has-editor [return false]
+    if any [none? width none? height] [return false]
+    w: make i32! eng/editor-width
+    h: make i32! eng/editor-height
+    unsafe/memcpy width (addr-of w) 4
+    unsafe/memcpy height (addr-of h) 4
+    return true
+]

@@ -1,0 +1,177 @@
+Recoil [
+    Title: "Brom preset schema and C ABI"
+    Description: {
+        Copies the engine's descriptor schema and provides bounded C entry
+        points for preparing and applying canonical preset snapshots.
+    }
+    Type: module
+    Module: brom/plugin/preset/schema
+    Ffi: [c-string]
+    Imports: [
+        brom/plugin/engine [engine! param-info! BROM-MAX-PARAMS]
+        brom/plugin/preset [
+            preset-snapshot! preset-cstr-string preset-slug-of
+            preset-name-of preset-key-of preset-prepare preset-fill-buffer
+            preset-format preset-snapshot-apply
+        ]
+    ]
+    Exports: [
+        brom-preset-schema-read brom-preset-prepare-text
+        brom-preset-format-snapshot brom-preset-decode-legacy
+        brom-preset-apply-validated
+    ]
+]
+
+; These layouts mirror brom/plugin/preset/api.h. Keep array capacities and
+; field order in sync with that public header.
+preset-schema-param!: make c-struct! [
+    id: [u32!]
+    steps: [u32!]
+    minimum: [f64!]
+    maximum: [f64!]
+    default-value: [f64!]
+    key: [c-array! [u8! 128]]
+]
+
+preset-schema!: make c-struct! [
+    count: [u32!]
+    version: [u32!]
+    parameters: [c-array! [preset-schema-param! 256]]
+]
+
+preset-identity!: make c-struct! [
+    key: [c-array! [u8! 128]]
+    display-name: [c-array! [u8! 256]]
+    kind: [u32!]
+    reserved: [u32!]
+]
+
+preset-bytes!: make c-struct! [bytes: [c-array! [u8! 16384]]]
+preset-output!: make c-struct! [bytes: [c-array! [u8! 16384]]]
+
+preset-copy-string: func [
+    :source [string!]
+    :destination [c-pointer!]
+    capacity [i32!]
+    return: [logic!]
+] [
+    if any [none? destination (length? source) >= capacity] [return false]
+    target: make [#mutable preset-output!] as preset-output! :destination
+    repeat index (length? source) [
+        target/bytes/:index: as u8! source/:index
+    ]
+    target/bytes/((length? source) + 1): as u8! 0
+    return true
+]
+
+preset-bytes-to-string: func [
+    :bytes [c-pointer!]
+    size [i32!]
+    return: [string!]
+] [
+    source: make [#mutable preset-bytes!] as preset-bytes! :bytes
+    result: make [#flexible [string! 16384]] none
+    repeat index size [append result as char! source/bytes/:index]
+    return freeze result
+]
+
+brom-preset-schema-read: c-fn! [
+    #export
+    engine-raw [c-pointer!] out-raw [c-pointer!]
+    return: [logic!]
+] [
+    if any [none? engine-raw none? out-raw] [return false]
+    engine: make [#mutable engine!] as engine! engine-raw
+    if any [engine/param-count < 0 engine/param-count > BROM-MAX-PARAMS] [return false]
+    out: make [#mutable preset-schema!] as preset-schema! out-raw
+    out/count: as u32! engine/param-count
+    out/version: 1
+    info-raw: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+    if none? info-raw [return false]
+    unsafe/memset info-raw 0 (as i32! size-of param-info!)
+    valid: make [#mutable logic!] true
+    repeat index engine/param-count [
+        if valid [
+            either engine/param-info-fn index :info-raw [
+                info: make [#mutable param-info!] as param-info! info-raw
+                row: make [#mutable preset-schema-param!] out/parameters/:index
+                row/id: info/id
+                row/steps: as u32! info/range/steps
+                row/minimum: info/range/lo
+                row/maximum: info/range/hi
+                row/default-value: info/default-value
+                if not preset-copy-string (preset-slug-of :info-raw)
+                    (addr-of row/key/0) 128 [valid: false]
+            ] [valid: false]
+        ]
+    ]
+    unsafe/free info-raw
+    return valid
+]
+
+brom-preset-prepare-text: c-fn! [
+    #export
+    engine-raw [c-pointer!] bytes [c-pointer!] size [size!]
+    snapshot-raw [c-pointer!] identity-raw [c-pointer!]
+    return: [logic!]
+] [
+    if any [none? engine-raw none? bytes none? snapshot-raw none? identity-raw]
+        [return false]
+    if any [size = 0 size >= 16384] [return false]
+    engine: make [#mutable engine!] as engine! engine-raw
+    text: preset-bytes-to-string :bytes (as i32! size)
+    if not preset-prepare :engine :text snapshot-raw [return false]
+    identity: make [#mutable preset-identity!] as preset-identity! identity-raw
+    name: preset-name-of :text
+    key: preset-key-of :text
+    if any [
+        not preset-copy-string :key (addr-of identity/key/0) 128
+        not preset-copy-string :name (addr-of identity/display-name/0) 256
+    ] [return false]
+    identity/kind: 0
+    identity/reserved: 0
+    return true
+]
+
+brom-preset-format-snapshot: c-fn! [
+    #export
+    engine-raw [c-pointer!] snapshot-raw [c-pointer!] name-raw [c-string!]
+    out-raw [c-pointer!] capacity [size!]
+    return: [size!]
+] [
+    if any [none? engine-raw none? snapshot-raw none? name-raw none? out-raw]
+        [return 0]
+    if capacity > 16384 [return 0]
+    engine: make [#mutable engine!] as engine! engine-raw
+    core: make c-pointer! engine/create-fn
+    if none? core [return 0]
+    snapshot: make [#mutable preset-snapshot!] as preset-snapshot! snapshot-raw
+    valid: preset-snapshot-apply :engine :core snapshot-raw
+    if not valid [engine/destroy-fn core return 0]
+    title: preset-cstr-string as c-pointer! name-raw
+    text: preset-format :engine :core :title
+    engine/destroy-fn core
+    if not preset-fill-buffer :text out-raw (as i32! capacity) [return 0]
+    return as size! ((length? text) + 1)
+]
+
+brom-preset-decode-legacy: c-fn! [
+    #export
+    engine-raw [c-pointer!] bytes [c-pointer!] size [size!]
+    snapshot-raw [c-pointer!]
+    return: [logic!]
+] [
+    identity: make preset-identity! [key: [] display-name: [] kind: 0 reserved: 0]
+    return brom-preset-prepare-text engine-raw bytes size snapshot-raw (addr-of identity)
+]
+
+brom-preset-apply-validated: c-fn! [
+    #export
+    engine-raw [c-pointer!] core [c-pointer!] snapshot-raw [c-pointer!]
+    return: [none!]
+] [
+    if any [none? engine-raw none? core none? snapshot-raw] [return none]
+    engine: make [#mutable engine!] as engine! engine-raw
+    preset-snapshot-apply :engine :core snapshot-raw
+    return none
+]

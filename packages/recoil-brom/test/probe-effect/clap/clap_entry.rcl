@@ -1,0 +1,10 @@
+Recoil [
+    Title: "Brom probe effect CLAP entry"
+    Type: module
+    Module: recoil-brom/test/probe-effect/clap/clap_entry
+    Imports: [
+        brom/plugin/clap/entry []
+        recoil-brom/test/probe-effect/plugin []
+    ]
+    Exports: []
+]

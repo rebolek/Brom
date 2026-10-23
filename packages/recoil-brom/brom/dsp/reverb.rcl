@@ -1,0 +1,440 @@
+Recoil [
+    Title: "Brom quantized four-line reverb"
+    Type: module
+    Module: brom/dsp/reverb
+    Imports: [brom/dsp/audio [BROM-AUDIO-CAPACITY brom-audio-f32!]]
+    Exports: [
+        brom-reverb-state! brom-reverb-params!
+        brom-reverb-activate brom-reverb-deactivate brom-reverb-reset
+        brom-reverb-tail-samples brom-reverb-memory-bytes brom-reverb-quantize
+        brom-reverb-process
+    ]
+]
+
+reverb-math: foreign <math.h> [
+    ceil: "ceil" [f64! return: [f64!]]
+    round: "roundf" [f32! return: [f32!]]
+    min: "fminf" [f32! f32! return: [f32!]]
+    max: "fmaxf" [f32! f32! return: [f32!]]
+    abs: "fabsf" [f32! return: [f32!]]
+    exp: "expf" [f32! return: [f32!]]
+    sin: "sinf" [f32! return: [f32!]]
+    cos: "cosf" [f32! return: [f32!]]
+    sqrt: "sqrtf" [f32! return: [f32!]]
+]
+
+brom-reverb-params!: make c-struct! [
+    mix: [f32!]
+    decay-seconds: [f32!]
+    damping-hz: [f32!]
+    size: [f32!]
+    diffusion: [f32!]
+    predelay-ms: [f32!]
+    bypass: [logic!]
+]
+
+; Zero initialization is required before the first lifecycle call. The caller
+; owns this struct; storage is the sole owned allocation, released at deactivate.
+; Offsets/capacities count f32 samples, not bytes. The last two regions are
+; full precision pre-delay channels, distinct from the four quantized FDN lines.
+brom-reverb-state!: make c-struct! [
+    storage: [c-pointer!]
+    memory-bytes: [size!]
+    sample-rate: [f32!]
+    max-frames: [i32!]
+    active: [logic!]
+    tail-samples: [u32!]
+    line-offsets: [c-array! [i32! 4]]
+    line-capacities: [c-array! [i32! 4]]
+    predelay-offset: [i32!]
+    predelay-capacity: [i32!]
+    write-index: [i32!]
+    damping: [c-array! [f32! 4]]
+    line-writes: [c-array! [i32! 4]]
+    predelay-write: [i32!]
+    taps: [c-array! [f32! 4]]
+    predelay-tap: [f32!]
+    gains: [c-array! [f32! 4]]
+    gain-targets: [c-array! [f32! 4]]
+    initialized: [logic!]
+    tail-live: [logic!]
+    silent-samples: [u32!]
+    control-phase: [i32!]
+    scalar-step: [f32!]
+    tap-step: [f32!]
+    mix: [f32!]
+    dry-gain: [f32!]
+    excitation: [f32!]
+    decay: [f32!]
+    cutoff: [f32!]
+    diffusion: [f32!]
+    damping-coefficient: [f32!]
+    damping-target: [f32!]
+    rotation-sin: [f32!]
+    rotation-cos: [f32!]
+    rotation-sin-target: [f32!]
+    rotation-cos-target: [f32!]
+]
+
+; Full-scale 2.0 maps to signed twelve-bit codes, with the positive endpoint
+; one step below full scale. These constants are the single tuning location.
+BROM-REVERB-QUANTIZER-STEP: as f32! (2.0 / 2048.0)
+BROM-REVERB-QUANTIZER-SCALE: as f32! (2048.0 / 2.0)
+BROM-REVERB-QUANTIZER-LOW: as f32! -2048.0
+BROM-REVERB-QUANTIZER-HIGH: as f32! 2047.0
+
+brom-reverb-quantize: func [
+    #inline
+    "Round to the nearest signed twelve-bit code, saturating at the rails."
+    sample [f32!] "Feedback write sample; NaN becomes zero."
+    return: [f32!] "Quantized sample, with ties rounded away from zero."
+] [
+    if sample <> sample [return as f32! 0.0]
+    ; Bound before rounding to avoid overflow for finite extreme inputs.
+    code: reverb-math/max BROM-REVERB-QUANTIZER-LOW
+        (reverb-math/min BROM-REVERB-QUANTIZER-HIGH
+            (sample * BROM-REVERB-QUANTIZER-SCALE))
+    return (reverb-math/round code) * BROM-REVERB-QUANTIZER-STEP
+]
+
+brom-reverb-reset: func [
+    "Clear delay and filter history without allocating or deactivating."
+    :state [brom-reverb-state!] "Borrowed caller-owned, zero-initialized state."
+    return: [none!] "No value; state remains configured when active."
+] [
+    if state/storage <> (as c-pointer! 0) [
+        memory: as c-pointer! state/storage
+        unsafe/memset :memory 0 (as i32! state/memory-bytes)
+    ]
+    state/write-index: 0
+    state/predelay-write: 0
+    state/predelay-tap: as f32! 0.0
+    state/initialized: false
+    state/tail-live: false
+    state/silent-samples: as u32! 0
+    state/control-phase: 0
+    state/mix: as f32! 0.0
+    state/dry-gain: as f32! 0.0
+    state/excitation: as f32! 0.0
+    state/decay: as f32! 0.0
+    state/cutoff: as f32! 0.0
+    state/diffusion: as f32! 0.0
+    state/damping-coefficient: as f32! 0.0
+    state/damping-target: as f32! 0.0
+    state/rotation-sin: as f32! 0.0
+    state/rotation-cos: as f32! 0.0
+    state/rotation-sin-target: as f32! 0.0
+    state/rotation-cos-target: as f32! 0.0
+    repeat line 4 [
+        state/damping/:line: as f32! 0.0
+        state/line-writes/:line: 0
+        state/taps/:line: as f32! 0.0
+        state/gains/:line: as f32! 0.0
+        state/gain-targets/:line: as f32! 0.0
+    ]
+    return none
+]
+
+brom-reverb-deactivate: func [
+    "Release activation storage and return state to its inactive zero shape."
+    :state [brom-reverb-state!] "Borrowed caller-owned, zero-initialized state."
+    return: [none!] "No value; safe to call repeatedly."
+] [
+    if state/storage <> (as c-pointer! 0) [
+        memory: as c-pointer! state/storage
+        unsafe/free :memory
+    ]
+    state/storage: as c-pointer! 0
+    state/memory-bytes: as size! 0
+    state/sample-rate: as f32! 0.0
+    state/scalar-step: as f32! 0.0
+    state/tap-step: as f32! 0.0
+    state/max-frames: 0
+    state/active: false
+    state/tail-samples: as u32! 0
+    state/predelay-offset: 0
+    state/predelay-capacity: 0
+    repeat line 4 [
+        state/line-offsets/:line: 0
+        state/line-capacities/:line: 0
+    ]
+    brom-reverb-reset :state
+    return none
+]
+
+brom-reverb-activate: func [
+    "Configure the active rate and allocate all delay regions outside processing."
+    :state [brom-reverb-state!] "Borrowed caller-owned, zero-initialized state."
+    rate [f64!] "Finite sample rate in Hz, within 32000 through 192000."
+    max-frames [i32!] "Positive host block limit; internally bounded to 512."
+    return: [logic!] "True on success; false leaves inactive, destructible state."
+] [
+    brom-reverb-deactivate :state
+    ; Checking the rate first also rejects infinities/NaN before integer casts
+    ; or size arithmetic. All supported rates fit these bounded capacities.
+    if any [rate <> rate rate < 32000.0 rate > 192000.0 max-frames <= 0] [
+        return false
+    ]
+    capacities: make [#mutable [c-array! [i32! 4]]] []
+    capacities/0: (as i32! reverb-math/ceil (rate * 0.0742)) + 2
+    capacities/1: (as i32! reverb-math/ceil (rate * 0.0874)) + 2
+    capacities/2: (as i32! reverb-math/ceil (rate * 0.1066)) + 2
+    capacities/3: (as i32! reverb-math/ceil (rate * 0.1234)) + 2
+    predelay-capacity: (as i32! reverb-math/ceil (rate * 0.200)) + 2
+    total: make [#mutable size!] 0
+    allocator-limit: as size! 2147483647
+    ; Check before each addition and multiplication, rather than narrowing an
+    ; already overflowing byte count for unsafe/malloc's i32 ABI.
+    sample-limit: allocator-limit / (size-of f32!)
+    repeat line 4 [
+        count: as size! capacities/:line
+        if count > (sample-limit - total) [return false]
+        total: total + count
+    ]
+    pre-count: as size! predelay-capacity
+    if pre-count > ((sample-limit - total) / (as size! 2)) [return false]
+    total: total + (pre-count * (as size! 2))
+    bytes: total * (size-of f32!)
+    if bytes > allocator-limit [return false]
+    memory: make c-pointer! unsafe/malloc (as i32! bytes)
+    if memory = (as c-pointer! 0) [return false]
+    unsafe/memset :memory 0 (as i32! bytes)
+    state/storage: memory
+    state/memory-bytes: bytes
+    state/sample-rate: as f32! rate
+    state/scalar-step: (as f32! 1.0) - (reverb-math/exp ((as f32! -1.0) / ((as f32! 0.020) * state/sample-rate)))
+    state/tap-step: (as f32! 1.0) - (reverb-math/exp ((as f32! -1.0) / ((as f32! 0.050) * state/sample-rate)))
+    state/max-frames: either max-frames < BROM-AUDIO-CAPACITY [max-frames] [BROM-AUDIO-CAPACITY]
+    state/tail-samples: as u32! reverb-math/ceil (rate * (16.0 + 0.200 + 0.1234 + 0.020))
+    offset: make [#mutable i32!] 0
+    repeat line 4 [
+        state/line-offsets/:line: offset
+        state/line-capacities/:line: capacities/:line
+        offset: offset + capacities/:line
+    ]
+    state/predelay-offset: offset
+    state/predelay-capacity: predelay-capacity
+    state/active: true
+    return true
+]
+
+brom-reverb-tail-samples: func [
+    "Return the fixed conservative activation tail horizon."
+    :state [brom-reverb-state!] "Borrowed caller-owned reverb state."
+    return: [u32!] "Samples of tail at the configured rate; zero when inactive."
+] [
+    return state/tail-samples
+]
+
+brom-reverb-memory-bytes: func [
+    "Return allocated delay storage, excluding the caller-owned state struct."
+    :state [brom-reverb-state!] "Borrowed caller-owned reverb state."
+    return: [size!] "Bytes allocated for delay lines; zero when inactive."
+] [
+    return state/memory-bytes
+]
+
+; The allocation is a private contiguous collection of these cells. Views do
+; not own or allocate memory; offsets are validated at activation.
+reverb-cell!: make c-struct! [value: [f32!]]
+
+reverb-limit: func [
+    #inline
+    "Sanitize a control before any coefficient calculation or integer cast."
+    value [f32!] "Untrusted control value."
+    low [f32!] "Minimum accepted value."
+    high [f32!] "Maximum accepted value."
+    fallback [f32!] "Value used for NaN or infinity."
+    return: [f32!] "Finite bounded value."
+] [
+    if any [value <> value (reverb-math/abs value) > (as f32! 3.4e38)] [return fallback]
+    return reverb-math/max low (reverb-math/min high value)
+]
+
+reverb-smooth: func [
+    #inline
+    "Approach a scalar target and snap the negligible final remainder."
+    value [f32!] "Previous state."
+    target [f32!] "Finite target."
+    step [f32!] "Sample-rate-derived smoothing fraction."
+    return: [f32!] "Updated state; zero targets reach exact zero."
+] [
+    next: value + ((target - value) * step)
+    return either (reverb-math/abs (target - next)) < (as f32! 0.000001) [target] [next]
+]
+
+reverb-tap: func [
+    #inline
+    "Move a delay read at no more than a quarter sample per sample."
+    value [f32!] "Previous delay length in samples."
+    target [f32!] "Target delay length in samples."
+    step [f32!] "Fifty-millisecond smoothing fraction."
+    return: [f32!] "New interpolated read delay."
+] [
+    movement: reverb-math/max (as f32! -0.25)
+        (reverb-math/min (as f32! 0.25) ((target - value) * step))
+    return value + movement
+]
+
+reverb-read: func [
+    #inline
+    "Read a full-precision fractional position from one private ring."
+    :memory [c-pointer!] "Borrowed activation allocation."
+    offset [i32!] "Region start in samples."
+    capacity [i32!] "Region capacity, including guards."
+    write-position [i32!] "Current write position in this region."
+    delay [f32!] "Bounded read delay in samples."
+    return: [f32!] "Linear interpolation of neighboring stored samples."
+] [
+    position: make [#mutable f32!] ((as f32! write-position) - delay)
+    if position < (as f32! 0.0) [position: position + (as f32! capacity)]
+    index: as i32! position
+    next-index: either (index + 1) = capacity [0] [index + 1]
+    fraction: position - (as f32! index)
+    first: make [#mutable reverb-cell!] as reverb-cell! (memory + ((offset + index) * 4))
+    second: make [#mutable reverb-cell!] as reverb-cell! (memory + ((offset + next-index) * 4))
+    return first/value + ((second/value - first/value) * fraction)
+]
+
+reverb-coefficients: func [
+    "Refresh expensive coefficient targets on a persistent 32-sample clock."
+    :state [brom-reverb-state!] "Borrowed active state."
+    return: [none!] "No value; finite coefficient targets are updated."
+] [
+    angle: state/diffusion * (as f32! 0.7853981633974483)
+    state/rotation-sin-target: reverb-math/sin angle
+    state/rotation-cos-target: reverb-math/cos angle
+    cutoff: reverb-math/min state/cutoff ((as f32! 0.45) * state/sample-rate)
+    state/damping-target: (as f32! 1.0) - (reverb-math/exp
+        ((as f32! -6.283185307179586) * cutoff / state/sample-rate))
+    repeat line 4 [
+        ; exp(-ln(1000) * delaySeconds / RT60) gives amplitude -60dB.
+        state/gain-targets/:line: reverb-math/exp
+            ((as f32! -6.907755278982137) * state/taps/:line / (state/sample-rate * state/decay))
+    ]
+    return none
+]
+
+brom-reverb-process: func [
+    "Process mono/stereo input with a bounded, quantized four-line FDN."
+    :state [brom-reverb-state!] "Borrowed active caller-owned state."
+    :input [brom-audio-f32!] "Planar input; may be exactly the output block."
+    :output [brom-audio-f32!] "Planar stereo output, written for frames only."
+    channels [i32!] "One duplicates left input; two reads both input channels."
+    frames [i32!] "Zero through configured frame capacity."
+    :params [brom-reverb-params!] "Current finite or untrusted controls."
+    return: [logic!] "False for invalid layout/capacity or inactive state, without mutation."
+] [
+    if any [state/active = false channels < 1 channels > 2 frames < 0 frames > state/max-frames] [return false]
+    if frames = 0 [return true]
+    mix-target: reverb-limit params/mix (as f32! 0.0) (as f32! 1.0) (as f32! 0.35)
+    decay-target: reverb-limit params/decay-seconds (as f32! 0.1) (as f32! 8.0) (as f32! 2.0)
+    cutoff-target: reverb-limit params/damping-hz (as f32! 200.0) (as f32! 16000.0) (as f32! 6000.0)
+    size-control: params/size
+    size-target: reverb-limit size-control (as f32! 0.5) (as f32! 2.0) (as f32! 1.0)
+    diffusion-target: reverb-limit params/diffusion (as f32! 0.0) (as f32! 1.0) (as f32! 0.75)
+    predelay-target: (reverb-limit params/predelay-ms (as f32! 0.0) (as f32! 200.0) (as f32! 20.0)) * state/sample-rate / (as f32! 1000.0)
+    dry-target: either params/bypass [as f32! 1.0] [(as f32! 1.0) - mix-target]
+    excitation-target: either params/bypass [as f32! 0.0] [as f32! 1.0]
+    base-times: make [c-array! [f32! 4]] [0.0371 0.0437 0.0533 0.0617]
+    memory: as c-pointer! state/storage
+    if state/initialized = false [
+        state/mix: mix-target
+        state/dry-gain: dry-target
+        state/excitation: excitation-target
+        state/decay: decay-target
+        state/cutoff: cutoff-target
+        state/diffusion: diffusion-target
+        state/predelay-tap: predelay-target
+        repeat line 4 [state/taps/:line: base-times/:line * size-target * state/sample-rate]
+        reverb-coefficients :state
+        state/rotation-sin: state/rotation-sin-target
+        state/rotation-cos: state/rotation-cos-target
+        state/damping-coefficient: state/damping-target
+        repeat line 4 [state/gains/:line: state/gain-targets/:line]
+        state/initialized: true
+    ]
+    reads: make [#mutable [c-array! [f32! 4]]] []
+    feedback: make [#mutable [c-array! [f32! 4]]] []
+    repeat sample frames [
+        ; Read both channels before writing either output, including aliasing.
+        left: reverb-limit input/left/:sample (as f32! -3.4e38) (as f32! 3.4e38) (as f32! 0.0)
+        right: either channels = 1 [left] [reverb-limit input/right/:sample (as f32! -3.4e38) (as f32! 3.4e38) (as f32! 0.0)]
+        state/mix: reverb-smooth state/mix mix-target state/scalar-step
+        state/dry-gain: reverb-smooth state/dry-gain dry-target state/scalar-step
+        state/excitation: reverb-smooth state/excitation excitation-target state/scalar-step
+        state/decay: reverb-smooth state/decay decay-target state/scalar-step
+        state/cutoff: reverb-smooth state/cutoff cutoff-target state/scalar-step
+        state/diffusion: reverb-smooth state/diffusion diffusion-target state/scalar-step
+        state/predelay-tap: reverb-tap state/predelay-tap predelay-target state/tap-step
+        repeat line 4 [
+            state/taps/:line: reverb-tap state/taps/:line
+                (base-times/:line * size-target * state/sample-rate) state/tap-step
+        ]
+        if state/control-phase = 0 [reverb-coefficients :state]
+        state/control-phase: (state/control-phase + 1) % 32
+        state/damping-coefficient: reverb-smooth state/damping-coefficient state/damping-target state/scalar-step
+        sine: reverb-smooth state/rotation-sin state/rotation-sin-target state/scalar-step
+        cosine: reverb-smooth state/rotation-cos state/rotation-cos-target state/scalar-step
+        ; Coefficient interpolation would otherwise contract the matrix. A
+        ; single sqrt restores the unit pair and orthogonality at every sample.
+        normalization: (as f32! 1.0) / (reverb-math/sqrt ((sine * sine) + (cosine * cosine)))
+        state/rotation-sin: sine * normalization
+        state/rotation-cos: cosine * normalization
+        pre-left: make [#mutable reverb-cell!] as reverb-cell! (memory + ((state/predelay-offset + state/predelay-write) * 4))
+        pre-right: make [#mutable reverb-cell!] as reverb-cell! (memory + ((state/predelay-offset + state/predelay-capacity + state/predelay-write) * 4))
+        ; Pre-delay and its interpolation retain full float precision.
+        excitation-left: left * state/excitation
+        excitation-right: right * state/excitation
+        pre-left/value: excitation-left
+        pre-right/value: excitation-right
+        if any [excitation-left <> (as f32! 0.0) excitation-right <> (as f32! 0.0)] [
+            state/silent-samples: as u32! 0
+            state/tail-live: true
+        ]
+        if state/tail-live [
+            state/silent-samples: state/silent-samples + (as u32! 1)
+            if state/silent-samples >= state/tail-samples [
+                ; Clear exactly once at the fixed activation bound. Controls
+                ; survive so a new note resumes the same smooth transitions.
+                unsafe/memset :memory 0 (as i32! state/memory-bytes)
+                repeat line 4 [state/damping/:line: as f32! 0.0]
+                state/tail-live: false
+            ]
+        ]
+        delayed-left: reverb-read :memory state/predelay-offset state/predelay-capacity state/predelay-write state/predelay-tap
+        delayed-right: reverb-read :memory (state/predelay-offset + state/predelay-capacity) state/predelay-capacity state/predelay-write state/predelay-tap
+        repeat line 4 [
+            reads/:line: reverb-read :memory state/line-offsets/:line state/line-capacities/:line state/line-writes/:line state/taps/:line
+            filtered: state/damping/:line + ((reads/:line - state/damping/:line) * state/damping-coefficient)
+            state/damping/:line: either (reverb-math/abs filtered) < (as f32! 1.0e-20) [as f32! 0.0] [filtered]
+            state/gains/:line: reverb-smooth state/gains/:line state/gain-targets/:line state/scalar-step
+            feedback/:line: state/damping/:line * state/gains/:line
+        ]
+        c: state/rotation-cos
+        s: state/rotation-sin
+        a: (c * feedback/0) - (s * feedback/1)
+        b: (s * feedback/0) + (c * feedback/1)
+        d: (c * feedback/2) - (s * feedback/3)
+        e: (s * feedback/2) + (c * feedback/3)
+        feedback/0: ((c * a) - (s * d)) + ((as f32! 0.25) * delayed-left)
+        feedback/1: ((c * b) - (s * e)) + ((as f32! 0.25) * delayed-right)
+        feedback/2: ((s * a) + (c * d)) + ((as f32! 0.25) * delayed-left)
+        feedback/3: ((s * b) + (c * e)) - ((as f32! 0.25) * delayed-right)
+        repeat line 4 [
+            cell: make [#mutable reverb-cell!] as reverb-cell! (memory + ((state/line-offsets/:line + state/line-writes/:line) * 4))
+            cell/value: brom-reverb-quantize feedback/:line
+            state/line-writes/:line: (state/line-writes/:line + 1) % state/line-capacities/:line
+        ]
+        residue-gain: make [#mutable f32!] 1.0
+        fade-samples: state/sample-rate * (as f32! 0.020)
+        remaining: (as f32! state/tail-samples) - (as f32! state/silent-samples)
+        if remaining < fade-samples [residue-gain: reverb-math/max (as f32! 0.0) (remaining / fade-samples)]
+        wet-gain: (as f32! 0.5) * state/mix * residue-gain
+        output/left/:sample: (left * state/dry-gain) + ((reads/0 + reads/1 - reads/2 - reads/3) * wet-gain)
+        output/right/:sample: (right * state/dry-gain) + ((reads/0 - reads/1 + reads/2 - reads/3) * wet-gain)
+        state/predelay-write: (state/predelay-write + 1) % state/predelay-capacity
+        state/write-index: either state/write-index >= 1000000000 [0] [state/write-index + 1]
+    ]
+    return true
+]

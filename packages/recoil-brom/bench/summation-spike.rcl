@@ -1,0 +1,244 @@
+Recoil [
+    Title: "Brom additive-summation hot-loop spike (f32, inline)"
+    Description: {
+        Reproduces the inner loop of Pokuston Mach I's Rust engine --
+        core/src/oscillator.rs sum_harmonics() and sample_wavetable() -- so the
+        Recoil codegen can be compared against core/benches/hotpath.rs before
+        committing to the full DSP port.
+
+        Shape mirrored from the Rust original:
+          16 voices x 2 oscillators x 128-sample blocks x 4x oversampling,
+          16 harmonics, steady state (no note events, no envelope work).
+        Per oscillator per oversampled sample: one fundamental lookup plus
+        8 even and 8 odd harmonic lookups, each a linearly interpolated read of
+        a 16384-entry table scaled by shared slope x per-voice correction.
+
+        Build:  r3 -s recoil.r3 compile --cflag -O2 -o /tmp/brom-spike \
+                    packages/recoil-brom/bench/summation-spike.rcl
+        Time:   time /tmp/brom-spike
+        The checksum print keeps the render observable so the optimiser cannot
+        discard the loop.
+    }
+    ; A module in its own mini-project rather than a bare script: the package
+    ; scan validates every .rcl beneath a package root regardless of
+    ; Module-Roots, so a headerless script here made the whole recoil-brom
+    ; package undependable (R6026).
+    Type: module
+    Module: recoil-brom/bench/summation-spike
+    Exports: []
+]
+
+mathf: foreign <math.h> [
+    pow: "pow" [f64! f64! return: [f64!]]
+    sin: "sin" [f64! return: [f64!]]
+]
+
+; --- shape constants, matching core/src/constants.rs ------------------------
+
+SINE-TABLE-SIZE: 16384
+TABLE-MASK: 16383
+SLOPE-TABLE-SIZE: 129
+MAX-VOICES: 16
+NUM-OSC: 2
+BLOCK-SIZE: 128
+OVERSAMPLING: 4
+HARMONICS: 16
+; Even harmonics 2,4..16 and odd 3,5..17 -- 8 of each at 16 harmonics.
+HARMONIC-PAIRS: 8
+; Matches the 2000 steady-state iterations in core/benches/hotpath.rs.
+BENCH-BLOCKS: 2000
+
+TWO-PI: 6.283185307179586
+SAMPLE-RATE: 44100.0
+
+; --- state ------------------------------------------------------------------
+
+osc-state!: make c-struct! [
+    phase: [f32!]
+    phase-delta: [f32!]
+    gain-comp: [f32!]
+    odd-level: [f32!]
+    even-level: [f32!]
+    drift-step: [f32!]
+    odd-correction: [c-array! [f32! 129]]
+    even-correction: [c-array! [f32! 129]]
+]
+
+voice-state!: make c-struct! [
+    oscs: [c-array! [osc-state! 2]]
+]
+
+engine!: make c-struct! [
+    sine-table: [c-array! [f32! 16384]]
+    ; Two oscillators' shared slope tables, flattened as osc * 129 + h.
+    shared-odd-slope: [c-array! [f32! 258]]
+    shared-even-slope: [c-array! [f32! 258]]
+    voices: [c-array! [voice-state! 16]]
+]
+
+; --- kernel -----------------------------------------------------------------
+
+frac32: func [
+    "Fractional part of a non-negative f32, mirroring Rust's f32::fract()."
+    v [f32!] "Non-negative value; phases are always positive here."
+    return: [f32!] "v minus its integer part, in [0.0, 1.0)."
+] [
+    return v - (as f32! (as i32! v))
+]
+
+sample-wavetable: func [
+    "Linearly interpolated table read, mirroring Oscillator::sample_wavetable."
+    :state [engine!] "Borrowed engine holding the sine table."
+    phase [f32!] "Phase in [0.0, 1.0)."
+    return: [f32!] "Interpolated table value."
+] [
+    scaled: phase * (as f32! SINE-TABLE-SIZE)
+    idx-int: as i32! scaled
+    idx1: idx-int & TABLE-MASK
+    idx2: (idx1 + 1) & TABLE-MASK
+    frac: scaled - (as f32! idx-int)
+    a: make f32! state/sine-table/:idx1
+    b: make f32! state/sine-table/:idx2
+    return a + ((b - a) * frac)
+]
+
+sum-harmonics: func [
+    "One oscillator's additive sum, mirroring Oscillator::sum_harmonics."
+    :state [engine!] "Borrowed engine holding sine and shared slope tables."
+    :osc [osc-state!] "Borrowed oscillator carrying phase and correction tables."
+    osc-index [i32!] "0 or 1; selects the shared slope table half."
+    distorted-phase [f32!] "Post-PD phase in [0.0, 1.0)."
+    return: [f32!] "Summed, gain-compensated oscillator output."
+] [
+    total: make [#mutable f32!] 0.0
+    base: osc-index * SLOPE-TABLE-SIZE
+
+    ; 1. Fundamental, always on.
+    total: total + (sample-wavetable :state distorted-phase)
+
+    ; 2. Even harmonics: 2, 4, .. 16.
+    repeat k HARMONIC-PAIRS [
+        h: 2 + (k * 2)
+        drift-offset: (as f32! (h - 1)) * osc/drift-step * 0.5
+        h-phase: frac32 ((distorted-phase * (as f32! h)) + drift-offset)
+        slope-idx: base + h
+        total: total + ((sample-wavetable :state h-phase)
+            * osc/even-level
+            * state/shared-even-slope/:slope-idx
+            * osc/even-correction/:h)
+    ]
+
+    ; 3. Odd harmonics: 3, 5, .. 17.
+    repeat k HARMONIC-PAIRS [
+        h: 3 + (k * 2)
+        drift-offset: (as f32! (h - 1)) * osc/drift-step * 0.5
+        h-phase: frac32 ((distorted-phase * (as f32! h)) + drift-offset)
+        slope-idx: base + h
+        total: total + ((sample-wavetable :state h-phase)
+            * osc/odd-level
+            * state/shared-odd-slope/:slope-idx
+            * osc/odd-correction/:h)
+    ]
+
+    return total * osc/gain-comp
+]
+
+mix-voices: func [
+    "Sum every voice's two oscillators for one oversampled sample."
+    :state [engine!] "Borrowed engine."
+    return: [f32!] "Mixed output for this oversampled sample."
+] [
+    total: make [#mutable f32!] 0.0
+    repeat v MAX-VOICES [
+        voice: make [#mutable voice-state!] as voice-state! (addr-of state/voices/:v)
+        repeat o NUM-OSC [
+            osc: make [#mutable osc-state!] as osc-state! (addr-of voice/oscs/:o)
+            contribution: sum-harmonics :state :osc o osc/phase
+            total: total + contribution
+            osc/phase: frac32 (osc/phase + osc/phase-delta)
+        ]
+    ]
+    return total
+]
+
+; --- setup ------------------------------------------------------------------
+
+midi-freq: func [
+    "MIDI note number to frequency in Hz."
+    note [i32!] "MIDI note number."
+    return: [f64!] "Frequency in Hz."
+] [
+    return 440.0 * (mathf/pow 2.0 ((as f64! (note - 69)) / 12.0))
+]
+
+slope-value: func [
+    "Amplitude weight for one harmonic, standing in for the shared slope table."
+    h [i32!] "Harmonic number, 1-based."
+    return: [f32!] "1/h falloff, matching a mid-range slope setting."
+] [
+    return as f32! (1.0 / (as f64! h))
+]
+
+init-engine: func [
+    "Fill the sine table, shared slope tables, voices and correction tables."
+    :state [engine!] "Borrowed engine to populate."
+    return: [none!] "Nothing; the engine is filled in place."
+] [
+    repeat i SINE-TABLE-SIZE [
+        phase: (as f64! i) * TWO-PI / (as f64! SINE-TABLE-SIZE)
+        state/sine-table/:i: as f32! (mathf/sin phase)
+    ]
+
+    repeat o NUM-OSC [
+        repeat h SLOPE-TABLE-SIZE [
+            idx: (o * SLOPE-TABLE-SIZE) + h
+            value: either h = 0 [as f32! 0.0] [slope-value h]
+            state/shared-odd-slope/:idx: value
+            state/shared-even-slope/:idx: value
+        ]
+    ]
+
+    repeat v MAX-VOICES [
+        voice: make [#mutable voice-state!] as voice-state! (addr-of state/voices/:v)
+        freq: midi-freq (36 + (v * 3))
+        repeat o NUM-OSC [
+            osc: make [#mutable osc-state!] as osc-state! (addr-of voice/oscs/:o)
+            osc/phase: as f32! ((as f64! v) * 0.01)
+            ; The engine runs at OVERSAMPLING x the host rate.
+            osc/phase-delta: as f32! (freq / (SAMPLE-RATE * (as f64! OVERSAMPLING)))
+            osc/gain-comp: as f32! 0.35
+            osc/odd-level: as f32! 0.5
+            osc/even-level: as f32! 0.5
+            osc/drift-step: as f32! 0.0
+            repeat h SLOPE-TABLE-SIZE [
+                ; env_amount = 0 leaves corrections at 1.0, the documented
+                ; zero-overhead path in mach/AGENTS.md.
+                osc/odd-correction/:h: as f32! 1.0
+                osc/even-correction/:h: as f32! 1.0
+            ]
+        ]
+    ]
+    return none
+]
+
+; --- run --------------------------------------------------------------------
+
+raw: make c-pointer! unsafe/malloc (as i32! size-of engine!)
+unsafe/memset raw 0 (as i32! size-of engine!)
+state: make [#mutable engine!] as engine! raw
+
+init-engine :state
+
+checksum: make [#mutable f64!] 0.0
+repeat block BENCH-BLOCKS [
+    repeat sample BLOCK-SIZE [
+        accum: make [#mutable f32!] 0.0
+        repeat os OVERSAMPLING [
+            accum: accum + (mix-voices :state)
+        ]
+        checksum: checksum + (as f64! (accum / (as f32! OVERSAMPLING)))
+    ]
+]
+
+print checksum
+unsafe/free raw

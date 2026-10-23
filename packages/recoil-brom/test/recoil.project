@@ -1,0 +1,9 @@
+Recoil-Project [
+    Name: recoil-brom-test
+    Version: 0.1.0
+    ; A project inside the package so brom/* has a consumer to be resolved
+    ; through; the package itself declares no dependencies.
+    Dependencies: [
+        [package: recoil-brom source: [path %../]]
+    ]
+]

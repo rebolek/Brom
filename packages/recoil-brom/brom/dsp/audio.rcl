@@ -1,0 +1,30 @@
+Recoil [
+    Title: "Brom typed planar float audio blocks"
+    Type: module
+    Module: brom/dsp/audio
+    Imports: []
+    Exports: [BROM-AUDIO-CAPACITY brom-audio-f32! brom-audio-f64!]
+]
+
+BROM-AUDIO-CAPACITY: 512
+
+; Inline ABI arrays have no managed series header. C adapters mirror this
+; caller-owned block with brom_audio_f32 in audio.h.
+brom-audio-f32!: make c-struct! [
+    left: [c-array! [f32! 512]]
+    right: [c-array! [f32! 512]]
+]
+
+static-assert ((size-of brom-audio-f32!) = 4096) "Brom planar float block size"
+static-assert ((offset-of brom-audio-f32! left) = 0) "Brom left plane offset"
+static-assert ((offset-of brom-audio-f32! right) = 2048) "Brom right plane offset"
+
+; The double-precision block mirrors brom_audio_f64 in audio.h.
+brom-audio-f64!: make c-struct! [
+    left: [c-array! [f64! 512]]
+    right: [c-array! [f64! 512]]
+]
+
+static-assert ((size-of brom-audio-f64!) = 8192) "Brom planar double block size"
+static-assert ((offset-of brom-audio-f64! left) = 0) "Brom f64 left plane offset"
+static-assert ((offset-of brom-audio-f64! right) = 4096) "Brom f64 right plane offset"

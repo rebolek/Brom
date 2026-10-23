@@ -1,0 +1,12 @@
+Recoil-Project [
+    Name: au-loos
+    Version: 0.2.0
+    Dependencies: [
+        [package: recoil-brom source: [path %../../../../packages/recoil-brom/]]
+        [package: loos-core source: [path %../]]
+        [package: recoil-gui source: [recoil %packages/recoil-gui/]]
+        [package: recoil-gui-backend-pugl source: [recoil %packages/recoil-gui-backend-pugl/]]
+        [package: pokuston-vst3-sdk source: [path %../../../../packages/pokuston-vst3-sdk/]]
+        [package: pokuston-audio-unit-sdk source: [path %../../../../packages/pokuston-audio-unit-sdk/]]
+    ]
+]

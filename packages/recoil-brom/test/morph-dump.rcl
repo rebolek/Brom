@@ -1,0 +1,58 @@
+Recoil [
+    Title: "Morphing oscillator dump"
+    Description: {
+        Writes raw f64 samples of brom-morph-osc-tick so the compiled result can
+        be held against the reference model the design was measured on. The
+        alias figures quoted for this oscillator were taken from that model; if
+        the two agree sample for sample the figures describe this code, and if
+        they do not then they describe nothing.
+    }
+    Type: module
+    Module: recoil-brom/test/morph-dump
+    Imports: [
+        brom/dsp/oscillator [
+            brom-blamp-table-bytes brom-blamp-table-fill
+            brom-morph-osc! brom-morph-osc-reset brom-morph-osc-tick
+        ]
+    ]
+    Exports: []
+]
+
+dump-stdio: foreign <stdio.h> [
+    fopen: "fopen" [c-string! c-string! return: [c-pointer!]]
+    fwrite: "fwrite" [c-pointer! size! size! c-pointer! return: [size!]]
+    fclose: "fclose" [c-pointer! return: [i32!]]
+]
+
+DUMP-FRAMES: 4096
+
+frames!: make c-struct! [
+    values: [c-array! [f64! 4096]]
+]
+
+table: make c-pointer! unsafe/malloc brom-blamp-table-bytes
+brom-blamp-table-fill :table
+
+osc: make [#mutable brom-morph-osc!] []
+handle: addr-of osc
+
+buffer: make c-pointer! unsafe/malloc (as i32! size-of frames!)
+out: make [#mutable frames!] as frames! buffer
+
+handle-file: dump-stdio/fopen "morph-dump.bin" "wb"
+
+; Three points across the travel, at a pitch where corrections overlap.
+repeat case 3 [
+    morph: either case = 0 [0.5] [either case = 1 [0.75] [0.9]]
+    brom-morph-osc-reset :handle
+    repeat i DUMP-FRAMES [
+        out/values/:i: brom-morph-osc-tick :handle :table 0.0798611111111111 morph
+    ]
+    written: dump-stdio/fwrite buffer 8 (as size! DUMP-FRAMES) handle-file
+    unused written
+]
+closed: dump-stdio/fclose handle-file
+unused closed
+unsafe/free :buffer
+unsafe/free :table
+print "dumped"

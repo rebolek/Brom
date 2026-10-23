@@ -1,0 +1,9 @@
+Recoil-Project [
+    Name: clap-brom-probe-effect
+    Version: 0.1.0
+    Dependencies: [
+        [package: recoil-brom source: [path %../../../]]
+        [package: brom-probe-effect source: [path %../]]
+        [package: pokuston-clap-sdk source: [path %../../../../pokuston-clap-sdk/]]
+    ]
+]

@@ -1,0 +1,2722 @@
+Recoil [
+    Title: "Shared CLAP shell"
+    Description: {
+        The host half of a CLAP plug-in, written once. Everything here is glue
+        that talks to the host and nothing here knows what the plug-in sounds
+        like: event dispatch, audio and note ports, the parameter extension,
+        state streaming, GUI lifecycle, the factory and the entry point.
+
+        A plug-in supplies a brom/plugin/engine descriptor and this module
+        drives it. Before Brom, kapralova/clap/clap_entry.rcl (1670 lines) and
+        loos/clap/clap_entry.rcl (1762) held two copies of this file that
+        differed by 294 lines out of 3,432 -- and every one of those 294 lines
+        was a parameter table, a voice count or a plug-in name.
+
+        The engine is registered rather than linked: a plug-in's own entry
+        calls brom-clap-register-engine from the CLAP entry init hook, which
+        the host always calls before it asks for the factory.
+    }
+    Type: module
+    Module: brom/plugin/clap/entry
+    Ffi: [c-string]
+    Imports: [
+        brom/plugin/values [param-range!]
+        brom/plugin/engine [
+            engine! param-info! brom-voice-state!
+            BROM-MAX-VOICES BROM-MAX-PARAMS BROM-MAX-STATE-BYTES
+            engine-param-info brom-select-voice
+        ]
+        brom/plugin/preset [
+            preset-cstr-string preset-fill-buffer
+            preset-dir preset-ensure-dir
+            preset-name-of preset-key-of preset-description-of
+            preset-feature-count preset-feature-at
+            preset-factory-count preset-factory-text preset-factory-name
+            preset-factory-key preset-factory-index-by-key
+            preset-factory-materialize preset-snapshot-apply preset-factory-match
+        ]
+        brom/plugin/preset/schema [brom-preset-schema-read brom-preset-prepare-text]
+        brom/plugin/state/dispatch [brom-state-load brom-state-save brom-state-save-context]
+    ]
+    Exports: [
+        brom-clap-init-engine
+        brom-clap-plugin-factory
+        brom-clap-entry-init brom-clap-entry-deinit
+    ]
+]
+
+math-ffi: foreign <math.h> [
+    pow: "pow" [f64! f64!] return: [f64!]
+]
+
+stdio-ffi: foreign <stdio.h> [
+    snprintf-f64: "snprintf" [c-pointer! i32! c-string! f64! return: [i32!]]
+]
+
+stdlib-ffi: foreign <stdlib.h> [
+    strtod: "strtod" [c-string! c-pointer! return: [f64!]]
+]
+
+string-ffi: foreign <string.h> [
+    strcmp: "strcmp" [c-string! c-string!] return: [i32!]
+]
+
+helpers: foreign <packages/recoil-brom/brom/plugin/clap/clap_support_api.h> [
+    copy-audio: "recoil_clap_copy_audio"
+        [:clap-process! c-pointer! u32! u32! f64! logic!] return: [none!]
+    copy-audio-stereo: "recoil_clap_copy_audio_stereo"
+        [:clap-process! c-pointer! c-pointer! u32! u32! f64! logic!] return: [none!]
+    stream-write-all: "recoil_clap_stream_write_all" [:clap-ostream! c-pointer! u64!] return: [logic!]
+    stream-read-all: "recoil_clap_stream_read_all" [:clap-istream! c-pointer! u64!] return: [logic!]
+    read-file: "recoil_clap_read_file" [c-string! c-pointer! u64!] return: [i64!]
+    stream-read-to-end: "recoil_clap_stream_read_to_end"
+        [:clap-istream! c-pointer! u64!] return: [i64!]
+    gui-platform-api: "recoil_clap_gui_platform_api" [] return: [c-string!]
+    gui-is-api-supported: "recoil_clap_gui_is_api_supported" [c-string! logic!] return: [logic!]
+    gui-create: "recoil_clap_gui_create" [c-pointer! c-pointer! c-pointer! u32! u32!] return: [c-pointer!]
+    gui-destroy: "recoil_clap_gui_destroy" [c-pointer!] return: [none!]
+    gui-set-parent: "recoil_clap_gui_set_parent" [c-pointer! c-pointer!] return: [logic!]
+    gui-show: "recoil_clap_gui_show" [c-pointer!] return: [logic!]
+    gui-hide: "recoil_clap_gui_hide" [c-pointer!] return: [logic!]
+    gui-on-timer: "recoil_clap_gui_on_timer" [c-pointer! u32!] return: [none!]
+    gui-on-main-thread: "recoil_clap_gui_on_main_thread" [c-pointer!] return: [none!]
+    gui-preset-changed: "recoil_clap_gui_preset_changed" [c-pointer! i32!] return: [none!]
+    preset-discovery-init: "recoil_clap_preset_discovery_init"
+        [c-string! c-string! c-string! u32! return: [none!]]
+    preset-discovery-add: "recoil_clap_preset_discovery_add"
+        [u32! c-string! c-string! c-string!] return: [logic!]
+    preset-discovery-add-user: "recoil_clap_preset_discovery_add_user"
+        [u32! c-string! c-string! c-string! c-string!] return: [logic!]
+    preset-discovery-add-feature: "recoil_clap_preset_discovery_add_feature"
+        [u32! c-string!] return: [logic!]
+    preset-discovery-factory: "recoil_clap_preset_discovery_factory" [] return: [c-pointer!]
+    preset-load-extension: "recoil_clap_preset_load_extension" [] return: [c-pointer!]
+    preset-mailbox-create: "recoil_clap_preset_mailbox_create" [] return: [c-pointer!]
+    preset-mailbox-destroy: "recoil_clap_preset_mailbox_destroy" [c-pointer!] return: [none!]
+    preset-snapshot-create: "recoil_clap_preset_snapshot_create"
+        [u32! i32!] return: [c-pointer!]
+    preset-mailbox-publish: "recoil_clap_preset_mailbox_publish"
+        [c-pointer! c-pointer!] return: [none!]
+    preset-mailbox-cancel: "recoil_clap_preset_mailbox_cancel"
+        [c-pointer!] return: [none!]
+    preset-mailbox-take: "recoil_clap_preset_mailbox_take"
+        [c-pointer!] return: [c-pointer!]
+    preset-mailbox-commit: "recoil_clap_preset_mailbox_commit"
+        [c-pointer! c-pointer!] return: [none!]
+    preset-mailbox-reject: "recoil_clap_preset_mailbox_reject"
+        [c-pointer! c-pointer!] return: [none!]
+    preset-mailbox-current: "recoil_clap_preset_mailbox_current"
+        [c-pointer!] return: [i32!]
+    preset-mailbox-clear: "recoil_clap_preset_mailbox_clear"
+        [c-pointer!] return: [none!]
+    preset-mailbox-active-matches: "recoil_clap_preset_mailbox_active_matches"
+        [c-pointer! u32! f64!] return: [logic!]
+    preset-mailbox-take-completions: "recoil_clap_preset_mailbox_take_completions"
+        [c-pointer!] return: [u32!]
+    preset-mailbox-reclaim: "recoil_clap_preset_mailbox_reclaim"
+        [c-pointer!] return: [none!]
+    preset-tx-create: "brom_preset_tx_create" [c-pointer! c-pointer! u32!] return: [c-pointer!]
+    preset-tx-destroy: "brom_preset_tx_destroy" [c-pointer!] return: [none!]
+    preset-submit-load: "brom_preset_submit_load" [c-pointer! c-pointer! c-pointer! c-pointer!] return: [i32!]
+    preset-submit-compare: "brom_preset_submit_compare" [c-pointer! u64!] return: [i32!]
+    preset-submit-edit: "brom_preset_submit_edit" [c-pointer! u64! u32! f64!] return: [i32!]
+    preset-audio-edit: "brom_preset_audio_edit" [c-pointer! u32! f64! logic! c-pointer!] return: [i32!]
+    preset-audio-cutoff: "brom_preset_audio_cutoff" [c-pointer!] return: [u64!]
+    preset-audio-boundary: "brom_preset_audio_boundary" [c-pointer! u64! c-pointer!] return: [logic!]
+    preset-audio-publish: "brom_preset_audio_publish" [c-pointer! c-pointer!] return: [none!]
+    preset-audio-publish-inactive: "brom_preset_audio_publish_inactive" [c-pointer! c-pointer!] return: [none!]
+    preset-audio-resume: "brom_preset_audio_resume" [c-pointer! c-pointer!] return: [logic!]
+    preset-set-active: "brom_preset_set_active" [c-pointer! logic!] return: [none!]
+    preset-read-view: "brom_preset_read_view" [c-pointer! c-pointer!] return: [logic!]
+    preset-session-encode: "brom_preset_session_encode"
+        [c-pointer! c-string! c-pointer! c-pointer! u64! c-pointer!] return: [i32!]
+    preset-session-decode: "brom_preset_session_decode"
+        [c-pointer! u64! c-pointer! c-string! c-pointer!] return: [i32!]
+    preset-session-migrate-legacy: "brom_preset_session_migrate_legacy"
+        [c-pointer! c-pointer! c-pointer! c-pointer!] return: [i32!]
+]
+
+preset-catalog-api: foreign <packages/recoil-brom/brom/plugin/preset/catalog.h> [
+    catalog-refresh: "brom_preset_catalog_refresh"
+        [c-string! c-pointer! c-pointer!] return: [i32!]
+    catalog-release: "brom_preset_catalog_release" [c-pointer!] return: [none!]
+    catalog-count: "brom_preset_catalog_count" [c-pointer!] return: [u32!]
+    catalog-read: "brom_preset_catalog_read" [c-pointer! u32! c-pointer!] return: [i32!]
+]
+
+
+CLAP_VERSION_MAJOR: 1
+CLAP_VERSION_MINOR: 2
+CLAP_VERSION_REVISION: 7
+CLAP_NAME_SIZE: 256
+CLAP_PATH_SIZE: 1024
+
+CLAP_CORE_EVENT_SPACE_ID: 0
+CLAP_EVENT_NOTE_ON: 0
+CLAP_EVENT_NOTE_OFF: 1
+CLAP_EVENT_NOTE_CHOKE: 2
+CLAP_EVENT_PARAM_VALUE: 5
+CLAP_EVENT_PARAM_GESTURE_BEGIN: 7
+CLAP_EVENT_PARAM_GESTURE_END: 8
+
+CLAP_PROCESS_CONTINUE: 1
+CLAP_PROCESS_ERROR: 0
+
+CLAP_AUDIO_PORT_IS_MAIN: 1
+CLAP_INVALID_ID: as u32! 4294967295
+CLAP_NOTE_DIALECT_CLAP: 1
+CLAP_PARAM_IS_AUTOMATABLE: 32
+CLAP_PARAM_FLAGS: CLAP_PARAM_IS_AUTOMATABLE
+CLAP_PARAM_RESCAN_VALUES: 1
+CLAP_PORT_STEREO: as c-string! "stereo"
+
+CLAP_EXT_AUDIO_PORTS: as c-string! "clap.audio-ports"
+CLAP_EXT_NOTE_PORTS: as c-string! "clap.note-ports"
+CLAP_EXT_PARAMS: as c-string! "clap.params"
+CLAP_EXT_STATE: as c-string! "clap.state"
+CLAP_EXT_GUI: as c-string! "clap.gui"
+CLAP_EXT_TIMER_SUPPORT: as c-string! "clap.timer-support"
+CLAP_EXT_PRESET_LOAD: as c-string! "clap.preset-load/2"
+CLAP_EXT_PRESET_LOAD_COMPAT: as c-string! "clap.preset-load.draft/2"
+CLAP_EXT_STATE_CONTEXT: as c-string! "clap.state-context/2"
+CLAP_STATE_CONTEXT_FOR_PRESET: 1
+CLAP_STATE_CONTEXT_FOR_DUPLICATE: 2
+CLAP_STATE_CONTEXT_FOR_PROJECT: 3
+CLAP_PLUGIN_FACTORY_ID: as c-string! "clap.plugin-factory"
+CLAP_PRESET_DISCOVERY_FACTORY_ID: as c-string! "clap.preset-discovery-factory/2"
+CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT: as c-string! "clap.preset-discovery-factory/draft-2"
+CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN: 1
+
+#extern c-array! [c-string! 3] recoil_clap_features_list
+
+; The plug-in's descriptor, reached by symbol rather than by registration.
+;
+; A registration call cannot work here: in a --lib build (which this always is,
+; because a CLAP host reads clap_entry as static data straight after dlopen)
+; module-level *assignments* are hoisted into __recoil_init_globals but a bare
+; module-level *call* is main-body code, and no main() is emitted -- so the call
+; is silently dropped and the engine would stay null.
+;
+; So the contract is a fixed symbol: every plug-in defines
+;
+;     #export [brom-engine-ptr]
+;     brom-engine-ptr: make c-pointer! addr-of brom-engine
+;
+; and this shell links against that pointer. It is a c-pointer! rather than the
+; engine! itself because #extern only accepts builtin types and c-array!
+; (src/parser/rules/statements.r3:316) -- a user-defined c-struct! does not match
+; the rule, falls through, and is rejected as a statement with no effect.
+;
+; The indirection costs nothing: both are module-level assignments hoisted into
+; __recoil_init_globals, and addr-of a global is a link-time constant.
+#extern c-pointer! brom_engine_ptr
+
+; Returns the raw pointer rather than an engine! so callers can build a
+; field-access view over it. A by-value engine! return would copy the whole
+; vtable -- and retain/release every fn-ptr! field's env -- on each call, which
+; several of these call sites make per audio block.
+active-engine: func [
+    "Address of the registered engine descriptor."
+    return: [c-pointer!] "Borrowed; undefined before registration."
+] [
+    return brom_engine_ptr
+]
+
+number-ws-chars: make bitset! charset " ^(09)^(0A)^(0D)"
+number-digit-chars: make bitset! charset "0123456789"
+number-ws: make rule! [any number-ws-chars]
+number-digits: make rule! [some number-digit-chars]
+number-text: make rule! [
+    number-ws
+    opt ["+" | "-"]
+    [
+        [number-digits opt ["." any number-digit-chars]]
+        | ["." number-digits]
+    ]
+    opt [["e" | "E"] opt ["+" | "-"] number-digits]
+    number-ws
+]
+
+clap-version!: make c-struct! [
+    major: [u32!]
+    minor: [u32!]
+    revision: [u32!]
+]
+
+clap-plugin-descriptor!: make c-struct! [
+    clap_version: [clap-version!]
+    id: [c-string!]
+    name: [c-string!]
+    vendor: [c-string!]
+    url: [c-string!]
+    manual_url: [c-string!]
+    support_url: [c-string!]
+    version: [c-string!]
+    description: [c-string!]
+    features: [c-pointer!]
+]
+
+clap-host!: make c-struct! [
+    clap_version: [clap-version!]
+    host_data: [c-pointer!]
+    name: [c-string!]
+    vendor: [c-string!]
+    url: [c-string!]
+    version: [c-string!]
+    get_extension: [c-fn! [:clap-host! c-string!] return: [c-pointer!]]
+    request_restart: [c-fn! [:clap-host!] return: [none!]]
+    request_process: [c-fn! [:clap-host!] return: [none!]]
+    request_callback: [c-fn! [:clap-host!] return: [none!]]
+]
+
+clap-host-timer-support!: make c-struct! [
+    register_timer: [c-fn! [:clap-host! u32! c-pointer!] return: [logic!]]
+    unregister_timer: [c-fn! [:clap-host! u32!] return: [logic!]]
+]
+
+clap-host-params!: make c-struct! [
+    rescan: [c-fn! [:clap-host! u32!] return: [none!]]
+    clear: [c-fn! [:clap-host! u32! u32!] return: [none!]]
+    request_flush: [c-fn! [:clap-host!] return: [none!]]
+]
+
+clap-host-preset-load!: make c-struct! [
+    on_error: [c-fn! [:clap-host! u32! c-string! c-string! i32! c-string!] return: [none!]]
+    loaded: [c-fn! [:clap-host! u32! c-string! c-string!] return: [none!]]
+]
+
+clap-plugin!: make c-struct! [
+    desc: [c-pointer!]
+    plugin_data: [c-pointer!]
+    init: [c-fn! [:clap-plugin!] return: [logic!]]
+    destroy: [c-fn! [:clap-plugin!] return: [none!]]
+    activate: [c-fn! [:clap-plugin! f64! i32! i32!] return: [logic!]]
+    deactivate: [c-fn! [:clap-plugin!] return: [none!]]
+    start_processing: [c-fn! [:clap-plugin!] return: [logic!]]
+    stop_processing: [c-fn! [:clap-plugin!] return: [none!]]
+    reset: [c-fn! [:clap-plugin!] return: [none!]]
+    process: [c-fn! [:clap-plugin! :clap-process!] return: [i32!]]
+    get_extension: [c-fn! [:clap-plugin! c-string!] return: [c-pointer!]]
+    on_main_thread: [c-fn! [:clap-plugin!] return: [none!]]
+]
+
+clap-plugin-factory!: make c-struct! [
+    get_plugin_count: [c-fn! [:clap-plugin-factory!] return: [i32!]]
+    get_plugin_descriptor: [c-fn! [:clap-plugin-factory! u32!] return: [c-pointer!]]
+    create_plugin: [c-fn! [:clap-plugin-factory! :clap-host! c-string!] return: [c-pointer!]]
+]
+
+clap-plugin-entry!: make c-struct! [
+    clap_version: [clap-version!]
+    init: [c-fn! [c-string!] return: [logic!]]
+    deinit: [c-fn! [] return: [none!]]
+    get_factory: [c-fn! [c-string!] return: [c-pointer!]]
+]
+
+clap-event-header!: make c-struct! [
+    size: [u32!]
+    time: [u32!]
+    space_id: [u16!]
+    type: [u16!]
+    flags: [u32!]
+]
+
+clap-event-note!: make c-struct! [
+    header: [clap-event-header!]
+    note_id: [i32!]
+    port_index: [i16!]
+    channel: [i16!]
+    key: [i16!]
+    velocity: [f64!]
+]
+
+clap-event-param-value!: make c-struct! [
+    header: [clap-event-header!]
+    param_id: [u32!]
+    cookie: [c-pointer!]
+    note_id: [i32!]
+    port_index: [i16!]
+    channel: [i16!]
+    key: [i16!]
+    value: [f64!]
+]
+
+clap-event-param-gesture!: make c-struct! [
+    header: [clap-event-header!]
+    param_id: [u32!]
+]
+
+clap-audio-buffer!: make c-struct! [
+    data32: [c-pointer!]
+    data64: [c-pointer!]
+    channel_count: [u32!]
+    latency: [u32!]
+    constant_mask: [u64!]
+]
+
+clap-input-events!: make c-struct! [
+    ctx: [c-pointer!]
+    size: [c-fn! [:clap-input-events!] return: [u32!]]
+    get: [c-fn! [:clap-input-events! u32!] return: [c-pointer!]]
+]
+
+clap-output-events!: make c-struct! [
+    ctx: [c-pointer!]
+    try_push: [c-fn! [:clap-output-events! :clap-event-header!] return: [logic!]]
+]
+
+clap-process!: make c-struct! [
+    steady_time: [i64!]
+    frames_count: [u32!]
+    transport: [c-pointer!]
+    audio_inputs: [c-pointer!]
+    audio_outputs: [c-pointer!]
+    audio_inputs_count: [u32!]
+    audio_outputs_count: [u32!]
+    in_events: [:clap-input-events!]
+    out_events: [c-pointer!]
+]
+
+clap-audio-port-info!: make c-struct! [
+    id: [u32!]
+    name: [c-array! [u8! 256]]
+    flags: [u32!]
+    channel_count: [u32!]
+    port_type: [c-string!]
+    in_place_pair: [u32!]
+]
+
+clap-note-port-info!: make c-struct! [
+    id: [u32!]
+    supported_dialects: [u32!]
+    preferred_dialect: [u32!]
+    name: [c-array! [u8! 256]]
+]
+
+clap-param-info!: make c-struct! [
+    id: [u32!]
+    flags: [u32!]
+    cookie: [c-pointer!]
+    name: [c-array! [u8! 256]]
+    module: [c-array! [u8! 1024]]
+    min_value: [f64!]
+    max_value: [f64!]
+    default_value: [f64!]
+]
+
+clap-window!: make c-struct! [
+    api: [c-string!]
+    ptr: [c-pointer!]
+]
+
+recoil-clap-gui-backend-state!: make c-struct! [
+    controller: [c-pointer!]
+]
+
+brom-preset-parameter!: make c-struct! [
+    id: [u32!]
+    steps: [u32!]
+    minimum: [f64!]
+    maximum: [f64!]
+    default_value: [f64!]
+    key: [c-array! [u8! 128]]
+]
+
+brom-preset-schema!: make c-struct! [
+    count: [u32!]
+    version: [u32!]
+    parameters: [c-array! [brom-preset-parameter! 256]]
+]
+
+brom-preset-snapshot!: make c-struct! [
+    count: [i32!]
+    index: [i32!]
+    values: [c-array! [f64! 256]]
+]
+
+brom-preset-identity!: make c-struct! [
+    key: [c-array! [u8! 128]]
+    display_name: [c-array! [u8! 256]]
+    kind: [u32!]
+    reserved: [u32!]
+]
+
+brom-preset-catalog-factory-entry!: make c-struct! [
+    identity: [brom-preset-identity!]
+]
+
+brom-preset-catalog-factory-bank!: make c-struct! [
+    entries: [c-pointer!]
+    count: [u32!]
+]
+
+brom-preset-catalog-factory-array!: make c-struct! [
+    entries: [c-array! [brom-preset-catalog-factory-entry! 128]]
+]
+
+brom-preset-catalog-entry!: make c-struct! [
+    identity: [brom-preset-identity!]
+    reserved: [u32!]
+]
+
+brom-preset-view!: make c-struct! [
+    generation: [u64!]
+    working_revision: [u64!]
+    publication_sequence: [u64!]
+    working: [brom-preset-snapshot!]
+    reference: [brom-preset-snapshot!]
+    baseline: [brom-preset-snapshot!]
+    working_identity: [brom-preset-identity!]
+    reference_identity: [brom-preset-identity!]
+    audible_side: [u32!]
+    changed: [logic!]
+    status: [c-array! [u8! 256]]
+]
+
+brom-preset-commit!: make c-struct! [
+    view: [brom-preset-view!]
+    apply_parameters: [logic!]
+    reset_voices: [logic!]
+    publish_view: [logic!]
+]
+
+brom-preset-identity-kind-factory: as u32! 1
+brom-preset-identity-kind-user: as u32! 2
+
+brom-clap-instance!: make c-struct! [
+    plugin: [clap-plugin!]
+    host: [c-pointer!]
+    core: [c-pointer!]
+    voice_active: [c-array! [logic! 64]]
+    voice_note_ids: [c-array! [i32! 64]]
+    voice_port_indexes: [c-array! [i32! 64]]
+    voice_channels: [c-array! [i32! 64]]
+    voice_keys: [c-array! [i32! 64]]
+    gui_edit_flags: [c-array! [u8! 256]]
+    gui_edit_values: [c-array! [f64! 256]]
+    preset_tx: [c-pointer!]
+    preset_schema: [brom-preset-schema!]
+    preset_active: [logic!]
+    preset_accepted_generation: [u64!]
+    preset_load_pending: [logic!]
+    preset_load_location_kind: [u32!]
+    preset_load_location: [c-array! [u8! 1024]]
+    gui: [recoil-clap-gui-backend-state!]
+]
+
+; The length has to be an integer literal -- a word, a paren and `comptime` are
+; all rejected with P1712 -- so this number cannot name BROM-MAX-STATE-BYTES.
+; Everything that bounds a write therefore measures THIS struct with size-of
+; rather than trusting the constant to match: brom-state-capacity below is the
+; single source of truth, and a drift between the two can no longer overflow
+; anything.
+;
+; They did drift. This was 4096 against a 16384 ceiling, so an engine declaring
+; more than 4096 bytes wrote past the end on save and had that much read into it
+; on load. Loos, at 108 bytes, never noticed; Mach's 16384-byte preset-text
+; state segfaulted every state test.
+brom-state-buffer!: make c-struct! [
+    data: [c-array! [u8! 16384]]
+]
+
+brom-state-capacity: func [
+    "Bytes the state scratch buffer actually holds, measured from the struct."
+    return: [i32!] "Capacity in bytes."
+] [
+    return as i32! size-of brom-state-buffer!
+]
+
+clap-plugin-audio-ports!: make c-struct! [
+    count: [c-fn! [:clap-plugin! logic!] return: [u32!]]
+    get: [c-fn! [:clap-plugin! u32! logic! :clap-audio-port-info!] return: [logic!]]
+]
+
+clap-plugin-note-ports!: make c-struct! [
+    count: [c-fn! [:clap-plugin! logic!] return: [u32!]]
+    get: [c-fn! [:clap-plugin! u32! logic! :clap-note-port-info!] return: [logic!]]
+]
+
+clap-plugin-params!: make c-struct! [
+    count: [c-fn! [:clap-plugin!] return: [u32!]]
+    get_info: [c-fn! [:clap-plugin! u32! :clap-param-info!] return: [logic!]]
+    get_value: [c-fn! [:clap-plugin! u32! c-pointer!] return: [logic!]]
+    value_to_text: [c-fn! [:clap-plugin! u32! f64! c-pointer! u32!] return: [logic!]]
+    text_to_value: [c-fn! [:clap-plugin! u32! c-string! c-pointer!] return: [logic!]]
+    flush: [c-fn! [:clap-plugin! :clap-input-events! c-pointer!] return: [none!]]
+]
+
+clap-ostream!: make c-struct! [
+    ctx: [c-pointer!]
+    write: [c-fn! [:clap-ostream! c-pointer! u64!] return: [i64!]]
+]
+
+clap-istream!: make c-struct! [
+    ctx: [c-pointer!]
+    read: [c-fn! [:clap-istream! c-pointer! u64!] return: [i64!]]
+]
+
+clap-plugin-state!: make c-struct! [
+    save: [c-fn! [:clap-plugin! :clap-ostream!] return: [logic!]]
+    load: [c-fn! [:clap-plugin! :clap-istream!] return: [logic!]]
+]
+
+clap-plugin-state-context!: make c-struct! [
+    save: [c-fn! [:clap-plugin! :clap-ostream! u32!] return: [logic!]]
+    load: [c-fn! [:clap-plugin! :clap-istream! u32!] return: [logic!]]
+]
+
+clap-plugin-gui!: make c-struct! [
+    is_api_supported: [c-fn! [:clap-plugin! c-string! logic!] return: [logic!]]
+    get_preferred_api: [c-fn! [:clap-plugin! c-pointer! c-pointer!] return: [logic!]]
+    create: [c-fn! [:clap-plugin! c-string! logic!] return: [logic!]]
+    destroy: [c-fn! [:clap-plugin!] return: [none!]]
+    set_scale: [c-fn! [:clap-plugin! f64!] return: [logic!]]
+    get_size: [c-fn! [:clap-plugin! c-pointer! c-pointer!] return: [logic!]]
+    can_resize: [c-fn! [:clap-plugin!] return: [logic!]]
+    get_resize_hints: [c-fn! [:clap-plugin! c-pointer!] return: [logic!]]
+    adjust_size: [c-fn! [:clap-plugin! c-pointer! c-pointer!] return: [logic!]]
+    set_size: [c-fn! [:clap-plugin! u32! u32!] return: [logic!]]
+    set_parent: [c-fn! [:clap-plugin! c-pointer!] return: [logic!]]
+    set_transient: [c-fn! [:clap-plugin! c-pointer!] return: [logic!]]
+    suggest_title: [c-fn! [:clap-plugin! c-string!] return: [none!]]
+    show: [c-fn! [:clap-plugin!] return: [logic!]]
+    hide: [c-fn! [:clap-plugin!] return: [logic!]]
+]
+
+clap-plugin-timer-support!: make c-struct! [
+    on_timer: [c-fn! [:clap-plugin! u32!] return: [none!]]
+]
+
+
+clap-version-init: make clap-version! [
+    major: CLAP_VERSION_MAJOR
+    minor: CLAP_VERSION_MINOR
+    revision: CLAP_VERSION_REVISION
+]
+
+feature-list: make c-pointer! as c-pointer! recoil_clap_features_list
+
+; Filled from the engine at registration rather than initialized statically,
+; because its identity strings belong to the plug-in. The host only reads it
+; through get_plugin_descriptor, which it cannot call before entry init.
+clap-descriptor: make [#mutable clap-plugin-descriptor!] make clap-plugin-descriptor! [
+    clap_version: clap-version-init
+    id: (as c-string! "")
+    name: (as c-string! "")
+    vendor: (as c-string! "")
+    url: (as c-string! "")
+    manual_url: (as c-string! "")
+    support_url: (as c-string! "")
+    version: (as c-string! "")
+    description: (as c-string! "")
+    features: feature-list
+]
+
+brom-clap-init-engine: func [
+    "Validate the linked engine and mirror its identity into the CLAP descriptor. Called from the CLAP entry init hook, which a host always runs before asking for the factory."
+    return: [logic!] "False when the engine declares more voices, parameters or state than the shell can track."
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    ; Reject rather than overrun: the per-instance voice and parameter tables
+    ; below are fixed-size, so an engine that wants more slots than the shell
+    ; was compiled for has to fail loudly at load time.
+    if eng/max-voices > BROM-MAX-VOICES [return false]
+    if eng/param-count > BROM-MAX-PARAMS [return false]
+    ; The state scratch buffer is a fixed c-array! for the same reason, and
+    ; state-save writes state-size bytes into it. Measured from the buffer, not
+    ; from BROM-MAX-STATE-BYTES: the constant is what plug-in authors read, so
+    ; it must not also be what bounds the write, or the two can drift apart
+    ; unnoticed -- which is exactly how this overflowed.
+    if eng/state-size > brom-state-capacity [return false]
+    ; And if the advertised ceiling ever exceeds the real buffer, say so at load
+    ; time instead of letting a conforming plug-in overrun it.
+    if BROM-MAX-STATE-BYTES > brom-state-capacity [return false]
+    clap-descriptor/id: eng/id
+    clap-descriptor/name: eng/name
+    clap-descriptor/vendor: eng/vendor
+    clap-descriptor/version: eng/version
+    clap-descriptor/description: eng/description
+    if eng/factory-count > 0 [
+        factory-count: either eng/factory-count > 128 [as u32! 128] [as u32! eng/factory-count]
+        factory-array: make [#mutable brom-preset-catalog-factory-array!] none
+        repeat preset-index factory-count [
+            text: preset-factory-text :eng preset-index
+            copy-preset-identity :factory-array/entries/:preset-index/identity
+                (preset-factory-key :eng preset-index)
+                (preset-factory-name :eng preset-index)
+                brom-preset-identity-kind-factory
+        ]
+        bank: make [#mutable brom-preset-catalog-factory-bank!] none
+        bank/entries: addr-of factory-array/entries/0
+        bank/count: factory-count
+        catalog: make [#mutable c-pointer!] none
+        directory: make string! preset-dir :eng
+        catalog-result: either preset-ensure-dir :eng [
+            preset-catalog-api/catalog-refresh (as c-string! directory)
+                (addr-of bank) (addr-of catalog)
+        ] [1]
+        catalog-size: either catalog-result = 0 [
+            preset-catalog-api/catalog-count catalog
+        ] [factory-count]
+        discovery-count: either catalog-size > 128 [as u32! 128] [catalog-size]
+        helpers/preset-discovery-init eng/id eng/name eng/vendor discovery-count
+        repeat preset-index discovery-count [
+            entry: make [#mutable brom-preset-catalog-entry!] none
+            entry-read: either catalog-result = 0 [
+                preset-catalog-api/catalog-read catalog (as u32! preset-index)
+                    (addr-of entry) = 0
+            ] [
+                entry/identity: factory-array/entries/:preset-index/identity
+                true
+            ]
+            if entry-read [
+                title: preset-cstr-string (addr-of entry/identity/display_name/0)
+                key: preset-cstr-string (addr-of entry/identity/key/0)
+                user-filename: copy skip key 5
+                description: make string! ""
+                text: make string! ""
+                if preset-index < factory-count [
+                    text: preset-factory-text :eng (as i32! preset-index)
+                    description: preset-description-of :text
+                ]
+                cached: either entry/identity/kind = brom-preset-identity-kind-user [
+                    file-path: rejoin [directory "/" user-filename]
+                    make logic! helpers/preset-discovery-add-user (as u32! preset-index)
+                        (as c-string! title) (as c-string! key) (as c-string! description)
+                        (as c-string! file-path)
+                ] [
+                    make logic! helpers/preset-discovery-add (as u32! preset-index)
+                        (as c-string! title) (as c-string! key) (as c-string! description)
+                ]
+                if all [cached preset-index < factory-count] [
+                    repeat feature-index preset-feature-count :text [
+                        feature: preset-feature-at :text feature-index
+                        added: make logic! helpers/preset-discovery-add-feature
+                            (as u32! preset-index) (as c-string! feature)
+                        unused added
+                    ]
+                ]
+            ]
+        ]
+        if catalog-result = 0 [preset-catalog-api/catalog-release catalog]
+    ]
+    return true
+]
+
+find-voice-slot: func [
+    instance-raw [c-pointer!]
+    note-id [i32!]
+    key [i32!]
+    return: [i32!]
+] [
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    ; Brom owns the stealing policy and the engine supplies the facts it ranks
+    ; on -- the shell must not decide this from its own voice table, which
+    ; records which host note owns a slot rather than whether the slot is still
+    ; sounding, and so would steal voices that are mid-release.
+    ;
+    ; Whichever slot comes back has its host-side bookkeeping cleared, so a
+    ; stolen voice stops being attributed to the note it used to play.
+    selected: make i32! either eng/custom-voice-slot [
+        eng/voice-slot-fn instance/core note-id key
+    ] [
+        brom-select-voice :eng instance/core
+    ]
+    if all [selected >= 0 selected < eng/max-voices] [
+        instance/voice_active/:selected: false
+        instance/voice_note_ids/:selected: -1
+        instance/voice_port_indexes/:selected: -1
+        instance/voice_channels/:selected: -1
+        instance/voice_keys/:selected: -1
+    ]
+    return selected
+]
+
+lookup-param: func [
+    "Fill `out` with the registered engine's description of parameter `param-id`."
+    param-id [u32!] "CLAP parameter id, as the host sent it."
+    :out [c-pointer!] "Borrowed address of a caller-owned param-info! to fill."
+    return: [logic!] "False when no parameter carries that id."
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    ; Scanned by id rather than indexed, because CLAP ids are opaque to the host
+    ; and an engine is free to make them sparse or stable-across-versions. Both
+    ; current plug-ins number theirs 0..n-1, so this hits on the first probe.
+    if param-id < (as u32! eng/param-count) [
+        if engine-param-info :eng (as i32! param-id) :out [
+            probe-info: make [#mutable param-info!] as param-info! :out
+            if probe-info/id = param-id [return true]
+        ]
+    ]
+    repeat index eng/param-count [
+        if engine-param-info :eng index :out [
+            info: make [#mutable param-info!] as param-info! :out
+            if info/id = param-id [return true]
+        ]
+    ]
+    return false
+]
+
+blank-param-info: func [
+    "A zeroed param-info! for the lookup-miss path."
+    return: [param-info!] "All fields zero, unit range, empty strings."
+] [
+    return make param-info! [
+        id: 0
+        name: (as c-string! "")
+        module: (as c-string! "")
+        default-value: 0.0
+        range: make param-range! [
+            lo: 0.0 hi: 1.0 skew: 1.0 symmetric: 0 steps: 0 kind: 0
+        ]
+    ]
+]
+
+voice-matches-event: func [
+    instance-raw [c-pointer!]
+    slot-index [i32!]
+    note-id [i32!]
+    port-index [i32!]
+    channel [i32!]
+    key [i32!]
+    return: [logic!]
+] [
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    if not instance/voice_active/:slot-index [return false]
+    if all [note-id >= 0 instance/voice_note_ids/:slot-index <> note-id] [return false]
+    if all [port-index >= 0 instance/voice_port_indexes/:slot-index <> port-index] [return false]
+    if all [channel >= 0 instance/voice_channels/:slot-index <> channel] [return false]
+    if all [key >= 0 instance/voice_keys/:slot-index <> key] [return false]
+    return true
+]
+
+clamp-param-value: func [
+    param-id [u32!]
+    value [f64!]
+    return: [f64!]
+] [
+    info: make [#mutable param-info!] blank-param-info
+    if not lookup-param param-id (addr-of info) [return value]
+    ; `value <> value` is the NaN test: a host that sends one gets the default
+    ; rather than a clamp, since NaN compares false against both bounds.
+    if value <> value [return info/default-value]
+    if value < info/range/lo [return info/range/lo]
+    if value > info/range/hi [return info/range/hi]
+    return value
+]
+
+param-default: func [
+    "The engine's default for a parameter, in engineering units."
+    param-id [u32!] "CLAP parameter id."
+    return: [f64!] "Default value; 0.0 when the id is unknown."
+] [
+    info: make [#mutable param-info!] blank-param-info
+    if not lookup-param param-id (addr-of info) [return 0.0]
+    return info/default-value
+]
+
+param-min: func [
+    "The low end of a parameter's range, in engineering units."
+    param-id [u32!] "CLAP parameter id."
+    return: [f64!] "Range minimum; 0.0 when the id is unknown."
+] [
+    info: make [#mutable param-info!] blank-param-info
+    if not lookup-param param-id (addr-of info) [return 0.0]
+    return info/range/lo
+]
+
+param-max: func [
+    "The high end of a parameter's range, in engineering units."
+    param-id [u32!] "CLAP parameter id."
+    return: [f64!] "Range maximum; 1.0 when the id is unknown."
+] [
+    info: make [#mutable param-info!] blank-param-info
+    if not lookup-param param-id (addr-of info) [return 1.0]
+    return info/range/hi
+]
+
+param-name: func [
+    "The display name a host shows for a parameter."
+    param-id [u32!] "CLAP parameter id."
+    return: [c-string!] "Borrowed static name owned by the engine; empty when unknown."
+] [
+    info: make [#mutable param-info!] blank-param-info
+    if not lookup-param param-id (addr-of info) [return as c-string! ""]
+    return info/name
+]
+
+param-module: func [
+    "The group a host files a parameter under."
+    param-id [u32!] "CLAP parameter id."
+    return: [c-string!] "Borrowed static group name; empty means ungrouped."
+] [
+    info: make [#mutable param-info!] blank-param-info
+    if not lookup-param param-id (addr-of info) [return as c-string! ""]
+    return info/module
+]
+
+parse-param-text: func [
+    text [c-string!]
+    out-value [c-pointer!]
+    return: [logic!]
+] [
+    if none? text [return false]
+    if none? out-value [return false]
+    text-string: make string! text
+    if not parse text-string [number-text end] [return false]
+    parsed: make f64! stdlib-ffi/strtod (as c-string! text-string) (as c-pointer! 0)
+    unsafe/memcpy out-value (addr-of parsed) 8
+    return true
+]
+
+format-param-text: func [
+    value [f64!]
+    out-buffer [c-pointer!]
+    capacity [u32!]
+    return: [logic!]
+] [
+    if none? out-buffer [return false]
+    if capacity = 0 [return false]
+    written: make i32! stdio-ffi/snprintf-f64 out-buffer (as i32! capacity) "%.2f" value
+    return all [written >= 0 written < capacity]
+]
+
+input-event-header-ptr: func [
+    :events [clap-input-events!]
+    index [u32!]
+    return: [c-pointer!]
+] [
+    if none? events [return as c-pointer! 0]
+    return events/get events index
+]
+
+input-event-is-core-type: func [
+    :events [clap-input-events!]
+    index [u32!]
+    event-type [i32!]
+    return: [logic!]
+] [
+    raw-event: make c-pointer! input-event-header-ptr :events index
+    if none? raw-event [return false]
+    header: make clap-event-header! as clap-event-header! raw-event
+    return all [
+        header/space_id = CLAP_CORE_EVENT_SPACE_ID
+        header/type = event-type
+    ]
+]
+
+input-event-is-note-end: func [
+    :events [clap-input-events!]
+    index [u32!]
+    return: [logic!]
+] [
+    raw-event: make c-pointer! input-event-header-ptr :events index
+    if none? raw-event [return false]
+    header: make clap-event-header! as clap-event-header! raw-event
+    return all [
+        header/space_id = CLAP_CORE_EVENT_SPACE_ID
+        any [header/type = CLAP_EVENT_NOTE_OFF header/type = CLAP_EVENT_NOTE_CHOKE]
+    ]
+]
+
+output-param-value: func [
+    :out-events [clap-output-events!]
+    param-id [u32!]
+    value [f64!]
+    return: [logic!]
+] [
+    if none? out-events [return false]
+    null-cookie: make c-pointer! as c-pointer! 0
+    event: make clap-event-param-value! [
+        header: make clap-event-header! [
+            size: 40
+            time: 0
+            space_id: CLAP_CORE_EVENT_SPACE_ID
+            type: CLAP_EVENT_PARAM_VALUE
+            flags: 0
+        ]
+        param_id: param-id
+        cookie: null-cookie
+        note_id: -1
+        port_index: -1
+        channel: -1
+        key: -1
+        value: value
+    ]
+    return out-events/try_push out-events addr-of event/header
+]
+
+output-param-gesture: func [
+    :out-events [clap-output-events!]
+    param-id [u32!]
+    event-type [u16!]
+    return: [logic!]
+] [
+    if none? out-events [return false]
+    event: make clap-event-param-gesture! [
+        header: make clap-event-header! [
+            size: as u32! size-of clap-event-param-gesture!
+            time: 0
+            space_id: CLAP_CORE_EVENT_SPACE_ID
+            type: event-type
+            flags: 0
+        ]
+        param_id: param-id
+    ]
+    return out-events/try_push out-events addr-of event/header
+]
+
+clear-u8-array-256: func [
+    :buf [clap-audio-port-info!]
+    return: [none!]
+] [
+    repeat idx CLAP_NAME_SIZE [
+        buf/name/:idx: as u8! 0
+    ]
+]
+
+clear-note-name-256: func [
+    :buf [clap-note-port-info!]
+    return: [none!]
+] [
+    repeat idx CLAP_NAME_SIZE [
+        buf/name/:idx: as u8! 0
+    ]
+]
+
+clear-param-name-256: func [
+    :buf [clap-param-info!]
+    return: [none!]
+] [
+    repeat idx CLAP_NAME_SIZE [
+        buf/name/:idx: as u8! 0
+    ]
+]
+
+clear-param-module-1024: func [
+    :buf [clap-param-info!]
+    return: [none!]
+] [
+    repeat idx CLAP_PATH_SIZE [
+        buf/module/:idx: as u8! 0
+    ]
+]
+
+copy-audio-port-name: func [
+    :buf [clap-audio-port-info!]
+    text [c-string!]
+    return: [none!]
+] [
+    clear-u8-array-256 :buf
+    if none? text [return none]
+    text-len: make i32! as i32! length? text
+    copy-len: either text-len < (CLAP_NAME_SIZE - 1) [text-len] [CLAP_NAME_SIZE - 1]
+    repeat idx copy-len [
+        buf/name/:idx: as u8! text/:idx
+    ]
+]
+
+copy-note-port-name: func [
+    :buf [clap-note-port-info!]
+    text [c-string!]
+    return: [none!]
+] [
+    clear-note-name-256 :buf
+    if none? text [return none]
+    text-len: make i32! as i32! length? text
+    copy-len: either text-len < (CLAP_NAME_SIZE - 1) [text-len] [CLAP_NAME_SIZE - 1]
+    repeat idx copy-len [
+        buf/name/:idx: as u8! text/:idx
+    ]
+]
+
+copy-param-name: func [
+    :buf [clap-param-info!]
+    text [c-string!]
+    return: [none!]
+] [
+    clear-param-name-256 :buf
+    if none? text [return none]
+    text-len: make i32! as i32! length? text
+    copy-len: either text-len < (CLAP_NAME_SIZE - 1) [text-len] [CLAP_NAME_SIZE - 1]
+    repeat idx copy-len [
+        buf/name/:idx: as u8! text/:idx
+    ]
+]
+
+copy-param-module: func [
+    :buf [clap-param-info!]
+    text [c-string!]
+    return: [none!]
+] [
+    clear-param-module-1024 :buf
+    if none? text [return none]
+    text-len: make i32! as i32! length? text
+    copy-len: either text-len < (CLAP_PATH_SIZE - 1) [text-len] [CLAP_PATH_SIZE - 1]
+    repeat idx copy-len [
+        buf/module/:idx: as u8! text/:idx
+    ]
+]
+
+fill-audio-port-info: func [
+    :info [clap-audio-port-info!]
+    id [u32!]
+    flags [u32!]
+    channel-count [u32!]
+    name [c-string!]
+    port-type [c-string!]
+    in-place-pair [u32!]
+    return: [none!]
+] [
+    info/id: id
+    info/flags: flags
+    info/channel_count: channel-count
+    info/port_type: port-type
+    info/in_place_pair: in-place-pair
+    copy-audio-port-name :info name
+]
+
+fill-note-port-info: func [
+    :info [clap-note-port-info!]
+    id [u32!]
+    supported-dialects [u32!]
+    preferred-dialect [u32!]
+    name [c-string!]
+    return: [none!]
+] [
+    info/id: id
+    info/supported_dialects: supported-dialects
+    info/preferred_dialect: preferred-dialect
+    copy-note-port-name :info name
+]
+
+fill-param-info: func [
+    :info [clap-param-info!]
+    id [u32!]
+    flags [u32!]
+    name [c-string!]
+    module [c-string!]
+    min-value [f64!]
+    max-value [f64!]
+    default-value [f64!]
+    return: [none!]
+] [
+    info/id: id
+    info/flags: flags
+    info/cookie: none
+    info/min_value: min-value
+    info/max_value: max-value
+    info/default_value: default-value
+    copy-param-name :info name
+    copy-param-module :info module
+]
+
+plugin-instance-raw: func [
+    :plugin [clap-plugin!]
+    return: [c-pointer!]
+] [
+    if none? plugin [return as c-pointer! 0]
+    return plugin/plugin_data
+]
+
+plugin-instance-set-param: func [
+    "Write one host parameter and clear preset identity only for a real change."
+    :instance-raw [c-pointer!] "Borrowed brom-clap-instance! pointer."
+    param-id [u32!] "CLAP parameter id."
+    value [f64!] "New value in engineering units."
+    return: [logic!] "False when the instance or id is unknown."
+] [
+    if none? instance-raw [return false]
+    eng: make [#mutable engine!] as engine! active-engine
+    if param-id >= (as u32! eng/param-count) [return false]
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    if not eng/set-param-fn instance/core param-id (clamp-param-value param-id value) [return false]
+    canonical: make f64! eng/get-param-fn instance/core param-id
+    if not helpers/preset-mailbox-active-matches instance/preset_mailbox param-id canonical [
+        helpers/preset-mailbox-clear instance/preset_mailbox
+    ]
+    return true
+]
+
+plugin-instance-get-param: func [
+    "Read one parameter from an instance into a caller-owned f64 slot."
+    instance-raw [c-pointer!] "brom-clap-instance! pointer."
+    param-id [u32!] "CLAP parameter id."
+    out-value [c-pointer!] "Address of a caller-owned f64! to fill."
+    return: [logic!] "False when the instance or id is unknown."
+] [
+    if any [none? instance-raw none? out-value] [return false]
+    eng: make [#mutable engine!] as engine! active-engine
+    if param-id >= (as u32! eng/param-count) [return false]
+    instance: make brom-clap-instance! as brom-clap-instance! instance-raw
+    value: make f64! eng/get-param-fn instance/core param-id
+    unsafe/memcpy out-value (addr-of value) 8
+    return true
+]
+
+request-host-param-flush: func [
+    :instance-raw [c-pointer!]
+    return: [none!]
+] [
+    if none? instance-raw [return none]
+    instance: make brom-clap-instance! as brom-clap-instance! instance-raw
+    if none? instance/host [return none]
+    host: make clap-host! as clap-host! instance/host
+    extension-raw: make c-pointer! host/get_extension :host CLAP_EXT_PARAMS
+    if none? extension-raw [return none]
+    extension: make clap-host-params! as clap-host-params! extension-raw
+    extension/request_flush :host
+    return none
+]
+
+request-host-param-rescan: func [
+    :instance-raw [c-pointer!]
+    return: [none!]
+] [
+    if none? instance-raw [return none]
+    instance: make brom-clap-instance! as brom-clap-instance! instance-raw
+    if none? instance/host [return none]
+    host: make clap-host! as clap-host! instance/host
+    extension-raw: make c-pointer! host/get_extension :host CLAP_EXT_PARAMS
+    if none? extension-raw [return none]
+    extension: make clap-host-params! as clap-host-params! extension-raw
+    extension/rescan :host CLAP_PARAM_RESCAN_VALUES
+    return none
+]
+
+request-host-main-callback: func [
+    "Ask the host to deliver the plug-in's main-thread completion callback."
+    :instance-raw [c-pointer!] "Borrowed brom-clap-instance! pointer."
+    return: [none!] "No value."
+] [
+    if none? instance-raw [return none]
+    instance: make brom-clap-instance! as brom-clap-instance! instance-raw
+    if none? instance/host [return none]
+    host: make clap-host! as clap-host! instance/host
+    host/request_callback :host
+    return none
+]
+
+notify-host-preset-load: func [
+    :instance-raw [c-pointer!] "Borrowed brom-clap-instance!."
+    location-kind [u32!] "CLAP discovery location kind."
+    :location [c-pointer!] "Borrowed file location, or none for plug-in content."
+    key [c-string!] "Preset load key reported back to the host."
+    success [logic!] "Whether the preset was applied."
+    return: [none!]
+] [
+    if none? instance-raw [return none]
+    instance: make brom-clap-instance! as brom-clap-instance! instance-raw
+    if none? instance/host [return none]
+    host: make clap-host! as clap-host! instance/host
+    extension-raw: make c-pointer! host/get_extension :host CLAP_EXT_PRESET_LOAD
+    if none? extension-raw [return none]
+    extension: make clap-host-preset-load! as clap-host-preset-load! extension-raw
+    either success [
+        extension/loaded :host location-kind
+            (as c-string! location) key
+    ] [
+        extension/on_error :host location-kind
+            (as c-string! location) key 0 (as c-string! "Preset could not be loaded")
+    ]
+    return none
+]
+
+factory-preset-fill: func [
+    index [u32!]
+    field [i32!]
+    feature-index [u32!]
+    :out [c-pointer!]
+    capacity [u32!]
+    return: [logic!]
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    if any [none? out index >= (as u32! (preset-factory-count :eng))] [return false]
+    text: preset-factory-text :eng (as i32! index)
+    value: make [#mutable string!] ""
+    if field = 0 [value: preset-factory-name :eng (as i32! index)]
+    if field = 1 [value: preset-factory-key :eng (as i32! index)]
+    if field = 2 [value: preset-description-of :text]
+    if field = 3 [value: preset-feature-at :text (as i32! feature-index)]
+    return preset-fill-buffer :value :out (as i32! capacity)
+]
+
+recoil-clap-factory-preset-count: c-fn! [
+    #export
+    return: [u32!]
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    return as u32! (preset-factory-count :eng)
+]
+
+recoil-clap-factory-preset-name: c-fn! [
+    #export
+    index [u32!] out [c-pointer!] capacity [u32!]
+    return: [logic!]
+] [
+    return factory-preset-fill index 0 0 :out capacity
+]
+
+recoil-clap-factory-preset-key: c-fn! [
+    #export
+    index [u32!] out [c-pointer!] capacity [u32!]
+    return: [logic!]
+] [
+    return factory-preset-fill index 1 0 :out capacity
+]
+
+recoil-clap-factory-preset-description: c-fn! [
+    #export
+    index [u32!] out [c-pointer!] capacity [u32!]
+    return: [logic!]
+] [
+    return factory-preset-fill index 2 0 :out capacity
+]
+
+recoil-clap-factory-preset-feature-count: c-fn! [
+    #export
+    index [u32!]
+    return: [u32!]
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    if index >= (as u32! (preset-factory-count :eng)) [return 0]
+    text: preset-factory-text :eng (as i32! index)
+    return as u32! preset-feature-count :text
+]
+
+recoil-clap-factory-preset-feature: c-fn! [
+    #export
+    index [u32!] feature-index [u32!] out [c-pointer!] capacity [u32!]
+    return: [logic!]
+] [
+    return factory-preset-fill index 3 feature-index :out capacity
+]
+
+copy-preset-identity: func [
+    :identity [brom-preset-identity!]
+    :key [string!]
+    :display-name [string!]
+    kind [u32!]
+    return: [none!]
+] [
+    unsafe/memset (addr-of identity) 0 (size-of brom-preset-identity!)
+    repeat index (length? key) [identity/key/:index: as u8! key/:index]
+    identity/key/(length? key): as u8! 0
+    repeat index (length? display-name) [identity/display_name/:index: as u8! display-name/:index]
+    identity/display_name/(length? display-name): as u8! 0
+    identity/kind: kind
+    return none
+]
+
+remember-preset-location: func [
+    :instance [brom-clap-instance!]
+    location-kind [u32!]
+    :location [string!]
+    return: [none!]
+] [
+    instance/preset_load_location_kind: location-kind
+    unsafe/memset (addr-of instance/preset_load_location/0) 0 1024
+    if (length? location) > 0 [
+        count: make i32! either (length? location) > 1023 [1023] [length? location]
+        repeat index count [instance/preset_load_location/:index: as u8! location/:index]
+        instance/preset_load_location/:count: as u8! 0
+    ]
+    instance/preset_load_pending: true
+    return none
+]
+
+initialize-preset-transaction: func [
+    :instance [brom-clap-instance!]
+    :engine [engine!]
+    return: [logic!]
+] [
+    if not brom-preset-schema-read :engine (addr-of instance/preset_schema) [return false]
+    initial: make [#mutable brom-preset-view!] none
+    initial/working/count: engine/param-count
+    initial/working/index: -1
+    repeat index engine/param-count [
+        value: make f64! engine/get-param-fn instance/core index
+        initial/working/values/:index: value
+        initial/reference/values/:index: value
+        initial/baseline/values/:index: value
+    ]
+    initial/reference/count: initial/working/count
+    initial/reference/index: -1
+    initial/baseline/count: initial/working/count
+    initial/baseline/index: -1
+    initial/generation: 1
+    instance/preset_accepted_generation: initial/generation
+    copy-preset-identity :initial/working_identity "default" "Default"
+        brom-preset-identity-kind-factory
+    copy-preset-identity :initial/reference_identity "default" "Default"
+        brom-preset-identity-kind-factory
+    instance/preset_tx: make c-pointer! helpers/preset-tx-create
+        (addr-of instance/preset_schema) (addr-of initial) (as u32! 64)
+    return not none? instance/preset_tx
+]
+
+commit-preset-boundary: func [
+    instance-raw [c-pointer!]
+    return: [logic!]
+] [
+    if none? instance-raw [return false]
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    cutoff: make u64! helpers/preset-audio-cutoff instance/preset_tx
+    commit: make [#mutable brom-preset-commit!] none
+    if not helpers/preset-audio-boundary instance/preset_tx cutoff (addr-of commit) [
+        return false
+    ]
+    eng: make [#mutable engine!] as engine! active-engine
+    if all [commit/apply_parameters instance/preset_active] [
+        if not preset-snapshot-apply :eng instance/core (addr-of commit/view/working) [
+            return false
+        ]
+    ]
+    if all [commit/reset_voices instance/preset_active] [
+        eng/reset-fn instance/core
+        repeat slot BROM-MAX-VOICES [
+            instance/voice_active/:slot: false
+            instance/voice_note_ids/:slot: -1
+            instance/voice_port_indexes/:slot: -1
+            instance/voice_channels/:slot: -1
+            instance/voice_keys/:slot: -1
+        ]
+    ]
+    either instance/preset_active [
+        helpers/preset-audio-publish instance/preset_tx (addr-of commit)
+    ] [
+        helpers/preset-audio-publish-inactive instance/preset_tx (addr-of commit)
+    ]
+    return true
+]
+
+load-factory-preset-index: func [
+    :instance-raw [c-pointer!] "Borrowed brom-clap-instance!."
+    index [i32!] "Factory bank index."
+    return: [logic!] "True when a complete snapshot was queued for commit."
+] [
+    if none? instance-raw [return false]
+    eng: make [#mutable engine!] as engine! active-engine
+    if any [index < 0 index >= (preset-factory-count :eng)] [return false]
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    snapshot: make c-pointer! helpers/preset-snapshot-create (as u32! eng/param-count) index
+    if none? snapshot [return false]
+    if not preset-factory-materialize :eng index snapshot [
+        helpers/preset-mailbox-reject instance/preset_mailbox snapshot
+        helpers/preset-mailbox-reclaim instance/preset_mailbox
+        return false
+    ]
+    identity: make [#mutable brom-preset-identity!] none
+    copy-preset-identity :identity (preset-factory-key :eng index)
+        (preset-factory-name :eng index) brom-preset-identity-kind-factory
+    generation: make [#mutable u64!] 0
+    accepted: helpers/preset-submit-load instance/preset_tx snapshot
+        (addr-of identity) (addr-of generation)
+    if accepted <> 0 [
+        helpers/preset-mailbox-reject instance/preset_mailbox snapshot
+        return false
+    ]
+    instance/preset_accepted_generation: generation
+    helpers/preset-mailbox-publish instance/preset_mailbox snapshot
+    remember-preset-location :instance (as u32! CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN) ""
+    either instance/preset_active [request-host-param-flush :instance-raw] [
+        if commit-preset-boundary :instance-raw [
+            queued: make c-pointer! helpers/preset-mailbox-take instance/preset_mailbox
+            if not none? queued [helpers/preset-mailbox-commit instance/preset_mailbox queued]
+            request-host-main-callback :instance-raw
+        ]
+    ]
+    return true
+]
+
+commit-pending-factory-preset: func [
+    "Commit the newest queued factory snapshot after the host's input events."
+    :instance-raw [c-pointer!] "Borrowed brom-clap-instance! pointer."
+    return: [none!] "No value."
+] [
+    if none? instance-raw [return none]
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    snapshot: make c-pointer! helpers/preset-mailbox-take instance/preset_mailbox
+    if not commit-preset-boundary :instance-raw [
+        if not none? snapshot [helpers/preset-mailbox-reject instance/preset_mailbox snapshot]
+        return none
+    ]
+    if not none? snapshot [helpers/preset-mailbox-commit instance/preset_mailbox snapshot]
+    request-host-main-callback :instance-raw
+    return none
+]
+
+load-user-preset-key: func [
+    instance-raw [c-pointer!]
+    :key [string!]
+    return: [logic!]
+] [
+    if any [(length? key) < 8 (copy/part key 5) <> "user:"] [return false]
+    filename: copy skip key 5
+    safe-chars: make bitset! charset "abcdefghijklmnopqrstuvwxyz0123456789-_"
+    if not parse filename [some safe-chars ".preset" end] [return false]
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    if not preset-ensure-dir :eng [return false]
+    directory: make string! preset-dir :eng
+    path: rejoin [directory "/" filename]
+    bytes: make [#mutable brom-state-buffer!] [data: []]
+    size: make i64! helpers/read-file (as c-string! path) (addr-of bytes)
+        (as u64! brom-state-capacity)
+    if size <= 0 [return false]
+    prepared: make [#mutable brom-preset-snapshot!] none
+    identity: make [#mutable brom-preset-identity!] none
+    if not brom-preset-prepare-text :eng (addr-of bytes) (as size! size)
+        (addr-of prepared) (addr-of identity) [return false]
+    display-name: preset-cstr-string (addr-of identity/display_name/0)
+    copy-preset-identity :identity key :display-name brom-preset-identity-kind-user
+    prepared/index: -1
+    snapshot: make c-pointer! helpers/preset-snapshot-create
+        (as u32! eng/param-count) -2
+    if none? snapshot [return false]
+    destination: make [#mutable brom-preset-snapshot!] as brom-preset-snapshot! snapshot
+    destination/count: prepared/count
+    destination/index: -2
+    repeat index prepared/count [destination/values/:index: prepared/values/:index]
+    generation: make [#mutable u64!] 0
+    accepted: helpers/preset-submit-load instance/preset_tx snapshot
+        (addr-of identity) (addr-of generation)
+    if accepted <> 0 [
+        helpers/preset-mailbox-reject instance/preset_mailbox snapshot
+        return false
+    ]
+    instance/preset_accepted_generation: generation
+    helpers/preset-mailbox-publish instance/preset_mailbox snapshot
+    remember-preset-location :instance (as u32! CLAP_PRESET_DISCOVERY_LOCATION_FILE) :path
+    either instance/preset_active [request-host-param-flush :instance-raw] [
+        if commit-preset-boundary :instance-raw [
+            queued: make c-pointer! helpers/preset-mailbox-take instance/preset_mailbox
+            if not none? queued [helpers/preset-mailbox-commit instance/preset_mailbox queued]
+            request-host-main-callback :instance-raw
+        ]
+    ]
+    return true
+]
+
+recoil-clap-plugin-load-preset: c-fn! [
+    #export
+    instance [c-pointer!]
+    key [c-string!]
+    location-kind [u32!]
+    location [c-string!]
+    return: [logic!]
+] [
+    if any [none? instance none? key] [return false]
+    eng: make [#mutable engine!] as engine! active-engine
+    key-text: preset-cstr-string (as c-pointer! key)
+    index: preset-factory-index-by-key :eng :key-text
+    if index < 0 [
+        if location-kind <> (as u32! CLAP_PRESET_DISCOVERY_LOCATION_FILE) [return false]
+        if none? location [return false]
+        instance-state: make [#mutable brom-clap-instance!] as brom-clap-instance! instance
+        path-text: preset-cstr-string (as c-pointer! location)
+        directory: make string! preset-dir :eng
+        filename: copy skip key-text 5
+        expected-path: rejoin [directory "/" filename]
+        if expected-path <> path-text [return false]
+        return load-user-preset-key :instance :key-text
+    ]
+    if location-kind <> (as u32! CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN) [return false]
+    if not none? location [return false]
+    return load-factory-preset-index :instance index
+]
+
+recoil-clap-plugin-load-factory-preset: c-fn! [
+    #export
+    instance [c-pointer!]
+    key [c-string!]
+    return: [logic!]
+] [
+    return recoil-clap-plugin-load-preset :instance key
+        (as u32! CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN) (as c-string! none)
+]
+
+recoil-clap-plugin-current-factory-preset: c-fn! [
+    #export
+    instance [c-pointer!]
+    return: [i32!]
+] [
+    if none? instance [return -1]
+    state: make brom-clap-instance! as brom-clap-instance! instance
+    index: make i32! helpers/preset-mailbox-current state/preset_mailbox
+    return either index >= 0 [index] [-1]
+]
+
+recoil-clap-plugin-load-factory-preset-index: c-fn! [
+    #export
+    instance [c-pointer!] index [u32!]
+    return: [logic!]
+] [
+    return load-factory-preset-index :instance (as i32! index)
+]
+
+recoil-clap-plugin-edit-param: c-fn! [
+    #export
+    :plugin [c-pointer!]
+    param-id [u32!]
+    value [f64!]
+    phase [i32!]
+    return: [logic!]
+] [
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! plugin
+    if param-id >= BROM-MAX-PARAMS [return false]
+    clamped: make f64! clamp-param-value param-id value
+    submitted: helpers/preset-submit-edit instance/preset_tx
+        instance/preset_accepted_generation param-id clamped
+    if submitted <> 0 [return false]
+    if not instance/preset_active [commit-preset-boundary plugin]
+    instance/gui_edit_values/:param-id: value
+    flag: make [#mutable u8!] instance/gui_edit_flags/:param-id
+    if phase = 0 [flag: flag | (as u8! 1)]
+    if phase = 1 [flag: flag | (as u8! 2)]
+    if phase = 2 [flag: flag | (as u8! 4)]
+    instance/gui_edit_flags/:param-id: flag
+    request-host-param-flush :plugin
+    return true
+]
+
+recoil-clap-plugin-get-param: c-fn! [
+    #export
+    plugin [c-pointer!]
+    param-id [u32!]
+    out-value [c-pointer!]
+    return: [logic!]
+] [
+    return plugin-instance-get-param plugin param-id out-value
+]
+
+apply-param-value: func [
+    :plugin [clap-plugin!]
+    param-id [u32!]
+    value [f64!]
+    return: [logic!]
+] [
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    if none? instance-raw [return false]
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    if param-id >= (as u32! eng/param-count) [return false]
+    clamped: make f64! clamp-param-value param-id value
+    canonical: make f64! clamped
+    if not helpers/preset-mailbox-active-matches instance/preset_mailbox param-id canonical [
+        helpers/preset-mailbox-clear instance/preset_mailbox
+    ]
+    either instance/preset_active [
+        apply-to-dsp: make [#mutable logic!] false
+        result: helpers/preset-audio-edit instance/preset_tx param-id canonical false
+            (addr-of apply-to-dsp)
+        if result <> 0 [return false]
+        if apply-to-dsp [return eng/set-param-fn instance/core param-id canonical]
+        return true
+    ] [
+        view: make [#mutable brom-preset-view!] none
+        if not helpers/preset-read-view instance/preset_tx (addr-of view) [return false]
+        result: helpers/preset-submit-edit instance/preset_tx view/generation param-id canonical
+        return result = 0
+    ]
+]
+
+sync-plugin-params-to-dsp: func [
+    :plugin [clap-plugin!]
+    return: [none!]
+] [
+    unused plugin
+    return none
+]
+
+plugin-reset: func [:plugin [clap-plugin!]] [
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    eng/reset-fn instance/core
+    repeat i BROM-MAX-VOICES [
+        instance/voice_active/:i: false
+        instance/voice_note_ids/:i: -1
+        instance/voice_port_indexes/:i: -1
+        instance/voice_channels/:i: -1
+        instance/voice_keys/:i: -1
+    ]
+]
+
+plugin-init: func [:plugin [clap-plugin!] return: [logic!]] [
+    sync-plugin-params-to-dsp :plugin
+    plugin-reset :plugin
+    true
+]
+
+plugin-destroy: func [:plugin [clap-plugin!]] [
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    if none? instance-raw [return none]
+    gui-destroy :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    helpers/preset-tx-destroy instance/preset_tx
+    helpers/preset-mailbox-destroy instance/preset_mailbox
+    if not none? instance/core [eng/destroy-fn instance/core]
+    unsafe/free instance-raw
+]
+
+plugin-activate: func [
+    :plugin [clap-plugin!]
+    sample-rate [f64!]
+    min-frames [i32!]
+    max-frames [i32!]
+    return: [logic!]
+] [
+    unused min-frames
+    unused max-frames
+    sync-plugin-params-to-dsp :plugin
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    eng/activate-fn instance/core sample-rate max-frames
+    resume-commit: make [#mutable brom-preset-commit!] none
+    if helpers/preset-audio-resume instance/preset_tx (addr-of resume-commit) [
+        if resume-commit/apply_parameters [
+            preset-snapshot-apply :eng instance/core (addr-of resume-commit/view/working)
+        ]
+        if resume-commit/reset_voices [eng/reset-fn instance/core]
+        helpers/preset-audio-publish instance/preset_tx (addr-of resume-commit)
+    ]
+    instance/preset_active: true
+    helpers/preset-set-active instance/preset_tx true
+    plugin-reset :plugin
+    true
+]
+
+plugin-deactivate: func [:plugin [clap-plugin!]] [
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    instance/preset_active: false
+    helpers/preset-set-active instance/preset_tx false
+]
+
+plugin-start-processing: func [:plugin [clap-plugin!] return: [logic!]] [
+    unused plugin
+    true
+]
+
+plugin-stop-processing: func [:plugin [clap-plugin!]] [
+    unused plugin
+]
+
+dispatch-input-event: func [
+    :plugin [clap-plugin!]
+    :events [clap-input-events!]
+    event-index [u32!]
+    return: [none!]
+] [
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    if input-event-is-core-type :events event-index CLAP_EVENT_PARAM_VALUE [
+        param-event: make clap-event-param-value! as clap-event-param-value! input-event-header-ptr :events event-index
+        apply-param-value :plugin param-event/param_id param-event/value
+        return none
+    ]
+    if input-event-is-core-type :events event-index CLAP_EVENT_NOTE_ON [
+        note-event: make clap-event-note! as clap-event-note! input-event-header-ptr :events event-index
+        note-id: make i32! note-event/note_id
+        port-index: make i32! as i32! note-event/port_index
+        channel: make i32! as i32! note-event/channel
+        key: make i32! as i32! note-event/key
+        ; An engine that owns its voices gets the event verbatim and the shell
+        ; keeps no slot bookkeeping for it -- there are no slots to keep.
+        if eng/core-owned-voices [
+            eng/note-event-fn instance/core true note-id channel key note-event/velocity
+            return none
+        ]
+        slot: make i32! find-voice-slot instance-raw note-id key
+        if all [slot >= 0 slot < BROM-MAX-VOICES] [
+            instance/voice_active/:slot: true
+            instance/voice_note_ids/:slot: note-id
+            instance/voice_port_indexes/:slot: port-index
+            instance/voice_channels/:slot: channel
+            instance/voice_keys/:slot: key
+            eng/note-on-fn instance/core slot key note-event/velocity
+        ]
+        return none
+    ]
+    if input-event-is-note-end :events event-index [
+        note-event: make clap-event-note! as clap-event-note! input-event-header-ptr :events event-index
+        note-id: make i32! note-event/note_id
+        port-index: make i32! as i32! note-event/port_index
+        channel: make i32! as i32! note-event/channel
+        key: make i32! as i32! note-event/key
+        if eng/core-owned-voices [
+            ; Velocity is meaningless on a release; 0.0 rather than the event's
+            ; field, which hosts fill inconsistently.
+            eng/note-event-fn instance/core false note-id channel key 0.0
+            return none
+        ]
+        repeat slot BROM-MAX-VOICES [
+            if voice-matches-event instance-raw slot note-id port-index channel key [
+                eng/note-off-fn instance/core slot
+                instance/voice_active/:slot: false
+                instance/voice_note_ids/:slot: -1
+                instance/voice_port_indexes/:slot: -1
+                instance/voice_channels/:slot: -1
+                instance/voice_keys/:slot: -1
+            ]
+        ]
+    ]
+    return none
+]
+
+plugin-process: func [:plugin [clap-plugin!] :proc [clap-process!] return: [i32!]] [
+    if none? proc [return CLAP_PROCESS_ERROR]
+    if none? proc/audio_outputs [return CLAP_PROCESS_ERROR]
+    output-count: as u32! proc/audio_outputs_count
+    if output-count < 1 [return CLAP_PROCESS_ERROR]
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    if none? instance-raw [return CLAP_PROCESS_ERROR]
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+
+    events: make clap-input-events! proc/in_events
+    event-count: either none? events [as u32! 0] [as u32! (events/size events)]
+    scratch-frames: as u32! eng/output-capacity
+    scratch-data: make c-pointer! eng/output-fn instance/core
+    if none? scratch-data [return CLAP_PROCESS_ERROR]
+    ; Read once per block like the left buffer. In mono mode it is never
+    ; dereferenced, so pointing it at the left buffer keeps the binding typed
+    ; without calling a null output-right-fn.
+    scratch-right: make c-pointer! either eng/stereo-output [
+        eng/output-right-fn instance/core
+    ] [
+        scratch-data
+    ]
+    if none? scratch-right [return CLAP_PROCESS_ERROR]
+    if scratch-frames = 0 [return CLAP_PROCESS_ERROR]
+
+    offset: make [#mutable u32!] (as u32! 0)
+    event-index: make [#mutable u32!] (as u32! 0)
+    frames: as u32! proc/frames_count
+    while [offset < frames] [
+        boundary: make [#mutable u32!] frames
+        if event-index < event-count [
+            header-raw: make c-pointer! input-event-header-ptr :events event-index
+            if not none? header-raw [
+                header: make clap-event-header! as clap-event-header! header-raw
+                boundary: header/time
+                if boundary < offset [boundary: offset]
+                if boundary > frames [boundary: frames]
+            ]
+        ]
+        while [offset < boundary] [
+            remaining: as u32! boundary - offset
+            chunk: as u32! either remaining < scratch-frames [remaining] [scratch-frames]
+            eng/process-fn instance/core (as i32! chunk)
+            either eng/stereo-output [
+                helpers/copy-audio-stereo :proc scratch-data scratch-right chunk offset 1.0 false
+            ] [
+                helpers/copy-audio :proc scratch-data chunk offset 1.0 false
+            ]
+            offset: offset + chunk
+        ]
+        while [event-index < event-count] [
+            header-raw: make c-pointer! input-event-header-ptr :events event-index
+            if none? header-raw [event-index: event-index + 1]
+            if not none? header-raw [
+                header: make clap-event-header! as clap-event-header! header-raw
+                event-time: as u32! header/time
+                if event-time > offset [break]
+                dispatch-input-event :plugin :events event-index
+                event-index: event-index + 1
+            ]
+        ]
+    ]
+
+    commit-pending-factory-preset :instance-raw
+    output-pending-gui-edits :plugin proc/out_events
+    CLAP_PROCESS_CONTINUE
+]
+
+audio-ports-count: func [:plugin [clap-plugin!] is-input [logic!] return: [u32!]] [
+    unused plugin
+    either is-input [as u32! 0] [as u32! 1]
+]
+
+audio-ports-get: func [
+    :plugin [clap-plugin!]
+    index [u32!]
+    is-input [logic!]
+    :info [clap-audio-port-info!]
+    return: [logic!]
+] [
+    unused plugin
+    if is-input [return false]
+    if index <> 0 [return false]
+    if none? info [return false]
+    fill-audio-port-info :info 0 CLAP_AUDIO_PORT_IS_MAIN 2 "Main Out" CLAP_PORT_STEREO CLAP_INVALID_ID
+    true
+]
+
+note-ports-count: func [:plugin [clap-plugin!] is-input [logic!] return: [u32!]] [
+    unused plugin
+    either is-input [as u32! 1] [as u32! 0]
+]
+
+note-ports-get: func [
+    :plugin [clap-plugin!]
+    index [u32!]
+    is-input [logic!]
+    :info [clap-note-port-info!]
+    return: [logic!]
+] [
+    unused plugin
+    if not is-input [return false]
+    if index <> 0 [return false]
+    if none? info [return false]
+    fill-note-port-info :info 0 CLAP_NOTE_DIALECT_CLAP CLAP_NOTE_DIALECT_CLAP "Main Note In"
+    true
+]
+
+audio-ports-count-cb: callback audio-ports-count [:plugin [clap-plugin!] is-input [logic!] return: [u32!]]
+audio-ports-get-cb: callback audio-ports-get [:plugin [clap-plugin!] index [u32!] is-input [logic!] :info [clap-audio-port-info!] return: [logic!]]
+note-ports-count-cb: callback note-ports-count [:plugin [clap-plugin!] is-input [logic!] return: [u32!]]
+note-ports-get-cb: callback note-ports-get [:plugin [clap-plugin!] index [u32!] is-input [logic!] :info [clap-note-port-info!] return: [logic!]]
+
+s_audio_ports: make clap-plugin-audio-ports! [
+    count: audio-ports-count-cb
+    get: audio-ports-get-cb
+]
+
+s_note_ports: make clap-plugin-note-ports! [
+    count: note-ports-count-cb
+    get: note-ports-get-cb
+]
+
+params-count: func [:plugin [clap-plugin!] return: [u32!]] [
+    unused plugin
+    eng: make [#mutable engine!] as engine! active-engine
+    as u32! eng/param-count
+]
+
+params-get-info: func [
+    :plugin [clap-plugin!]
+    index [u32!]
+    :info [clap-param-info!]
+    return: [logic!]
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    unused plugin
+    if none? info [return false]
+    if index >= (as u32! eng/param-count) [return false]
+    fill-param-info :info index CLAP_PARAM_FLAGS (param-name index) (param-module index)
+        (param-min index) (param-max index) (param-default index)
+    return true
+]
+
+params-get-value: func [
+    :plugin [clap-plugin!]
+    param-id [u32!]
+    out-value [c-pointer!]
+    return: [logic!]
+] [
+    unused plugin
+    if none? out-value [return false]
+    return plugin-instance-get-param (plugin-instance-raw :plugin) param-id out-value
+]
+
+params-value-to-text: func [
+    :plugin [clap-plugin!]
+    param-id [u32!]
+    value [f64!]
+    out-buffer [c-pointer!]
+    capacity [u32!]
+    return: [logic!]
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    if none? out-buffer [return false]
+    if param-id >= (as u32! eng/param-count) [return false]
+    clamped: make f64! clamp-param-value param-id value
+    ; An engine that renders its own text gets first refusal; the shell's
+    ; plain number formatting is the fallback, including when the engine
+    ; declines a particular id.
+    if eng/custom-param-text [
+        instance-raw: make c-pointer! plugin-instance-raw :plugin
+        if not none? instance-raw [
+            instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+            if eng/param-text-fn instance/core param-id clamped out-buffer capacity [return true]
+        ]
+    ]
+    return format-param-text clamped out-buffer capacity
+]
+
+params-text-to-value: func [
+    :plugin [clap-plugin!]
+    param-id [u32!]
+    text [c-string!]
+    out-value [c-pointer!]
+    return: [logic!]
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    if none? text [return false]
+    if none? out-value [return false]
+    if param-id >= (as u32! eng/param-count) [return false]
+    parsed: 0.0
+    ; Symmetric with value-to-text: the engine that wrote "-6.00 dB" is the one
+    ; that can read it back. parse-param-text only understands a leading number,
+    ; so without this a typed unit string would clamp to a wrong value silently.
+    handled: make [#mutable logic!] false
+    if eng/custom-param-text [
+        instance-raw: make c-pointer! plugin-instance-raw :plugin
+        if not none? instance-raw [
+            instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+            if eng/param-parse-fn instance/core param-id text (addr-of parsed) [handled: true]
+        ]
+    ]
+    if not handled [
+        if not parse-param-text text addr-of parsed [return false]
+    ]
+    clamped: make f64! clamp-param-value param-id parsed
+    unsafe/memcpy out-value (addr-of clamped) 8
+    return true
+]
+
+output-pending-gui-edits: func [
+    :plugin [clap-plugin!]
+    out-events [c-pointer!]
+    return: [none!]
+] [
+    if none? out-events [return none]
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    output-events: make clap-output-events! as clap-output-events! out-events
+    repeat param-id eng/param-count [
+        flags: make u8! instance/gui_edit_flags/:param-id
+        if (flags & (as u8! 1)) <> (as u8! 0) [
+            output-param-gesture :output-events (as u32! param-id) (as u16! CLAP_EVENT_PARAM_GESTURE_BEGIN)
+        ]
+        if (flags & (as u8! 2)) <> (as u8! 0) [
+            output-param-value :output-events (as u32! param-id) instance/gui_edit_values/:param-id
+        ]
+        if (flags & (as u8! 4)) <> (as u8! 0) [
+            output-param-gesture :output-events (as u32! param-id) (as u16! CLAP_EVENT_PARAM_GESTURE_END)
+        ]
+        instance/gui_edit_flags/:param-id: as u8! 0
+    ]
+    return none
+]
+
+params-flush: func [
+    :plugin [clap-plugin!]
+    :in-events [clap-input-events!]
+    out-events [c-pointer!]
+] [
+    if not none? in-events [
+        count: as u32! in-events/size in-events
+        repeat idx count [
+            if input-event-is-core-type :in-events idx CLAP_EVENT_PARAM_VALUE [
+                event: make clap-event-param-value! as clap-event-param-value! input-event-header-ptr :in-events idx
+                apply-param-value :plugin
+                    event/param_id
+                    event/value
+            ]
+        ]
+    ]
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    commit-pending-factory-preset :instance-raw
+    output-pending-gui-edits :plugin out-events
+]
+
+params-count-cb: callback params-count [:plugin [clap-plugin!] return: [u32!]]
+params-get-info-cb: callback params-get-info [:plugin [clap-plugin!] index [u32!] :info [clap-param-info!] return: [logic!]]
+params-get-value-cb: callback params-get-value [:plugin [clap-plugin!] param-id [u32!] out-value [c-pointer!] return: [logic!]]
+params-value-to-text-cb: callback params-value-to-text [:plugin [clap-plugin!] param-id [u32!] value [f64!] out-buffer [c-pointer!] capacity [u32!] return: [logic!]]
+params-text-to-value-cb: callback params-text-to-value [:plugin [clap-plugin!] param-id [u32!] text [c-string!] out-value [c-pointer!] return: [logic!]]
+params-flush-cb: callback params-flush [:plugin [clap-plugin!] :in-events [clap-input-events!] out-events [c-pointer!]]
+
+s_params: make clap-plugin-params! [
+    count: params-count-cb
+    get_info: params-get-info-cb
+    get_value: params-get-value-cb
+    value_to_text: params-value-to-text-cb
+    text_to_value: params-text-to-value-cb
+    flush: params-flush-cb
+]
+
+state-save: func [
+    :plugin [clap-plugin!]
+    :stream [clap-ostream!]
+    return: [logic!]
+] [
+    if none? stream [return false]
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    state: make [#mutable brom-state-buffer!] [data: []]
+    if eng/state-size > brom-state-capacity [return false]
+    view: make [#mutable brom-preset-view!] none
+    if not helpers/preset-read-view instance/preset_tx (addr-of view) [return false]
+    temporary-core: make c-pointer! eng/create-fn
+    if none? temporary-core [return false]
+    applied: preset-snapshot-apply :eng temporary-core (addr-of view/working)
+    if not applied [eng/destroy-fn temporary-core return false]
+    saved: brom-state-save :eng temporary-core (addr-of state) (as size! eng/state-size)
+    eng/destroy-fn temporary-core
+    if not saved [return false]
+    return helpers/stream-write-all stream (addr-of state) (as u64! eng/state-size)
+]
+
+state-load: func [
+    :plugin [clap-plugin!]
+    :stream [clap-istream!]
+    return: [logic!]
+] [
+    if none? stream [return false]
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    state: make [#mutable brom-state-buffer!] [data: []]
+    size: make i64! helpers/stream-read-to-end stream (addr-of state)
+        (as u64! brom-state-capacity)
+    if size <= 0 [return false]
+    return restore-preset-state-bytes :instance :eng (addr-of state) (as u64! size)
+]
+
+restore-preset-state-bytes: func [
+    :instance [brom-clap-instance!]
+    :engine [engine!]
+    bytes [c-pointer!]
+    size [u64!]
+    return: [logic!]
+] [
+    snapshot: make [#mutable brom-preset-snapshot!] none
+    identity: make [#mutable brom-preset-identity!] none
+    view: make [#mutable brom-preset-view!] none
+    session-result: helpers/preset-session-decode bytes size
+        (addr-of instance/preset_schema) engine/id (addr-of view)
+    either session-result = 0 [
+        ; The session payload already includes its identities and comparison
+        ; state. Submit it as one generation; never apply parameters here.
+    ] [
+        either brom-preset-prepare-text :engine bytes (as size! size)
+            (addr-of snapshot) (addr-of identity) [
+        identity/kind: brom-preset-identity-kind-user
+        if helpers/preset-session-migrate-legacy
+            (addr-of instance/preset_schema) (addr-of snapshot) (addr-of identity)
+            (addr-of view) <> 0 [return false]
+        ] [
+            temporary-core: make c-pointer! engine/create-fn
+            if none? temporary-core [return false]
+            loaded: brom-state-load :engine temporary-core bytes (as size! size)
+            if not loaded [engine/destroy-fn temporary-core return false]
+            snapshot/count: engine/param-count
+            snapshot/index: -1
+            repeat index engine/param-count [
+                snapshot/values/:index: engine/get-param-fn temporary-core index
+            ]
+            engine/destroy-fn temporary-core
+            copy-preset-identity :identity "legacy:unknown" "Legacy State"
+                brom-preset-identity-kind-user
+            if helpers/preset-session-migrate-legacy
+                (addr-of instance/preset_schema) (addr-of snapshot) (addr-of identity)
+                (addr-of view) <> 0 [return false]
+        ]
+    ]
+    generation: make [#mutable u64!] 0
+    if helpers/preset-submit-restore instance/preset_tx (addr-of view)
+        (addr-of generation) <> 0 [return false]
+    instance/preset_accepted_generation: generation
+    either instance/preset_active [request-host-param-flush (addr-of instance)] [none]
+    helpers/preset-mailbox-cancel instance/preset_mailbox
+    helpers/preset-mailbox-clear instance/preset_mailbox
+    request-host-param-rescan (addr-of instance)
+    return true
+]
+
+state-save-cb: callback state-save [:plugin [clap-plugin!] :stream [clap-ostream!] return: [logic!]]
+state-load-cb: callback state-load [:plugin [clap-plugin!] :stream [clap-istream!] return: [logic!]]
+
+s_state: make clap-plugin-state! [
+    save: state-save-cb
+    load: state-load-cb
+]
+
+state-save-context: func [
+    :plugin [clap-plugin!]
+    :stream [clap-ostream!]
+    context-type [u32!]
+    return: [logic!]
+] [
+    if none? stream [return false]
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    state: make [#mutable brom-state-buffer!] [data: []]
+    if context-type <> (as u32! CLAP_STATE_CONTEXT_FOR_PRESET) [
+        view: make [#mutable brom-preset-view!] none
+        if not helpers/preset-read-view instance/preset_tx (addr-of view) [return false]
+        written: make [#mutable u64!] 0
+        encoded: helpers/preset-session-encode (addr-of instance/preset_schema)
+            eng/id (addr-of view) (addr-of state) (as u64! brom-state-capacity)
+            (addr-of written)
+        if encoded <> 0 [return false]
+        return helpers/stream-write-all stream (addr-of state) written
+    ]
+    temporary-core: make c-pointer! eng/create-fn
+    if none? temporary-core [return false]
+    view: make [#mutable brom-preset-view!] none
+    if not helpers/preset-read-view instance/preset_tx (addr-of view) [
+        eng/destroy-fn temporary-core
+        return false
+    ]
+    applied: preset-snapshot-apply :eng temporary-core (addr-of view/working)
+    if not applied [eng/destroy-fn temporary-core return false]
+    written: brom-state-save-context :eng temporary-core (addr-of state)
+        (as size! brom-state-capacity) (as i32! CLAP_STATE_CONTEXT_FOR_PRESET)
+    eng/destroy-fn temporary-core
+    if written = (as size! 0) [return false]
+    return helpers/stream-write-all stream (addr-of state) (as u64! written)
+]
+
+state-load-context: func [
+    :plugin [clap-plugin!]
+    :stream [clap-istream!]
+    context-type [u32!]
+    return: [logic!]
+] [
+    ; Format-sniffing in brom-state-load already handles either origin, so a
+    ; context-saved state loads the same way state.load does.
+    unused context-type
+    return state-load :plugin :stream
+]
+
+state-save-context-cb: callback state-save-context [
+    :plugin [clap-plugin!] :stream [clap-ostream!] context-type [u32!] return: [logic!]
+]
+state-load-context-cb: callback state-load-context [
+    :plugin [clap-plugin!] :stream [clap-istream!] context-type [u32!] return: [logic!]
+]
+
+s_state_context: make clap-plugin-state-context! [
+    save: state-save-context-cb
+    load: state-load-context-cb
+]
+
+plugin-gui-state-ptr-trimmed: func [
+    :plugin [clap-plugin!]
+    return: [c-pointer!]
+] [
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    if none? instance-raw [return as c-pointer! 0]
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    return addr-of instance/gui
+]
+
+gui-is-api-supported: func [
+    :plugin [clap-plugin!]
+    api [c-string!]
+    is-floating [logic!]
+    return: [logic!]
+] [
+    unused plugin
+    return helpers/gui-is-api-supported api is-floating
+]
+
+gui-get-preferred-api: func [
+    :plugin [clap-plugin!]
+    api-out [c-pointer!]
+    floating-out [c-pointer!]
+    return: [logic!]
+] [
+    unused plugin
+    if any [none? api-out none? floating-out] [return false]
+    preferred-api: make c-string! helpers/gui-platform-api
+    if none? preferred-api [return false]
+    floating: make u8! as u8! 0
+    unsafe/memcpy api-out (addr-of preferred-api) (size-of c-pointer!)
+    unsafe/memcpy floating-out (addr-of floating) 1
+    return true
+]
+
+gui-create: func [
+    :plugin [clap-plugin!]
+    api [c-string!]
+    is-floating [logic!]
+    return: [logic!]
+] [
+    if not helpers/gui-is-api-supported api is-floating [return false]
+    gui-state: make c-pointer! plugin-gui-state-ptr-trimmed :plugin
+    if none? gui-state [return false]
+    state: make [#mutable recoil-clap-gui-backend-state!] as recoil-clap-gui-backend-state! gui-state
+    if not none? state/controller [return false]
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    eng: make [#mutable engine!] as engine! active-engine
+    state/controller: helpers/gui-create instance/host instance-raw instance/core (as u32! eng/editor-width) (as u32! eng/editor-height)
+    if none? state/controller [return false]
+    return true
+]
+
+gui-destroy: func [:plugin [clap-plugin!]] [
+    gui-state: make c-pointer! plugin-gui-state-ptr-trimmed :plugin
+    if none? gui-state [return none]
+    state: make [#mutable recoil-clap-gui-backend-state!] as recoil-clap-gui-backend-state! gui-state
+    if not none? state/controller [
+        helpers/gui-destroy state/controller
+        state/controller: as c-pointer! 0
+    ]
+]
+
+gui-set-scale: func [:plugin [clap-plugin!] scale [f64!] return: [logic!]] [
+    unused plugin
+    unused scale
+    return true
+]
+
+gui-get-size: func [
+    :plugin [clap-plugin!]
+    width-out [c-pointer!]
+    height-out [c-pointer!]
+    return: [logic!]
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    unused plugin
+    w: as u32! eng/editor-width
+    h: as u32! eng/editor-height
+    unsafe/memcpy width-out (addr-of w) 4
+    unsafe/memcpy height-out (addr-of h) 4
+    return true
+]
+
+gui-can-resize: func [:plugin [clap-plugin!] return: [logic!]] [unused plugin return false]
+
+gui-get-resize-hints: func [:plugin [clap-plugin!] hints [c-pointer!] return: [logic!]] [
+    unused plugin
+    unused hints
+    return false
+]
+
+gui-adjust-size: func [
+    :plugin [clap-plugin!]
+    width-io [c-pointer!]
+    height-io [c-pointer!]
+    return: [logic!]
+] [
+    eng: make [#mutable engine!] as engine! active-engine
+    unused plugin
+    w: as u32! eng/editor-width
+    h: as u32! eng/editor-height
+    unsafe/memcpy width-io (addr-of w) 4
+    unsafe/memcpy height-io (addr-of h) 4
+    return true
+]
+
+gui-set-size: func [:plugin [clap-plugin!] width [u32!] height [u32!] return: [logic!]] [
+    unused plugin
+    unused width
+    unused height
+    return true
+]
+
+gui-set-parent: func [:plugin [clap-plugin!] window [c-pointer!] return: [logic!]] [
+    gui-state: make c-pointer! plugin-gui-state-ptr-trimmed :plugin
+    if any [none? gui-state none? window] [return false]
+    state: make [#mutable recoil-clap-gui-backend-state!] as recoil-clap-gui-backend-state! gui-state
+    if none? state/controller [return false]
+    return helpers/gui-set-parent state/controller window
+]
+
+gui-set-transient: func [:plugin [clap-plugin!] window [c-pointer!] return: [logic!]] [
+    unused plugin
+    unused window
+    return false
+]
+
+gui-suggest-title: func [:plugin [clap-plugin!] title [c-string!]] [
+    unused plugin
+    unused title
+]
+
+gui-show: func [:plugin [clap-plugin!] return: [logic!]] [
+    gui-state: make c-pointer! plugin-gui-state-ptr-trimmed :plugin
+    if none? gui-state [return false]
+    state: make [#mutable recoil-clap-gui-backend-state!] as recoil-clap-gui-backend-state! gui-state
+    if none? state/controller [return false]
+    return helpers/gui-show state/controller
+]
+
+gui-hide: func [:plugin [clap-plugin!] return: [logic!]] [
+    gui-state: make c-pointer! plugin-gui-state-ptr-trimmed :plugin
+    if none? gui-state [return true]
+    state: make [#mutable recoil-clap-gui-backend-state!] as recoil-clap-gui-backend-state! gui-state
+    if none? state/controller [return true]
+    return helpers/gui-hide state/controller
+]
+
+plugin-on-timer: func [:plugin [clap-plugin!] timer-id [u32!]] [
+    gui-state: make c-pointer! plugin-gui-state-ptr-trimmed :plugin
+    if none? gui-state [return none]
+    state: make [#mutable recoil-clap-gui-backend-state!] as recoil-clap-gui-backend-state! gui-state
+    if not none? state/controller [helpers/gui-on-timer state/controller timer-id]
+]
+
+plugin-on-timer-cb: callback plugin-on-timer [:plugin [clap-plugin!] timer-id [u32!]]
+
+s_timer_support: make clap-plugin-timer-support! [on_timer: plugin-on-timer-cb]
+
+gui-is-api-supported-cb: callback gui-is-api-supported [
+    :plugin [clap-plugin!]
+    api [c-string!]
+    is-floating [logic!]
+    return: [logic!]
+]
+
+gui-get-preferred-api-cb: callback gui-get-preferred-api [
+    :plugin [clap-plugin!]
+    api-out [c-pointer!]
+    floating-out [c-pointer!]
+    return: [logic!]
+]
+
+gui-create-cb: callback gui-create [
+    :plugin [clap-plugin!]
+    api [c-string!]
+    is-floating [logic!]
+    return: [logic!]
+]
+
+gui-destroy-cb: callback gui-destroy [
+    :plugin [clap-plugin!]
+]
+
+gui-set-scale-cb: callback gui-set-scale [
+    :plugin [clap-plugin!]
+    scale [f64!]
+    return: [logic!]
+]
+
+gui-get-size-cb: callback gui-get-size [
+    :plugin [clap-plugin!]
+    width-out [c-pointer!]
+    height-out [c-pointer!]
+    return: [logic!]
+]
+
+gui-can-resize-cb: callback gui-can-resize [
+    :plugin [clap-plugin!]
+    return: [logic!]
+]
+
+gui-get-resize-hints-cb: callback gui-get-resize-hints [
+    :plugin [clap-plugin!]
+    hints [c-pointer!]
+    return: [logic!]
+]
+
+gui-adjust-size-cb: callback gui-adjust-size [
+    :plugin [clap-plugin!]
+    width-io [c-pointer!]
+    height-io [c-pointer!]
+    return: [logic!]
+]
+
+gui-set-size-cb: callback gui-set-size [
+    :plugin [clap-plugin!]
+    width [u32!]
+    height [u32!]
+    return: [logic!]
+]
+
+gui-set-parent-cb: callback gui-set-parent [
+    :plugin [clap-plugin!]
+    window [c-pointer!]
+    return: [logic!]
+]
+
+gui-set-transient-cb: callback gui-set-transient [
+    :plugin [clap-plugin!]
+    window [c-pointer!]
+    return: [logic!]
+]
+
+gui-suggest-title-cb: callback gui-suggest-title [
+    :plugin [clap-plugin!]
+    title [c-string!]
+]
+
+gui-show-cb: callback gui-show [
+    :plugin [clap-plugin!]
+    return: [logic!]
+]
+
+gui-hide-cb: callback gui-hide [
+    :plugin [clap-plugin!]
+    return: [logic!]
+]
+
+s_gui: make clap-plugin-gui! [
+    is_api_supported: gui-is-api-supported-cb
+    get_preferred_api: gui-get-preferred-api-cb
+    create: gui-create-cb
+    destroy: gui-destroy-cb
+    set_scale: gui-set-scale-cb
+    get_size: gui-get-size-cb
+    can_resize: gui-can-resize-cb
+    get_resize_hints: gui-get-resize-hints-cb
+    adjust_size: gui-adjust-size-cb
+    set_size: gui-set-size-cb
+    set_parent: gui-set-parent-cb
+    set_transient: gui-set-transient-cb
+    suggest_title: gui-suggest-title-cb
+    show: gui-show-cb
+    hide: gui-hide-cb
+]
+
+plugin-get-extension: func [:plugin [clap-plugin!] id [c-string!] return: [c-pointer!]] [
+    unused plugin
+    if any [
+        (string-ffi/strcmp id CLAP_EXT_PRESET_LOAD) = 0
+        (string-ffi/strcmp id CLAP_EXT_PRESET_LOAD_COMPAT) = 0
+    ] [
+        eng0: make [#mutable engine!] as engine! active-engine
+        if eng0/factory-count > 0 [return helpers/preset-load-extension]
+    ]
+    if (string-ffi/strcmp id CLAP_EXT_AUDIO_PORTS) = 0 [return addr-of s_audio_ports]
+    if (string-ffi/strcmp id CLAP_EXT_NOTE_PORTS) = 0 [return addr-of s_note_ports]
+    if (string-ffi/strcmp id CLAP_EXT_PARAMS) = 0 [return addr-of s_params]
+    if (string-ffi/strcmp id CLAP_EXT_STATE) = 0 [return addr-of s_state]
+    ; Withheld unless the engine opts in, the same way clap.gui is withheld
+    ; without has-editor -- see CLAP_EXT_STATE_CONTEXT's own extension
+    ; contract: implementing it without clap.state is invalid, and a plug-in
+    ; that has not opted in should not advertise it either.
+    if (string-ffi/strcmp id CLAP_EXT_STATE_CONTEXT) = 0 [
+        eng-sc: make [#mutable engine!] as engine! active-engine
+        if not eng-sc/has-state-context [return as c-pointer! none]
+        return addr-of s_state_context
+    ]
+    ; Withheld rather than advertised-and-failing: a plug-in with no editor that
+    ; still answers clap.gui leaves the host opening a window nothing draws.
+    if (string-ffi/strcmp id CLAP_EXT_GUI) = 0 [
+        eng: make [#mutable engine!] as engine! active-engine
+        if not eng/has-editor [return as c-pointer! none]
+        return addr-of s_gui
+    ]
+    if (string-ffi/strcmp id CLAP_EXT_TIMER_SUPPORT) = 0 [return addr-of s_timer_support]
+    return as c-pointer! none
+]
+
+plugin-on-main-thread: func [:plugin [clap-plugin!]] [
+    instance-raw: make c-pointer! plugin-instance-raw :plugin
+    if not none? instance-raw [
+        instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+        completions: as u32! helpers/preset-mailbox-take-completions instance/preset_mailbox
+        if completions > 0 [
+            helpers/preset-mailbox-reclaim instance/preset_mailbox
+            request-host-param-rescan :instance-raw
+            preset-index: make i32! helpers/preset-mailbox-current instance/preset_mailbox
+            view: make [#mutable brom-preset-view!] none
+            if all [instance/preset_load_pending
+                helpers/preset-read-view instance/preset_tx (addr-of view)] [
+                key: preset-cstr-string (addr-of view/working_identity/key/0)
+                location: either instance/preset_load_location_kind =
+                    (as u32! CLAP_PRESET_DISCOVERY_LOCATION_FILE) [
+                    addr-of instance/preset_load_location/0
+                ] [as c-pointer! none]
+                notify-host-preset-load :instance-raw
+                    instance/preset_load_location_kind :location (as c-string! key) true
+                instance/preset_load_pending: false
+            ]
+            ; And tell the editor, if there is one. It cannot ask: the commit
+            ; runs on the audio thread, so an editor that polled the mailbox
+            ; would read whatever was committed BEFORE the load it triggered.
+            ; This is the first moment on the main thread at which the answer
+            ; is true, which makes it the moment to push it.
+            editor-gui: make c-pointer! plugin-gui-state-ptr-trimmed :plugin
+            if not none? editor-gui [
+                editor-state: make [#mutable recoil-clap-gui-backend-state!]
+                    as recoil-clap-gui-backend-state! editor-gui
+                if not none? editor-state/controller [
+                    helpers/gui-preset-changed editor-state/controller
+                        (either preset-index >= 0 [preset-index] [-1])
+                ]
+            ]
+        ]
+    ]
+    gui-state: make c-pointer! plugin-gui-state-ptr-trimmed :plugin
+    if none? gui-state [return none]
+    state: make [#mutable recoil-clap-gui-backend-state!] as recoil-clap-gui-backend-state! gui-state
+    if not none? state/controller [helpers/gui-on-main-thread state/controller]
+]
+
+plugin-get-extension-cb: callback plugin-get-extension [
+    :plugin [clap-plugin!]
+    id [c-string!]
+    return: [c-pointer!]
+]
+
+plugin-on-main-thread-cb: callback plugin-on-main-thread [
+    :plugin [clap-plugin!]
+]
+
+plugin-init-cb: callback plugin-init [:plugin [clap-plugin!] return: [logic!]]
+plugin-destroy-cb: callback plugin-destroy [:plugin [clap-plugin!]]
+plugin-activate-cb: callback plugin-activate [:plugin [clap-plugin!] sample-rate [f64!] min-frames [i32!] max-frames [i32!] return: [logic!]]
+plugin-deactivate-cb: callback plugin-deactivate [:plugin [clap-plugin!]]
+plugin-start-processing-cb: callback plugin-start-processing [:plugin [clap-plugin!] return: [logic!]]
+plugin-stop-processing-cb: callback plugin-stop-processing [:plugin [clap-plugin!]]
+plugin-reset-cb: callback plugin-reset [:plugin [clap-plugin!]]
+plugin-process-cb: callback plugin-process [:plugin [clap-plugin!] :proc [clap-process!] return: [i32!]]
+
+s_plugin: make clap-plugin! [
+    desc: addr-of clap-descriptor
+    plugin_data: none
+    init: plugin-init-cb
+    destroy: plugin-destroy-cb
+    activate: plugin-activate-cb
+    deactivate: plugin-deactivate-cb
+    start_processing: plugin-start-processing-cb
+    stop_processing: plugin-stop-processing-cb
+    reset: plugin-reset-cb
+    process: plugin-process-cb
+    get_extension: plugin-get-extension-cb
+    on_main_thread: plugin-on-main-thread-cb
+]
+
+create-plugin: func [
+    "Allocate a plug-in instance if the host asked for this engine's id."
+    :factory [clap-plugin-factory!] "Borrowed factory; unused."
+    :host [clap-host!] "Borrowed host, retained on the instance."
+    plugin-id [c-string!] "Plug-in id the host is requesting."
+    return: [c-pointer!] "The clap_plugin pointer, or none on a miss."
+] [
+    unused factory
+    if none? plugin-id [return as c-pointer! none]
+    eng: make [#mutable engine!] as engine! active-engine
+    if (string-ffi/strcmp plugin-id eng/id) <> 0 [return as c-pointer! none]
+    instance-raw: make c-pointer! unsafe/malloc (size-of brom-clap-instance!)
+    if none? instance-raw [return as c-pointer! none]
+    unsafe/memset instance-raw 0 (size-of brom-clap-instance!)
+    instance: make [#mutable brom-clap-instance!] as brom-clap-instance! instance-raw
+    instance/plugin: s_plugin
+    instance/plugin/plugin_data: as c-pointer! (addr-of instance/plugin)
+    instance/host: as c-pointer! host
+    instance/core: eng/create-fn
+    if none? instance/core [
+        unsafe/free instance-raw
+        return as c-pointer! none
+    ]
+    instance/preset_mailbox: helpers/preset-mailbox-create
+    if none? instance/preset_mailbox [
+        eng/destroy-fn instance/core
+        unsafe/free instance-raw
+        return as c-pointer! none
+    ]
+    if not initialize-preset-transaction :instance :eng [
+        helpers/preset-mailbox-destroy instance/preset_mailbox
+        eng/destroy-fn instance/core
+        unsafe/free instance-raw
+        return as c-pointer! none
+    ]
+    repeat i BROM-MAX-VOICES [
+        instance/voice_active/:i: false
+        instance/voice_note_ids/:i: -1
+        instance/voice_port_indexes/:i: -1
+        instance/voice_channels/:i: -1
+        instance/voice_keys/:i: -1
+    ]
+    unsafe/memset (addr-of instance/gui) 0 (size-of recoil-clap-gui-backend-state!)
+    return addr-of instance/plugin
+]
+
+factory-get-plugin-count: func [:factory [clap-plugin-factory!] return: [i32!]] [
+    unused factory
+    1
+]
+
+factory-get-plugin-descriptor: func [
+    :factory [clap-plugin-factory!]
+    index [u32!]
+    return: [c-pointer!]
+] [
+    unused factory
+    either index = 0 [addr-of clap-descriptor] [none]
+]
+
+factory-create-plugin: func [
+    :factory [clap-plugin-factory!]
+    :host [clap-host!]
+    plugin-id [c-string!]
+    return: [c-pointer!]
+] [
+    create-plugin :factory :host plugin-id
+]
+
+factory-get-plugin-count-cb: callback factory-get-plugin-count [
+    :factory [clap-plugin-factory!]
+    return: [i32!]
+]
+
+factory-get-plugin-descriptor-cb: callback factory-get-plugin-descriptor [
+    :factory [clap-plugin-factory!]
+    index [u32!]
+    return: [c-pointer!]
+]
+
+factory-create-plugin-cb: callback factory-create-plugin [
+    :factory [clap-plugin-factory!]
+    :host [clap-host!]
+    plugin-id [c-string!]
+    return: [c-pointer!]
+]
+
+s_factory: make clap-plugin-factory! [
+    get_plugin_count: factory-get-plugin-count-cb
+    get_plugin_descriptor: factory-get-plugin-descriptor-cb
+    create_plugin: factory-create-plugin-cb
+]
+
+entry-init: func [plugin-path [c-string!] return: [logic!]] [
+    unused plugin-path
+    ; Refusing here is the whole point of the ceilings: a host that gets false
+    ; from init unloads the plug-in instead of running it against tables too
+    ; small for the engine it linked.
+    ready: make logic! brom-clap-init-engine
+    return ready
+]
+
+entry-deinit: func [] [
+]
+
+entry-get-factory: func [factory-id [c-string!] return: [c-pointer!]] [
+    if none? factory-id [return as c-pointer! none]
+    if (string-ffi/strcmp factory-id CLAP_PLUGIN_FACTORY_ID) = 0 [return addr-of s_factory]
+    if any [
+        (string-ffi/strcmp factory-id CLAP_PRESET_DISCOVERY_FACTORY_ID) = 0
+        (string-ffi/strcmp factory-id CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT) = 0
+    ] [
+        eng: make [#mutable engine!] as engine! active-engine
+        if eng/factory-count > 0 [return helpers/preset-discovery-factory]
+    ]
+    return as c-pointer! none
+]
+
+entry-init-cb: callback entry-init [
+    plugin-path [c-string!]
+    return: [logic!]
+]
+
+entry-deinit-cb: callback entry-deinit []
+
+entry-get-factory-cb: callback entry-get-factory [
+    factory-id [c-string!]
+    return: [c-pointer!]
+]
+
+#export [clap-entry]
+clap-entry: make clap-plugin-entry! [
+    clap_version: clap-version-init
+    init: entry-init-cb
+    deinit: entry-deinit-cb
+    get_factory: entry-get-factory-cb
+]

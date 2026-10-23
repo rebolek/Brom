@@ -1,0 +1,538 @@
+Recoil [
+    Title: "Brom DSP filter family"
+    Description: {
+        A family of filter types, not one filter. Instruments want different
+        filters -- that is a voicing decision, not duplication -- so sharing here
+        means each *type* exists once, in Brom, rather than one type being forced
+        on everyone. This is the shape brom-dsp-filters already has in Rust.
+
+        Every type follows the same interface: a state struct the caller owns,
+        a reset, and a tick taking the sample plus an already-computed cutoff and
+        resonance. Modulation stays with the instrument. Loos derives its cutoff
+        from an LFO and a filter envelope, Mach will derive its differently, and
+        neither belongs in here.
+
+        Members so far:
+          brom-ladder!     -- Stilson/Smith four-pole Moog-style ladder, from Loos
+          brom-juno!       -- four cascaded one-poles, saturated feedback, from Mach
+          brom-svf!        -- two-pole TPT state variable, from Mach
+          brom-2pole!      -- state variable with saturated resonance, 2x oversampled
+          brom-multimode!  -- state variable morphing lowpass to bandpass to highpass
+
+        The four from Mach cache their frequency coefficient and recompute it
+        only when cutoff moves more than a hundredth of a hertz. That cache is
+        not an optimisation detail to be tidied away: a tan or an exp per sample
+        per voice is what these filters would otherwise cost, and it is the
+        reason the reference implementation fits its budget at all.
+    }
+    Type: module
+    Module: brom/dsp/filter
+    Imports: [
+        brom/dsp/utils [
+            brom-clamp-f64 brom-sanitize-f64 brom-abs-f64
+            brom-fast-tanh brom-fast-tan
+        ]
+    ]
+    Exports: [
+        brom-ladder! brom-ladder-reset brom-ladder-tick
+        BROM-CUTOFF-MIN BROM-CUTOFF-MAX
+        BROM-2POLE-RES-KNEE BROM-2POLE-RES-FLOOR BROM-2POLE-SATURATION
+        brom-one-pole-g
+        brom-juno! brom-juno-reset brom-juno-tick
+        brom-svf! brom-svf-reset brom-svf-tick
+        brom-2pole! brom-2pole-reset brom-2pole-tick
+        brom-multimode! brom-multimode-reset brom-multimode-tick
+    ]
+]
+
+; Above this the one-pole coefficient derivation stops behaving; the ladder is
+; an approximation of an analogue circuit and it is only valid well below
+; Nyquist. 0.82 of half the sample rate is where Loos has always clamped.
+BROM-LADDER-MAX-F: 0.82
+; Feedback intermediates are held inside this magnitude. Four is generous for a
+; signal path normalized to one, and tight enough that a runaway resonance
+; cannot reach infinity before the saturation catches it.
+BROM-LADDER-LIMIT: 4.0
+
+brom-ladder!: make c-struct! [
+    y1: [f64!]
+    y2: [f64!]
+    y3: [f64!]
+    y4: [f64!]
+    oldx: [f64!]
+    oldy1: [f64!]
+    oldy2: [f64!]
+    oldy3: [f64!]
+]
+
+brom-ladder-reset: func [
+    "Clear a ladder's history so the next sample starts from silence."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-ladder!."
+    return: [none!] "No value."
+] [
+    ladder: make [#mutable brom-ladder!] as brom-ladder! :filter
+    ladder/y1: 0.0
+    ladder/y2: 0.0
+    ladder/y3: 0.0
+    ladder/y4: 0.0
+    ladder/oldx: 0.0
+    ladder/oldy1: 0.0
+    ladder/oldy2: 0.0
+    ladder/oldy3: 0.0
+    return none
+]
+
+brom-ladder-tick: func [
+    "Run one sample through a four-pole resonant ladder low-pass."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-ladder!."
+    input [f64!] "Unfiltered sample."
+    cutoff [f64!] "Cutoff in Hz, already modulated and bounded by the caller."
+    resonance [f64!] "Resonance, already bounded by the caller."
+    sample-rate [f64!] "Sample rate in Hz."
+    return: [f64!] "Filtered sample."
+] [
+    ladder: make [#mutable brom-ladder!] as brom-ladder! :filter
+    f: brom-clamp-f64 (2.0 * cutoff / sample-rate) 0.0 BROM-LADDER-MAX-F
+    p: f * (1.8 - (0.8 * f))
+    k: (2.0 * p) - 1.0
+    t: (1.0 - p) * 1.386249
+    t2: 12.0 + (t * t)
+    r: resonance * ((t2 + (6.0 * t)) / (t2 - (6.0 * t)))
+    x: brom-sanitize-f64 (input - (r * ladder/y4)) BROM-LADDER-LIMIT
+    ladder/y1: (x * p) + (ladder/oldx * p) - (k * ladder/y1)
+    ladder/y2: (ladder/y1 * p) + (ladder/oldy1 * p) - (k * ladder/y2)
+    ladder/y3: (ladder/y2 * p) + (ladder/oldy2 * p) - (k * ladder/y3)
+    ladder/y4: (ladder/y3 * p) + (ladder/oldy3 * p) - (k * ladder/y4)
+    ; The cubic is the ladder's soft saturation: it is what keeps self-oscillation
+    ; bounded and gives the resonance its character, so it is part of the filter
+    ; rather than a safety net.
+    ladder/y4: ladder/y4 - ((ladder/y4 * ladder/y4 * ladder/y4) / 6.0)
+    ladder/y1: brom-sanitize-f64 ladder/y1 BROM-LADDER-LIMIT
+    ladder/y2: brom-sanitize-f64 ladder/y2 BROM-LADDER-LIMIT
+    ladder/y3: brom-sanitize-f64 ladder/y3 BROM-LADDER-LIMIT
+    ladder/y4: brom-sanitize-f64 ladder/y4 BROM-LADDER-LIMIT
+    ladder/oldx: x
+    ladder/oldy1: ladder/y1
+    ladder/oldy2: ladder/y2
+    ladder/oldy3: ladder/y3
+    return ladder/y4
+]
+
+; ---------------------------------------------------------------------------
+; The Mach filters
+; ---------------------------------------------------------------------------
+
+filter-math: foreign <math.h> [
+    fabs: "fabs" [f64! return: [f64!]]
+]
+
+BROM-CUTOFF-MIN: 20.0
+BROM-CUTOFF-MAX: 18000.0
+; Recomputing the frequency coefficient below this much movement is not worth a
+; transcendental. A hundredth of a hertz is inaudible anywhere in the range and
+; far finer than any modulation source resolves.
+BROM-COEF-EPSILON: 0.01
+; A cached cutoff can never be negative, so this forces the first tick through
+; the coefficient calculation whatever it is asked for.
+BROM-COEF-UNSET: -1.0
+
+; Absolute bound held on a filter's integrator state. Every topology except the
+; ladder -- which has its own, narrower BROM-LADDER-LIMIT -- settles far inside
+; this; it is here so no arithmetic path can leave a state unbounded.
+BROM-STATE-LIMIT: 10.0
+
+BROM-FILTER-PI: 3.141592653589793
+; Above this resonance the two-pole ramps into self-oscillation; below it, its
+; damping is exactly what the reference computes. See brom-2pole-tick.
+BROM-2POLE-RES-KNEE: 0.95
+; Damping at full resonance -- the depth the reference reaches, arrived at
+; gradually rather than in one step.
+BROM-2POLE-RES-FLOOR: -0.05
+; Level at which the two-pole's state saturates once it is self-oscillating.
+; This is what sets the oscillation amplitude: the loop settles where the
+; curve's slope brings its gain back to one. Two gives an oscillation that
+; reaches about a third of a unit signal at full resonance -- clearly audible,
+; and subordinate to the note rather than swamping it.
+BROM-2POLE-SATURATION: 2.0
+BROM-TWO-PI: 6.283185307179586
+
+brom-one-pole-g: func [
+    #inline
+    "How far a one-pole moves toward its input in one sample, for a given cutoff."
+    cutoff [f64!] "Cutoff in Hz; the caller has already bounded it."
+    sample-rate [f64!] "Rate the filter is ticked at, in Hz -- oversampled if it is."
+    return: [f64!] "1 - exp(-2*pi*cutoff/sample-rate), in 0..1."
+] [
+    ; Written as a series rather than as `1 - exp(-x)` because that subtraction
+    ; is the whole difficulty. For a low cutoff x is tiny, exp(-x) is a hair
+    ; under one, and the answer is what survives the cancellation -- so an
+    ; approximate exp does not give an approximate g, it gives noise. The
+    ; reference used brom-fast-exp here, whose bias is tuned for spread rather
+    ; than exactness anywhere and returns 0.971 for exp(0). That 2.9% ABSOLUTE
+    ; error is the entire answer at the bottom of the range: g could never fall
+    ; below 0.0295, pinning the Juno's cutoff at roughly 840 Hz however far down
+    ; the knob went. Measured, not inferred -- with cutoff asked for 20 Hz, a
+    ; 1 kHz tone came out only 15 dB down where four poles should have put it
+    ; near 135, and 20 Hz and 100 Hz differed by 1.35 dB.
+    ;
+    ; So compute the numerator directly, as x + x^2/2 + x^3/6 + x^4/24 + x^5/120
+    ; in Horner form -- exp(x) - 1 with the leading one never formed, so there
+    ; is nothing to cancel. Then g = N / (1 + N), which is the same series over
+    ; its own exponential and needs no second evaluation.
+    ;
+    ; The form is worth more than the term count. It is exact as cutoff goes to
+    ; zero, rises monotonically, and approaches one from below as cutoff climbs,
+    ; so it cannot overshoot into instability at any rate it is handed. Worst
+    ; relative error anywhere in x > 0 is 0.52%, up near half the sample rate
+    ; where g is already 0.97 and the filter passes nearly everything; across
+    ; Mach's own range it stays under 0.007%, against 3.7% for the exp it
+    ; replaces. Better everywhere, for 0.3 ns a call.
+    x: BROM-TWO-PI * cutoff / sample-rate
+    ; 0.166666... is 1/6, then 1/24 and 1/120 -- the factorials of the series.
+    series: x * (1.0 + (x * (0.5 + (x * (0.16666666666666666 +
+        (x * (0.041666666666666664 + (x * 0.008333333333333333))))))))
+    return series / (1.0 + series)
+]
+
+; --- Juno: four one-poles with saturated feedback ---------------------------
+
+brom-juno!: make c-struct! [
+    z1: [f64!]
+    z2: [f64!]
+    z3: [f64!]
+    z4: [f64!]
+    cached-g: [f64!]
+    cached-cutoff: [f64!]
+]
+
+brom-juno-reset: func [
+    "Clear a Juno filter's history so the next sample starts from silence."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-juno!."
+    return: [none!] "No value."
+] [
+    juno: make [#mutable brom-juno!] as brom-juno! :filter
+    juno/z1: 0.0
+    juno/z2: 0.0
+    juno/z3: 0.0
+    juno/z4: 0.0
+    juno/cached-g: 0.0
+    juno/cached-cutoff: BROM-COEF-UNSET
+    return none
+]
+
+brom-juno-tick: func [
+    "Run one sample through four cascaded one-poles with saturated feedback."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-juno!."
+    input [f64!] "Unfiltered sample."
+    cutoff [f64!] "Cutoff in Hz; bounded here to 20..18000."
+    resonance [f64!] "Resonance; bounded here to 0..0.95."
+    sample-rate [f64!] "Sample rate in Hz."
+    return: [f64!] "Filtered sample."
+] [
+    juno: make [#mutable brom-juno!] as brom-juno! :filter
+    bounded-cutoff: brom-clamp-f64 cutoff BROM-CUTOFF-MIN BROM-CUTOFF-MAX
+    bounded-res: brom-clamp-f64 resonance 0.0 0.95
+    if (filter-math/fabs (bounded-cutoff - juno/cached-cutoff)) > BROM-COEF-EPSILON [
+        juno/cached-g: brom-one-pole-g bounded-cutoff sample-rate
+        juno/cached-cutoff: bounded-cutoff
+    ]
+    g: juno/cached-g
+    ; The Juno's resonance ran to roughly four times feedback at maximum, and
+    ; the saturation on that path is what stops it screaming rather than
+    ; resonating -- it is the character, not a limiter bolted on afterwards.
+    ;
+    ; bounded-res, not resonance: the reference writes `let resonance =
+    ; resonance.clamp(0.0, 0.95)` and every later mention of the name means the
+    ; clamped value. Shadowing does not survive translation -- the bound has to
+    ; become a separate binding here -- and this line went on reading the raw
+    ; argument, so the cap the docstring promises was computed and discarded.
+    ; Unreachable from Mach, whose resonance parameter stops at 0.9, which is
+    ; why it never showed; brom is shared, so it would have surfaced in whatever
+    ; instrument first asked for more.
+    fed-back: brom-fast-tanh (juno/z4 * bounded-res * 4.0)
+    x: input - fed-back
+    juno/z1: juno/z1 + (g * (x - juno/z1))
+    juno/z2: juno/z2 + (g * (juno/z1 - juno/z2))
+    juno/z3: juno/z3 + (g * (juno/z2 - juno/z3))
+    juno/z4: juno/z4 + (g * (juno/z3 - juno/z4))
+    ; Alone among the four topologies this one guarded nothing: no NaN catch,
+    ; no bound, and no denormal flush. The last of those is the one that shows
+    ; -- four cascaded one-poles ring down asymptotically, so a released note
+    ; leaves a tail that decays for thousands of samples through the denormal
+    ; range, which is both the cost BROM-DENORMAL-THRESHOLD exists to avoid and
+    ; a subnormal written to the host's float buffer once the tail is scaled
+    ; into it. The other three already bound their state at ten; this brings
+    ; the Juno in line with them and with the ladder.
+    juno/z1: brom-sanitize-f64 juno/z1 BROM-STATE-LIMIT
+    juno/z2: brom-sanitize-f64 juno/z2 BROM-STATE-LIMIT
+    juno/z3: brom-sanitize-f64 juno/z3 BROM-STATE-LIMIT
+    juno/z4: brom-sanitize-f64 juno/z4 BROM-STATE-LIMIT
+    return juno/z4
+]
+
+; --- SVF: two-pole topology-preserving state variable ------------------------
+
+brom-svf!: make c-struct! [
+    ic1eq: [f64!]
+    ic2eq: [f64!]
+    cached-g: [f64!]
+    cached-cutoff: [f64!]
+]
+
+brom-svf-reset: func [
+    "Clear a state-variable filter's integrators."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-svf!."
+    return: [none!] "No value."
+] [
+    svf: make [#mutable brom-svf!] as brom-svf! :filter
+    svf/ic1eq: 0.0
+    svf/ic2eq: 0.0
+    svf/cached-g: 0.0
+    svf/cached-cutoff: BROM-COEF-UNSET
+    return none
+]
+
+brom-svf-tick: func [
+    "Run one sample through a two-pole state-variable low-pass."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-svf!."
+    input [f64!] "Unfiltered sample."
+    cutoff [f64!] "Cutoff in Hz; bounded here to 20..0.45 of the sample rate."
+    resonance [f64!] "Resonance; bounded here to 0..0.95."
+    sample-rate [f64!] "Sample rate in Hz."
+    return: [f64!] "Low-pass output."
+] [
+    svf: make [#mutable brom-svf!] as brom-svf! :filter
+    bounded-cutoff: brom-clamp-f64 cutoff BROM-CUTOFF-MIN (sample-rate * 0.45)
+    bounded-res: brom-clamp-f64 resonance 0.0 0.95
+    if (filter-math/fabs (bounded-cutoff - svf/cached-cutoff)) > BROM-COEF-EPSILON [
+        svf/cached-g: brom-fast-tan (BROM-FILTER-PI * bounded-cutoff / sample-rate)
+        svf/cached-cutoff: bounded-cutoff
+    ]
+    g: svf/cached-g
+    ; Damping, not resonance: k is 1/Q, so two is over-damped and zero sings.
+    k: 2.0 - (2.0 * bounded-res)
+    ; An unusable coefficient means the filter cannot be solved this sample. It
+    ; passes the input through rather than emitting a NaN that would then
+    ; propagate through every voice sharing the output bus.
+    if g <> g [return input]
+    if g > 10.0 [return input]
+    denominator: 1.0 + (g * k) + (g * g)
+    if denominator < 0.0000000001 [return input]
+    a1: 1.0 / denominator
+    a2: g * a1
+    a3: g * a2
+    v3: input - svf/ic2eq
+    v1: (a1 * svf/ic1eq) + (a2 * v3)
+    v2: svf/ic2eq + (a2 * svf/ic1eq) + (a3 * v3)
+    ; Trapezoidal integration: the new state is twice the integrator output
+    ; less the old state.
+    svf/ic1eq: (2.0 * v1) - svf/ic1eq
+    svf/ic2eq: (2.0 * v2) - svf/ic2eq
+    ; NaN catch, bound and denormal flush in one pass. The flush is what was
+    ; missing: an integrator ringing down after a note is released decays
+    ; asymptotically, so without it the state spends thousands of samples in
+    ; the denormal range that BROM-DENORMAL-THRESHOLD exists to keep it out of.
+    svf/ic1eq: brom-sanitize-f64 svf/ic1eq BROM-STATE-LIMIT
+    svf/ic2eq: brom-sanitize-f64 svf/ic2eq BROM-STATE-LIMIT
+    return v2
+]
+
+; --- 2-pole: state variable with a saturated resonance path ------------------
+
+brom-2pole!: make c-struct! [
+    z1: [f64!]
+    z2: [f64!]
+    cached-g: [f64!]
+    cached-cutoff: [f64!]
+]
+
+brom-2pole-reset: func [
+    "Clear a two-pole filter's integrators."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-2pole!."
+    return: [none!] "No value."
+] [
+    two-pole: make [#mutable brom-2pole!] as brom-2pole! :filter
+    two-pole/z1: 0.0
+    two-pole/z2: 0.0
+    two-pole/cached-g: 0.0
+    two-pole/cached-cutoff: BROM-COEF-UNSET
+    return none
+]
+
+brom-2pole-tick: func [
+    "Run one sample through a state variable whose resonance path saturates."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-2pole!."
+    input [f64!] "Unfiltered sample."
+    cutoff [f64!] "Cutoff in Hz; bounded here against the oversampled rate."
+    resonance [f64!] "Resonance in 0..1; at the very top the filter self-oscillates."
+    sample-rate [f64!] "Sample rate in Hz, before this filter's own oversampling."
+    return: [f64!] "Low-pass output."
+] [
+    ; Oversampled twice inside the tick rather than around it. The saturation
+    ; sits in the resonance feedback with a one-sample delay, so the rate that
+    ; delay runs at is audible -- running the filter at the outer rate is a
+    ; different filter, not the same one cheaper.
+    two-pole: make [#mutable brom-2pole!] as brom-2pole! :filter
+    oversampled-rate: sample-rate * 2.0
+    bounded-cutoff: brom-clamp-f64 cutoff BROM-CUTOFF-MIN (oversampled-rate * 0.49)
+    if (filter-math/fabs (bounded-cutoff - two-pole/cached-cutoff)) > BROM-COEF-EPSILON [
+        two-pole/cached-g: brom-fast-tan (BROM-FILTER-PI * bounded-cutoff / oversampled-rate)
+        two-pole/cached-cutoff: bounded-cutoff
+    ]
+    g: two-pole/cached-g
+    mapped-res: brom-clamp-f64 resonance 0.0 1.0
+    ; Damping is 1/Q: two is over-damped, zero is the edge of self-oscillation,
+    ; and negative injects energy. The filter has to reach negative damping to
+    ; sing at all.
+    ;
+    ; The reference gets there with a step -- damping is 2-2r until resonance
+    ; hits 0.99, then -0.05 flat. Since crossing zero IS the oscillation
+    ; threshold, that step is a bifurcation reached in one knob increment: with
+    ; no bound on the integrator states, output jumped from 0.11 to 410 across
+    ; a hundredth of a turn. Measured against the reference itself, not
+    ; inferred.
+    ;
+    ; Here the same line simply continues through zero. Below the knee nothing
+    ; changes -- bit-identical -- and at full resonance it arrives at the same
+    ; -0.05, so both ends of the knob match the reference and only the path
+    ; between them differs. Self-oscillation starts around 0.983 instead of
+    ; 0.99 and arrives gradually.
+    ; How far past the knee the resonance sits, zero to one. Drives both the
+    ; damping ramp and how strongly the state saturates, so the two arrive
+    ; together and both start from exactly nothing at the knee.
+    past-knee: either mapped-res <= BROM-2POLE-RES-KNEE [
+        0.0
+    ] [
+        (mapped-res - BROM-2POLE-RES-KNEE) / (1.0 - BROM-2POLE-RES-KNEE)
+    ]
+    knee-damping: 2.0 - (2.0 * BROM-2POLE-RES-KNEE)
+    damping: either mapped-res <= BROM-2POLE-RES-KNEE [
+        2.0 - (2.0 * mapped-res)
+    ] [
+        knee-damping + ((BROM-2POLE-RES-FLOOR - knee-damping) * past-knee)
+    ]
+    output: make [#mutable f64!] 0.0
+    repeat pass 2 [
+        ; z1 is the previous bandpass, used as the predictor for the saturated
+        ; feedback. Putting the non-linearity a sample behind keeps the solver
+        ; linear -- the instability is in the character, not in the maths.
+        limited: brom-fast-tanh (two-pole/z1 * (1.0 + (2.0 * mapped-res)))
+        denominator: 1.0 + (g * (g + damping))
+        inverse: 1.0 / denominator
+        highpass: (input - ((damping * limited) + (g * two-pole/z1)) - two-pole/z2) * inverse
+        bandpass: (g * highpass) + two-pole/z1
+        lowpass: (g * bandpass) + two-pole/z2
+        two-pole/z1: (2.0 * bandpass) - two-pole/z1
+        two-pole/z2: (2.0 * lowpass) - two-pole/z2
+        if two-pole/z1 <> two-pole/z1 [two-pole/z1: 0.0]
+        if two-pole/z2 <> two-pole/z2 [two-pole/z2: 0.0]
+        ; Under negative damping the existing saturation sits only in the
+        ; feedback path: it limits what is injected, never what accumulates.
+        ; The reference has no bound on the state at all, so its oscillation
+        ; grew to 410 times the input.
+        ;
+        ; A hard clamp bounds that but cannot grade it -- oscillation would
+        ; step straight to the wall the moment damping crossed zero, which is
+        ; the same cliff moved rather than removed. Saturating instead lets the
+        ; loop settle where its gain falls back to one, so amplitude tracks how
+        ; negative the damping is and self-oscillation arrives gradually.
+        ;
+        ; Blended in over the same ramp rather than switched on at the knee.
+        ; Switching it on looks harmless -- tanh is nearly the identity for
+        ; small values -- but "nearly" compounds through a resonant loop, and
+        ; measuring it either side of the knee showed a 1.4% step in output.
+        ; Small, yet a discontinuity is exactly what this is here to remove.
+        ; At the knee the blend contributes nothing, so below it the filter is
+        ; still bit-for-bit the reference.
+        if past-knee > 0.0 [
+            saturated1: BROM-2POLE-SATURATION * (brom-fast-tanh (two-pole/z1 / BROM-2POLE-SATURATION))
+            saturated2: BROM-2POLE-SATURATION * (brom-fast-tanh (two-pole/z2 / BROM-2POLE-SATURATION))
+            two-pole/z1: two-pole/z1 + ((saturated1 - two-pole/z1) * past-knee)
+            two-pole/z2: two-pole/z2 + ((saturated2 - two-pole/z2) * past-knee)
+        ]
+        ; A last bound regardless, so no arithmetic path can leave the state
+        ; unbounded even if the saturation above is ever bypassed -- and the
+        ; denormal flush with it, so a ringdown does not decay through the
+        ; denormal range for thousands of samples after a note ends.
+        two-pole/z1: brom-sanitize-f64 two-pole/z1 BROM-STATE-LIMIT
+        two-pole/z2: brom-sanitize-f64 two-pole/z2 BROM-STATE-LIMIT
+        output: lowpass
+    ]
+    return output
+]
+
+; --- multimode: the same SVF, morphing between its outputs -------------------
+
+brom-multimode!: make c-struct! [
+    ic1eq: [f64!]
+    ic2eq: [f64!]
+    cached-g: [f64!]
+    cached-cutoff: [f64!]
+]
+
+brom-multimode-reset: func [
+    "Clear a morphing filter's integrators."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-multimode!."
+    return: [none!] "No value."
+] [
+    multimode: make [#mutable brom-multimode!] as brom-multimode! :filter
+    multimode/ic1eq: 0.0
+    multimode/ic2eq: 0.0
+    multimode/cached-g: 0.0
+    multimode/cached-cutoff: BROM-COEF-UNSET
+    return none
+]
+
+brom-multimode-tick: func [
+    "Run one sample through a state variable, morphing between its outputs."
+    :filter [c-pointer!] "Borrowed address of a caller-owned brom-multimode!."
+    input [f64!] "Unfiltered sample."
+    cutoff [f64!] "Cutoff in Hz; bounded here to 20..18000."
+    resonance [f64!] "Resonance; bounded here to 0..0.98."
+    morph [f64!] "Blend: 0 is low-pass, 0.5 band-pass, 1 high-pass."
+    sample-rate [f64!] "Sample rate in Hz."
+    return: [f64!] "Blended output."
+] [
+    ; Morph is an argument rather than a setter plus a tick, so a sample can
+    ; never be rendered against a blend the caller thought it had changed.
+    multimode: make [#mutable brom-multimode!] as brom-multimode! :filter
+    bounded-cutoff: brom-clamp-f64 cutoff BROM-CUTOFF-MIN BROM-CUTOFF-MAX
+    bounded-res: brom-clamp-f64 resonance 0.0 0.98
+    bounded-morph: brom-clamp-f64 morph 0.0 1.0
+    if (filter-math/fabs (bounded-cutoff - multimode/cached-cutoff)) > BROM-COEF-EPSILON [
+        multimode/cached-g: brom-fast-tan (BROM-FILTER-PI * bounded-cutoff / sample-rate)
+        multimode/cached-cutoff: bounded-cutoff
+    ]
+    g: multimode/cached-g
+    k: 2.0 - (2.0 * bounded-res)
+    if g <> g [return input]
+    if g > 10.0 [return input]
+    denominator: 1.0 + (g * k) + (g * g)
+    if denominator < 0.0000000001 [return input]
+    a1: 1.0 / denominator
+    a2: g * a1
+    a3: g * a2
+    v3: input - multimode/ic2eq
+    v1: (a1 * multimode/ic1eq) + (a2 * v3)
+    v2: multimode/ic2eq + (a2 * multimode/ic1eq) + (a3 * v3)
+    multimode/ic1eq: (2.0 * v1) - multimode/ic1eq
+    multimode/ic2eq: (2.0 * v2) - multimode/ic2eq
+    ; As in the plain SVF: NaN catch, bound and denormal flush together.
+    multimode/ic1eq: brom-sanitize-f64 multimode/ic1eq BROM-STATE-LIMIT
+    multimode/ic2eq: brom-sanitize-f64 multimode/ic2eq BROM-STATE-LIMIT
+    ; All three responses come out of the same solve; the high-pass is what is
+    ; left of the input once the band-pass and low-pass are taken out of it.
+    lowpass: v2
+    bandpass: v1
+    highpass: input - (k * v1) - v2
+    ; Two linear crossfades end to end rather than one three-way blend, so the
+    ; band-pass is reached exactly at the midpoint instead of only being
+    ; approached.
+    return either bounded-morph <= 0.5 [
+        t: bounded-morph * 2.0
+        (lowpass * (1.0 - t)) + (bandpass * t)
+    ] [
+        t: (bounded-morph - 0.5) * 2.0
+        (bandpass * (1.0 - t)) + (highpass * t)
+    ]
+]

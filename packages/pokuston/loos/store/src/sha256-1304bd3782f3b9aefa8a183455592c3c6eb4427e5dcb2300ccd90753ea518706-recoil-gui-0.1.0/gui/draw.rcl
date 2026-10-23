@@ -1,0 +1,491 @@
+Recoil [
+    Title: "Draw — a graphics dialect over the path contract"
+    Description: {
+        `draw` takes a context and a block of graphics commands and lowers them,
+        at compile time, into calls on the path contract in gui/gui.rcl. It is a
+        dialect in the sense Rebol means: the block is vocabulary, not code, and
+        every widget is written in it rather than in a stream of hand-sequenced
+        drawing calls.
+
+            draw :context [
+                fill-pen body   box (fxy 12.0 12.0) (fxy 220.0 180.0)
+                pen accent      line-width 5
+                arc centre radius start swept
+            ]
+
+        A coordinate is one operand, not two: every position, size and offset is
+        an `fpair!` from std/geometry. `box origin size` cannot be handed its
+        width where its height belongs, and a caller that moves a widget moves
+        both components or neither. The path contract underneath is still
+        f32! scalars; the pair is split at the call site, once, after the
+        expression behind it has been evaluated exactly once.
+
+        Operands are ordinary Recoil expressions, so a knob's geometry stays
+        dynamic while its structure stays static -- which is what makes this
+        worth lowering rather than interpreting. Nothing here survives to run
+        time: no dispatch, no block walked per frame, and every operand is
+        type-checked at its call site.
+
+        The dialect is documented in docs/user/draw.md, including the
+        divergence below and what is not implemented from Red's vocabulary.
+
+        DIVERGENCE FROM RED. In Red, `pen` and `fill-pen` are run-time state
+        that a shape consults, and either may be `off`. A compile-time lowering
+        cannot read run-time state, so here a shape strokes when a `pen` has
+        appeared earlier in the same block and fills when a `fill-pen` has, both
+        decided lexically. A shape with neither is a compile error rather than
+        an invisible result. `push [...]` scopes those flags the way it scopes
+        the transform.
+    }
+    Type: module
+    Module: gui/draw
+    Imports: [
+        gui/gui [
+            GUI-WINDING-CW GUI-CAP-BUTT GUI-CAP-ROUND GUI-CAP-SQUARE
+            GUI-JOIN-MITER GUI-JOIN-ROUND GUI-JOIN-BEVEL
+            gui-path-begin gui-path-move-to gui-path-line-to
+            gui-path-bezier-to gui-path-quad-to gui-path-arc gui-path-rect
+            gui-path-rounded-rect gui-path-ellipse gui-path-close
+            gui-path-fill gui-path-stroke gui-path-fill-color gui-path-stroke-color
+            gui-path-stroke-width gui-path-line-cap gui-path-line-join
+            gui-path-save gui-path-restore gui-path-translate gui-path-rotate
+            gui-path-scale gui-path-scissor gui-path-reset-scissor gui-path-text
+        ]
+    ]
+    Exports: [draw]
+]
+
+draw: compfunc [#raw ctx-src body-src] [
+    ; --- expansion helpers ---------------------------------------------------
+    ; The parser's own node shapes: a call is [call name [args] return-type], a
+    ; borrowed argument is a get-word in the args block, and a cast is
+    ; [cast type expr]. Confirmed against compile/ast rather than assumed.
+    ctx-word: either all [block? ctx-src not empty? ctx-src] [ctx-src/1] [
+        do make error! "draw: expected a context expression as the first argument"
+    ]
+    if get-word? ctx-word [ctx-word: to-word ctx-word]
+    unless word? ctx-word [
+        do make error! "draw: the context argument must be a plain word naming a borrowed context"
+    ]
+    body: either all [block? body-src not empty? body-src block? body-src/1] [body-src/1] [
+        do make error! "draw: expected a block of drawing commands as the second argument"
+    ]
+
+    statements: copy []
+    borrowed-ctx: to get-word! ctx-word
+
+    emit: func [name args] [
+        append/only statements reduce ['expr reduce ['call name args 'none!]]
+    ]
+    ; Operands are parsed into AST rather than passed through as source. A bare
+    ; word or number survives either way, but a path or a parenthesised
+    ; expression does not, and parse-expression-value returns [ok? parsed] --
+    ; passing that pair through as the expression made the leading #(true) the
+    ; value, so every parenthesised operand silently became the literal 1.
+    parse-operand: func [token label /local ok? parsed] [
+        set [ok? parsed] parse-expression-value reduce [token]
+        unless ok? [
+            do make error! rejoin ["draw: cannot parse the operand of `" label "`: " mold token]
+        ]
+        parsed
+    ]
+    operand: func [token label] [
+        ; A tuple! is only ever a colour, and only `pen`/`fill-pen` take one.
+        ; Refusing it here rather than letting it fall through to the parser
+        ; keeps `circle centre 26.30.35.255` an error instead of a radius of
+        ; four hundred million.
+        if tuple? token [
+            do make error! rejoin [
+                "draw: `" label "` does not take a colour; a tuple! operand is "
+                "only valid for pen and fill-pen: " mold token
+            ]
+        ]
+        either any [word? token get-word? token number? token] [token] [
+            parse-operand token label
+        ]
+    ]
+    ; Every path coordinate is f32!; operands are written as ordinary numbers.
+    as-f32: func [expr label] [reduce ['cast 'f32! operand expr label]]
+
+    ; --- colour operands -----------------------------------------------------
+    ; `pen` and `fill-pen` take one operand, and gui-rgb takes four arguments,
+    ; so every colour inside a draw block used to be hoisted to a local first.
+    ; A tuple! is one operand and Rebol has had the literal all along: this
+    ; block reaches the dialect as raw Rebol (draw is a #raw compfunc), so
+    ; 26.30.35.255 arrives as a tuple! value without the Recoil term grammar
+    ; needing a rule for it. It packs to exactly the 0xRRGGBBAA integer
+    ; gui-rgb computes, at compile time. Three parts take alpha 255.
+    colour-operand: func [token label /local parts alpha] [
+        unless tuple? token [return operand token label]
+        parts: length? token
+        if any [parts < 3 parts > 4] [
+            do make error! rejoin [
+                "draw: a colour tuple for `" label "` needs three or four parts: " mold token
+            ]
+        ]
+        alpha: either parts = 4 [to integer! token/4] [255]
+        ((to integer! token/1) * 16777216)
+            + ((to integer! token/2) * 65536)
+            + ((to integer! token/3) * 256)
+            + alpha
+    ]
+
+    ; --- pair operands -------------------------------------------------------
+    ; A pair operand names one fpair!, and the two f32! coordinates the backend
+    ; wants are its fields. A plain word is read twice directly, which is free;
+    ; anything else is bound to a temporary first, because reading `p/x` and
+    ; `p/y` off an unbound expression would evaluate that expression once per
+    ; component -- `circle (pair-add centre offset) r` would call pair-add
+    ; twice, and a call with a side effect would perform it twice.
+    ;
+    ; The ordinal comes from the shared per-compile counter, so two draw blocks
+    ; in one function never collide on a temp name, and the name is still
+    ; reproducible across builds.
+    pair-binding: func [token label /local ok? parsed tmp] [
+        if word? token [return token]
+        if get-word? token [return to-word token]
+        parsed: parse-operand token label
+        tmp: to-word rejoin ["__draw_pair_" shared-next-internal-ordinal]
+        append/only statements reduce ['set tmp parsed]
+        tmp
+    ]
+    ; Build `<word>/<field>` through the parser rather than by hand, so the node
+    ; shape stays whatever the parser currently emits for a path read.
+    pair-field: func [word field label] [
+        reduce ['cast 'f32! parse-operand to-path reduce [word field] label]
+    ]
+    ; Returns [x-expr y-expr], both cast to f32!.
+    pair-parts: func [token label /local w] [
+        w: pair-binding token label
+        reduce [pair-field w 'x label  pair-field w 'y label]
+    ]
+
+    caps: [butt 0 round 1 square 2]
+    joins: [miter 0 round 1 bevel 2]
+
+    ; --- the walk ------------------------------------------------------------
+    ; A hand-written walk rather than a parse rule: each command consumes a
+    ; fixed number of operands and every operand is an arbitrary expression, so
+    ; the useful work is "take n items", which parse would only wrap.
+    ; /local matters more than it looks: `walk` recurses for `push`, and
+    ; without declaring these the inner call overwrites the outer cursor, so
+    ; every command AFTER a push is silently dropped. It cost the Loos knob its
+    ; centre dot, found by diffing the port against the C editor it replaces.
+    walk: func [
+        block pen? fill?
+        /local cursor take-n shape-paint command a out i
+            seg started? verb want ops p q r
+    ] [
+        cursor: block
+        take-n: func [n label] [
+            out: copy []
+            repeat i n [
+                cursor: next cursor
+                if tail? cursor [
+                    do make error! rejoin ["draw: " label " wants " n " operands"]
+                ]
+                append/only out cursor/1
+            ]
+            out
+        ]
+        shape-paint: func [label] [
+            unless any [pen? fill?] [
+                do make error! rejoin [
+                    "draw: `" label "` has neither a pen nor a fill-pen set before it in this block, "
+                    "so it would draw nothing. Set one, or remove the shape."
+                ]
+            ]
+            if fill? [emit 'gui-path-fill reduce [borrowed-ctx]]
+            if pen? [emit 'gui-path-stroke reduce [borrowed-ctx]]
+        ]
+
+        while [not tail? cursor] [
+            command: cursor/1
+            unless word? command [
+                do make error! rejoin ["draw: expected a command word, got " mold command]
+            ]
+            switch/default command [
+                pen [
+                    a: take-n 1 "pen"
+                    emit 'gui-path-stroke-color reduce [borrowed-ctx colour-operand a/1 "pen"]
+                    pen?: true
+                ]
+                fill-pen [
+                    a: take-n 1 "fill-pen"
+                    emit 'gui-path-fill-color reduce [borrowed-ctx colour-operand a/1 "fill-pen"]
+                    fill?: true
+                ]
+                line-width [
+                    a: take-n 1 "line-width"
+                    emit 'gui-path-stroke-width reduce [borrowed-ctx as-f32 a/1 "line-width"]
+                ]
+                line-cap [
+                    a: take-n 1 "line-cap"
+                    unless all [word? a/1 find caps a/1] [
+                        do make error! "draw: line-cap takes butt, round or square"
+                    ]
+                    emit 'gui-path-line-cap reduce [borrowed-ctx select caps a/1]
+                ]
+                line-join [
+                    a: take-n 1 "line-join"
+                    unless all [word? a/1 find joins a/1] [
+                        do make error! "draw: line-join takes miter, round or bevel"
+                    ]
+                    emit 'gui-path-line-join reduce [borrowed-ctx select joins a/1]
+                ]
+                line [
+                    ; line <from> <to>
+                    a: take-n 2 "line"
+                    unless pen? [
+                        do make error! "draw: `line` needs a pen; a line has no interior to fill"
+                    ]
+                    p: pair-parts a/1 "line"
+                    q: pair-parts a/2 "line"
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    emit 'gui-path-move-to reduce [borrowed-ctx p/1 p/2]
+                    emit 'gui-path-line-to reduce [borrowed-ctx q/1 q/2]
+                    emit 'gui-path-stroke reduce [borrowed-ctx]
+                ]
+                box [
+                    ; box <origin> <size>
+                    a: take-n 2 "box"
+                    p: pair-parts a/1 "box"
+                    q: pair-parts a/2 "box"
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    emit 'gui-path-rect reduce [borrowed-ctx p/1 p/2 q/1 q/2]
+                    shape-paint "box"
+                ]
+                rounded-box [
+                    ; rounded-box <origin> <size> <radius>
+                    a: take-n 3 "rounded-box"
+                    p: pair-parts a/1 "rounded-box"
+                    q: pair-parts a/2 "rounded-box"
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    emit 'gui-path-rounded-rect reduce [
+                        borrowed-ctx p/1 p/2 q/1 q/2 as-f32 a/3 "rounded-box"
+                    ]
+                    shape-paint "rounded-box"
+                ]
+                circle [
+                    ; circle <centre> <radius> -- sugar over ellipse with one
+                    ; radius, so the backend needs no circle of its own.
+                    a: take-n 2 "circle"
+                    p: pair-parts a/1 "circle"
+                    r: as-f32 a/2 "circle"
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    emit 'gui-path-ellipse reduce [borrowed-ctx p/1 p/2 r r]
+                    shape-paint "circle"
+                ]
+                ellipse [
+                    ; ellipse <centre> <radii>
+                    a: take-n 2 "ellipse"
+                    p: pair-parts a/1 "ellipse"
+                    q: pair-parts a/2 "ellipse"
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    emit 'gui-path-ellipse reduce [borrowed-ctx p/1 p/2 q/1 q/2]
+                    shape-paint "ellipse"
+                ]
+                arc [
+                    ; arc <centre> <radius> <start> <end>
+                    a: take-n 4 "arc"
+                    unless pen? [
+                        do make error! "draw: `arc` needs a pen; it is stroked, not filled"
+                    ]
+                    p: pair-parts a/1 "arc"
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    emit 'gui-path-arc reduce [
+                        borrowed-ctx p/1 p/2 as-f32 a/2 "arc"
+                        as-f32 a/3 "arc" as-f32 a/4 "arc" 0
+                    ]
+                    emit 'gui-path-stroke reduce [borrowed-ctx]
+                ]
+                triangle [
+                    ; triangle <a> <b> <c>
+                    a: take-n 3 "triangle"
+                    p: pair-parts a/1 "triangle"
+                    q: pair-parts a/2 "triangle"
+                    r: pair-parts a/3 "triangle"
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    emit 'gui-path-move-to reduce [borrowed-ctx p/1 p/2]
+                    emit 'gui-path-line-to reduce [borrowed-ctx q/1 q/2]
+                    emit 'gui-path-line-to reduce [borrowed-ctx r/1 r/2]
+                    emit 'gui-path-close reduce [borrowed-ctx]
+                    shape-paint "triangle"
+                ]
+                curve [
+                    ; curve <from> <control-1> <control-2> <to> -- cubic,
+                    ; matching Red's `curve`.
+                    a: take-n 4 "curve"
+                    unless pen? [
+                        do make error! "draw: `curve` needs a pen"
+                    ]
+                    p: pair-parts a/1 "curve"
+                    q: pair-parts a/2 "curve"
+                    r: pair-parts a/3 "curve"
+                    ops: pair-parts a/4 "curve"
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    emit 'gui-path-move-to reduce [borrowed-ctx p/1 p/2]
+                    emit 'gui-path-bezier-to reduce [
+                        borrowed-ctx q/1 q/2 r/1 r/2 ops/1 ops/2
+                    ]
+                    emit 'gui-path-stroke reduce [borrowed-ctx]
+                ]
+                text [
+                    ; text <position> <size> <string>
+                    a: take-n 3 "text"
+                    unless fill? [
+                        do make error! "draw: `text` paints with the fill-pen; set one before it"
+                    ]
+                    p: pair-parts a/1 "text"
+                    emit 'gui-path-text reduce [
+                        borrowed-ctx p/1 p/2 as-f32 a/2 "text" (operand a/3 "text")
+                    ]
+                ]
+                translate [
+                    ; translate <delta>
+                    a: take-n 1 "translate"
+                    p: pair-parts a/1 "translate"
+                    emit 'gui-path-translate reduce [borrowed-ctx p/1 p/2]
+                ]
+                rotate [
+                    a: take-n 1 "rotate"
+                    emit 'gui-path-rotate reduce [borrowed-ctx as-f32 a/1 "rotate"]
+                ]
+                scale [
+                    ; scale <factors>
+                    a: take-n 1 "scale"
+                    p: pair-parts a/1 "scale"
+                    emit 'gui-path-scale reduce [borrowed-ctx p/1 p/2]
+                ]
+                clip [
+                    ; clip <origin> <size>
+                    a: take-n 2 "clip"
+                    p: pair-parts a/1 "clip"
+                    q: pair-parts a/2 "clip"
+                    emit 'gui-path-scissor reduce [borrowed-ctx p/1 p/2 q/1 q/2]
+                ]
+                reset-clip [
+                    emit 'gui-path-reset-scissor reduce [borrowed-ctx]
+                ]
+                shape [
+                    ; A path built from segments, where the shape words above
+                    ; each begin and finish one of their own. This is what a
+                    ; curve made of several pieces needs -- an envelope, a
+                    ; waveform, anything traced rather than named.
+                    ;
+                    ; Red spells the same idea `shape [move line curv qcurv
+                    ; close]`; the sub-dialect here is that shorter, with the
+                    ; segment kinds Recoil's path contract carries, and every
+                    ; operand a point rather than a loose coordinate.
+                    a: take-n 1 "shape"
+                    unless block? a/1 [
+                        do make error! "draw: shape takes a block of segments"
+                    ]
+                    emit 'gui-path-begin reduce [borrowed-ctx]
+                    seg: a/1
+                    started?: false
+                    while [not tail? seg] [
+                        verb: seg/1
+                        unless word? verb [
+                            do make error! rejoin [
+                                "draw: expected a shape segment word, got " mold verb
+                            ]
+                        ]
+                        want: switch/default verb [
+                            move [1] line [1] quad [2] curve [3] close [0]
+                        ] [
+                            do make error! rejoin [
+                                "draw: unknown shape segment `" verb "`; "
+                                "expected move, line, quad, curve or close"
+                            ]
+                        ]
+                        ops: copy []
+                        repeat i want [
+                            seg: next seg
+                            if tail? seg [
+                                do make error! rejoin [
+                                    "draw: shape segment `" verb "` wants " want
+                                    " point operands"
+                                ]
+                            ]
+                            append/only ops seg/1
+                        ]
+                        if all [not started? verb <> 'move] [
+                            do make error! "draw: a shape must begin with `move`"
+                        ]
+                        switch verb [
+                            move [
+                                p: pair-parts ops/1 "shape move"
+                                emit 'gui-path-move-to reduce [borrowed-ctx p/1 p/2]
+                                started?: true
+                            ]
+                            line [
+                                p: pair-parts ops/1 "shape line"
+                                emit 'gui-path-line-to reduce [borrowed-ctx p/1 p/2]
+                            ]
+                            quad [
+                                p: pair-parts ops/1 "shape quad"
+                                q: pair-parts ops/2 "shape quad"
+                                emit 'gui-path-quad-to reduce [
+                                    borrowed-ctx p/1 p/2 q/1 q/2
+                                ]
+                            ]
+                            curve [
+                                p: pair-parts ops/1 "shape curve"
+                                q: pair-parts ops/2 "shape curve"
+                                r: pair-parts ops/3 "shape curve"
+                                emit 'gui-path-bezier-to reduce [
+                                    borrowed-ctx p/1 p/2 q/1 q/2 r/1 r/2
+                                ]
+                            ]
+                            close [emit 'gui-path-close reduce [borrowed-ctx]]
+                        ]
+                        seg: next seg
+                    ]
+                    unless started? [
+                        do make error! "draw: shape drew no segments"
+                    ]
+                    shape-paint "shape"
+                ]
+                push [
+                    ; Scopes transform, clip and paint, and the pen/fill-pen
+                    ; flags with them -- a colour set inside a push does not
+                    ; make shapes after the push paintable, because at run time
+                    ; the restore has undone it.
+                    a: take-n 1 "push"
+                    unless block? a/1 [
+                        do make error! "draw: push takes a block of commands"
+                    ]
+                    emit 'gui-path-save reduce [borrowed-ctx]
+                    walk a/1 pen? fill?
+                    emit 'gui-path-restore reduce [borrowed-ctx]
+                ]
+            ] [
+                do make error! rejoin ["draw: unknown command `" command "`"]
+            ]
+            cursor: next cursor
+        ]
+    ]
+
+    walk body false false
+
+    if empty? statements [
+        do make error! "draw: the block drew nothing"
+    ]
+    ; EVERY command goes in the prefix, and the block's value is a fresh
+    ; begin-path rather than the last command.
+    ;
+    ; Making the last call the value looked tidier and silently dropped it: in
+    ; statement position the value of a block-expr is discarded, side effect and
+    ; all, so a block ending in a shape lost that shape and nothing said so. It
+    ; cost a knob its centre dot, found only by diffing against the C editor
+    ; this dialect was replacing.
+    ;
+    ; begin-path is the right filler because it is genuinely inert: it starts a
+    ; path that nothing then fills or strokes, so whether the emitter keeps it
+    ; or folds it away, the drawing is identical.
+    macro-expr reduce [
+        'block-expr statements
+        reduce ['call 'gui-path-begin reduce [borrowed-ctx] 'none!]
+    ]
+]

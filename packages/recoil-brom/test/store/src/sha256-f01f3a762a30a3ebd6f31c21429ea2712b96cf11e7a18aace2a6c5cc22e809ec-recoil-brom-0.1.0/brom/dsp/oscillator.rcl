@@ -1,0 +1,1792 @@
+Recoil [
+    Title: "Brom DSP oscillator family"
+    Description: {
+        A family of oscillator types, like brom/dsp/filter. Sharing means each
+        type exists once, in Brom, rather than one waveform being forced on
+        every instrument.
+
+        Members so far:
+          brom-blep-saw   -- band-limited sawtooth via PolyBLEP, from Loos
+          brom-pd-*       -- phase-distortion warps, from Mach
+
+        These are stateless: they derive a sample from a phase the caller owns
+        and advances. Phase is voice bookkeeping, not waveform generation, and an
+        instrument that wants sync, drift or per-voice detune needs it to stay
+        its own.
+
+        The phase-distortion family is the second kind. A PD oscillator does not
+        generate a waveform at all -- it rewrites the phase, and something else
+        reads a table at the rewritten position. So what lives here is the warp
+        (five of them), the table read, and the harmonic addressing; the
+        instrument owns the table, the slope spectrum and the voice.
+
+        Every warp maps 0..1 onto 0..1 monotonically and is written as a sum of
+        clamped ramps rather than an if-ladder, so the per-sample path has no
+        data-dependent branch -- the piecewise-linear shapes are algebraically
+        identical to the segment form, not an approximation of it.
+    }
+    Type: module
+    Module: brom/dsp/oscillator
+    Imports: [
+        brom/dsp/utils [brom-clamp-f64 brom-clamp-i32 brom-abs-f64 brom-fast-exp]
+    ]
+    Exports: [
+        brom-poly-blep brom-blep-saw
+        BROM-BLAMP-HALF BROM-BLAMP-OVERSAMPLE BROM-BLAMP-POINTS
+        brom-blamp-table! brom-blamp-table-bytes brom-blamp-table-fill
+        brom-blamp-residual
+        BROM-MORPH-MIN
+        brom-morph-osc! brom-morph-osc-bytes brom-morph-osc-reset
+        brom-morph-osc-set-phase brom-morph-osc-tick
+        BROM-WAVETABLE-SIZE BROM-WAVETABLE-MASK BROM-MAX-HARMONICS
+        BROM-PD-ALGO-SAWTOOTH BROM-PD-ALGO-SINEPULSE BROM-PD-ALGO-SQUARE
+        BROM-PD-ALGO-SAWSQUARE BROM-PD-ALGO-TRAPEZOID
+        brom-fract brom-wrap-phase
+        brom-wavetable! brom-wavetable-bytes brom-wavetable-fill
+        brom-wavetable-read brom-wavetable-read-fast
+        brom-pd-cache! brom-pd-cache-update brom-pd-warp
+        brom-pd-square brom-pd-trapezoid brom-pd-distort
+        brom-harmonic-phase brom-slope-value
+        brom-ln-table! brom-ln-table-bytes brom-ln-table-fill
+        brom-slope-table! brom-slope-table-bytes brom-slope-table-fill
+        brom-slope-table-audible-limit brom-slope-table-crest
+        BROM-ENV-MULTIPLY BROM-ENV-ADD BROM-ENV-BIPOLAR
+        brom-modulate brom-dc-coefficient
+        brom-fm-deviation brom-fm-budget brom-fm-harmonic-limit
+        brom-fm-feedback-limit
+        brom-osc-params! brom-osc-env!
+        brom-pd-osc! brom-pd-osc-bytes brom-pd-osc-reset
+        brom-pd-osc-set-frequency brom-pd-osc-advance-phase brom-pd-osc-set-phase
+        brom-pd-osc-trigger brom-pd-osc-ramp brom-pd-osc-decay-ramp
+        brom-pd-osc-advance-ramp
+        brom-pd-osc-set-correction brom-pd-osc-clear-correction
+        brom-pd-osc-set-gain
+        brom-sum-harmonics brom-pd-osc-render
+    ]
+]
+
+brom-poly-blep: func [
+    "Return a PolyBLEP correction for one sawtooth edge."
+    #inline
+    phase [f64!] "Oscillator phase in the half-open unit interval."
+    step [f64!] "Phase step per sample."
+    return: [f64!] "Band-limiting correction; zero away from the discontinuity."
+] [
+    ; A naive saw's jump from +1 to -1 is a step discontinuity, which in a
+    ; sampled signal aliases across the whole spectrum. PolyBLEP subtracts a
+    ; two-sample polynomial approximation of the band-limited step, which is
+    ; cheap enough for a per-sample path and removes most of the audible alias.
+    either phase < step [
+        x: phase / step
+        return x + x - (x * x) - 1.0
+    ] [
+        edge: 1.0 - step
+        either phase > edge [
+            x: (phase - 1.0) / step
+            return (x * x) + x + x + 1.0
+        ] [return 0.0]
+    ]
+]
+
+brom-blep-saw: func [
+    "One band-limited sawtooth sample for a phase the caller owns."
+    #inline
+    phase [f64!] "Oscillator phase in the half-open unit interval."
+    step [f64!] "Phase step per sample -- frequency divided by sample rate."
+    return: [f64!] "Sample in -1..1, band-limited around the edge."
+] [
+    return ((2.0 * phase) - 1.0) - brom-poly-blep phase step
+]
+
+; Declared here rather than beside the phase-distortion code it was written
+; for: the slope correction below calls it, and a foreign block referenced
+; above its declaration does not raise -- it mis-parses into an untyped word
+; and surfaces later as a type error with no location.
+osc-math: foreign <math.h> [
+    sin: "sin" [f64! return: [f64!]]
+    cos: "cos" [f64! return: [f64!]]
+    log: "log" [f64! return: [f64!]]
+    exp: "exp" [f64! return: [f64!]]
+]
+
+brom-fract: func [
+    "Return the fractional part of a non-negative value."
+    #inline
+    value [f64!] "Value at or above zero; a negative input truncates toward zero instead."
+    return: [f64!] "Value minus its integer part, in 0..1."
+] [
+    return value - (as f64! (as i64! value))
+]
+
+brom-wrap-phase: func [
+    "Wrap an arbitrary phase into the half-open unit interval."
+    #inline
+    value [f64!] "Phase in cycles; negative and multi-cycle values are accepted."
+    return: [f64!] "Equivalent phase in 0..<1."
+] [
+    part: brom-fract value
+    return either part < 0.0 [part + 1.0] [part]
+]
+
+; ---------------------------------------------------------------------------
+; Band-limited slope correction
+; ---------------------------------------------------------------------------
+
+; PolyBLEP above corrects a jump in VALUE. This corrects a jump in SLOPE, which
+; is what a variable-slope ramp -- a sawtooth at one end of its travel, a
+; triangle at the other -- is made of. A slope break aliases far less than a
+; value break to begin with, its spectrum falling as 1/n^2 rather than 1/n, but
+; "less" is still audible: measured on a naive morph oscillator the worst
+; audible alias runs to -30 dBc at the top of the keyboard.
+;
+; The correction is a stored residual: the difference between a band-limited
+; ramp and the ideal one, sampled finely enough either side of the break that a
+; break landing between samples can be read out by interpolation. It is
+; expressed in SAMPLES rather than cycles, which is what makes one table serve
+; every sample rate and every pitch -- it is built once and never rebuilt.
+;
+; Measured against a two-point PolyBLEP saw, in the band below 16 kHz, which is
+; the only alias worth counting -- above it the fold lands where nobody hears
+; it, and a measurement that includes it reports a floor set by inaudible
+; content:
+;
+;     note   PolyBLEP    this
+;     A2      -61.9     -91.1
+;     A4      -50.5     -79.4
+;     A6      -37.8     -67.1
+;     A7      -31.7     -61.0
+;
+; Half-width of the correction window, in samples. Sixteen either side buys the
+; figures above; eight halves the work for about six decibels back.
+BROM-BLAMP-HALF: 16
+; Sub-sample resolution of the stored residual. A break almost never lands on a
+; sample, so the read interpolates between neighbours. Rounding to the nearest
+; entry instead is its own noise floor near -48 dBc -- above the correction
+; this exists to deliver, which makes the interpolation load-bearing rather
+; than a refinement.
+BROM-BLAMP-OVERSAMPLE: 256
+BROM-BLAMP-POINTS: 8193
+BROM-BLAMP-SPAN: 8192
+; Samples touched by one break: BROM-BLAMP-HALF either side.
+BROM-BLAMP-WINDOW: 32
+; Index of the break itself: half of BROM-BLAMP-SPAN, written out because a
+; binop between two compile-time constants still fails type inference here.
+BROM-BLAMP-CENTRE: 4096
+BROM-BLAMP-CENTRE-F: 4096.0
+BROM-BLAMP-PI: 3.141592653589793
+BROM-BLAMP-TWO-PI: 6.283185307179586
+
+brom-blamp-table!: make c-struct! [
+    residual: [c-array! [f64! 8193]]
+]
+
+brom-blamp-table-bytes: func [
+    "Byte size a caller must allocate to hold one slope-correction table."
+    return: [i32!] "Size in bytes of a brom-blamp-table!."
+] [
+    return as i32! size-of brom-blamp-table!
+]
+
+brom-blamp-table-fill: func [
+    "Derive the band-limited ramp residual into caller-owned table storage."
+    :table [c-pointer!] "Borrowed address of brom-blamp-table-bytes bytes."
+    return: [none!] "No value; the table is filled in place."
+] [
+    ; Built rather than tabulated as constants, because the derivation is the
+    ; explanation: a windowed sinc is the band-limited impulse, its running sum
+    ; is the band-limited step, subtracting the ideal step leaves what PolyBLEP
+    ; approximates with a polynomial, and running-summing THAT gives the ramp.
+    ; Each stage is one loop and none of it needs to be believed on trust.
+    t: make [#mutable brom-blamp-table!] as brom-blamp-table! :table
+    centre: BROM-BLAMP-CENTRE-F
+    scale: as f64! BROM-BLAMP-OVERSAMPLE
+
+    ; The window has to be normalised by its own sum, not by an analytic
+    ; constant: a truncated, windowed sinc does not integrate to exactly one,
+    ; and a step response that settles anywhere but one leaves a DC error in
+    ; every correction.
+    total: make [#mutable f64!] 0.0
+    repeat i BROM-BLAMP-POINTS [
+        offset: ((as f64! i) - centre) / scale
+        sinc: either offset = 0.0 [
+            1.0
+        ] [
+            (osc-math/sin (BROM-BLAMP-PI * offset)) / (BROM-BLAMP-PI * offset)
+        ]
+        ; Blackman: its stopband is far enough down that the window, rather
+        ; than the truncation, stops being what limits the result.
+        angle: (BROM-BLAMP-TWO-PI * (as f64! i)) / (as f64! BROM-BLAMP-SPAN)
+        window: 0.42 - (0.5 * (osc-math/cos angle)) + (0.08 * (osc-math/cos (2.0 * angle)))
+        total: total + (sinc * window)
+    ]
+
+    step-sum: make [#mutable f64!] 0.0
+    ramp-sum: make [#mutable f64!] 0.0
+    repeat i BROM-BLAMP-POINTS [
+        offset: ((as f64! i) - centre) / scale
+        sinc: either offset = 0.0 [
+            1.0
+        ] [
+            (osc-math/sin (BROM-BLAMP-PI * offset)) / (BROM-BLAMP-PI * offset)
+        ]
+        angle: (BROM-BLAMP-TWO-PI * (as f64! i)) / (as f64! BROM-BLAMP-SPAN)
+        window: 0.42 - (0.5 * (osc-math/cos angle)) + (0.08 * (osc-math/cos (2.0 * angle)))
+        step-sum: step-sum + ((sinc * window) / total)
+        ; The ideal step switches at the centre, which is where the break is
+        ; taken to be; the residual is what the band-limited one has that the
+        ; ideal one does not.
+        ideal: either i < BROM-BLAMP-CENTRE [0.0] [1.0]
+        ramp-sum: ramp-sum + ((step-sum - ideal) / scale)
+        t/residual/:i: ramp-sum
+    ]
+    return none
+]
+
+brom-blamp-residual: func [
+    #inline
+    "Read the ramp residual at a sub-sample offset, linearly interpolated."
+    :table [c-pointer!] "Borrowed address of a filled brom-blamp-table!."
+    position [f64!] "Offset from the break in table entries, not samples."
+    return: [f64!] "Residual, or zero beyond the window where it has decayed."
+] [
+    t: make [#mutable brom-blamp-table!] as brom-blamp-table! :table
+    if position < 0.0 [return 0.0]
+    whole: as i32! position
+    if whole >= BROM-BLAMP-SPAN [return 0.0]
+    fraction: position - (as f64! whole)
+    next-index: whole + 1
+    low: make f64! t/residual/:whole
+    high: make f64! t/residual/:next-index
+    return low + ((high - low) * fraction)
+]
+
+; ---------------------------------------------------------------------------
+; Morphing ramp oscillator
+; ---------------------------------------------------------------------------
+
+; One waveform family rather than two blended: the ramp rises for the first
+; `morph` of its cycle and falls for the rest, so half is a triangle and the
+; whole travel is a genuine change of shape. Crossfading a saw against a
+; triangle would be a different sound and would need two band-limited sources
+; to do it.
+;
+; The falling segment is never allowed shorter than one sample. That is what
+; keeps this a slope problem: with a floor of one sample the fall stays a ramp
+; rather than becoming a step, so there is no value discontinuity anywhere in
+; the travel and no second correction to switch to. The cost is a sinc roll-off
+; of 1.9 dB at 16 kHz, tapering to 0.13 dB at 4 kHz -- a gentle top-end shelf,
+; and one an analogue oscillator would not have been flatter than.
+BROM-MORPH-RING: 64
+BROM-MORPH-RING-MASK: 63
+BROM-MORPH-MIN: 0.5
+BROM-MORPH-MAX-STEP: 0.25
+
+brom-morph-osc!: make c-struct! [
+    phase: [f64!]
+    ; Corrections reach both backwards and forwards from a break, so a sample
+    ; cannot be emitted until every break that touches it has been seen. The
+    ; ring holds that window and the output trails the input by BROM-BLAMP-HALF
+    ; samples because of it -- a third of a millisecond at 44.1 kHz.
+    ring: [c-array! [f64! 64]]
+    cursor: [i32!]
+    ; Ticks since the last reset, saturating once the window has filled. A
+    ; break reaches backwards, and at the very start "backwards" is before the
+    ; oscillator existed: those corrections have no sample to land on and the
+    ; ring index for them wraps to the far end, where they would surface a
+    ; whole revolution later as a click. Counting the first few ticks is what
+    ; lets them be dropped instead of wrapped.
+    primed: [i32!]
+]
+
+brom-morph-osc-bytes: func [
+    "Byte size a caller must allocate to hold one morphing oscillator."
+    return: [i32!] "Size in bytes of a brom-morph-osc!."
+] [
+    return as i32! size-of brom-morph-osc!
+]
+
+brom-morph-osc-reset: func [
+    "Clear an oscillator's phase and its pending corrections."
+    :osc [c-pointer!] "Borrowed address of a caller-owned brom-morph-osc!."
+    return: [none!] "No value."
+] [
+    o: make [#mutable brom-morph-osc!] as brom-morph-osc! :osc
+    o/phase: 0.0
+    o/cursor: 0
+    o/primed: 0
+    repeat i BROM-MORPH-RING [o/ring/:i: 0.0]
+    return none
+]
+
+brom-morph-osc-set-phase: func [
+    "Place an oscillator's phase without disturbing its pending corrections."
+    :osc [c-pointer!] "Borrowed address of a caller-owned brom-morph-osc!."
+    phase [f64!] "Phase in 0..1; values outside are wrapped."
+    return: [none!] "No value."
+] [
+    o: make [#mutable brom-morph-osc!] as brom-morph-osc! :osc
+    o/phase: brom-wrap-phase phase
+    return none
+]
+
+brom-morph-apply-break: func [
+    "Add one slope break's correction into an oscillator's pending window."
+    :osc [c-pointer!] "Borrowed brom-morph-osc! whose ring is amended in place."
+    :table [c-pointer!] "Borrowed address of a filled brom-blamp-table!."
+    fraction [f64!] "How far before the coming sample the break fell, in samples."
+    slope-change [f64!] "Change in slope across the break, per sample."
+    return: [none!] "No value; the correction is accumulated, never assigned."
+] [
+    o: make [#mutable brom-morph-osc!] as brom-morph-osc! :osc
+    ; Below this the target sample precedes the reset and is dropped.
+    first-live: (BROM-BLAMP-HALF - 1) - o/primed
+    repeat j BROM-BLAMP-WINDOW [
+        if j >= first-live [
+        position: ((as f64! j) + fraction) * (as f64! BROM-BLAMP-OVERSAMPLE)
+        correction: slope-change * (brom-blamp-residual :table position)
+        ; Accumulated, because at the top of the keyboard a break arrives every
+        ; dozen samples and windows overlap two and three deep. Assigning here
+        ; would silently drop every correction but the last.
+        index: (o/cursor + 1 + j - BROM-BLAMP-HALF) & BROM-MORPH-RING-MASK
+        held: make f64! o/ring/:index
+        o/ring/:index: held + correction
+        ]
+    ]
+    return none
+]
+
+brom-morph-osc-tick: func [
+    "One band-limited sample of a morphing ramp, corrected at both slope breaks."
+    :osc [c-pointer!] "Borrowed address of a caller-owned brom-morph-osc!."
+    :table [c-pointer!] "Borrowed address of a filled brom-blamp-table!."
+    step [f64!] "Phase step per sample -- frequency divided by sample rate."
+    morph [f64!] "Fraction of the cycle spent rising; 0.5 is a triangle, 1 a saw."
+    return: [f64!] "Sample in -1..1, delayed by BROM-BLAMP-HALF samples."
+] [
+    o: make [#mutable brom-morph-osc!] as brom-morph-osc! :osc
+    bounded-step: brom-clamp-f64 step 0.0 BROM-MORPH-MAX-STEP
+    ; The upper bound is where the fall reaches one sample, so it tightens as
+    ; the note rises. It is never audible that it does: the difference between
+    ; a fall of one sample and an instantaneous one lives above Nyquist at
+    ; every pitch.
+    break-point: brom-clamp-f64 morph BROM-MORPH-MIN (1.0 - bounded-step)
+    rise-slope: 2.0 / break-point
+    fall-slope: 0.0 - (2.0 / (1.0 - break-point))
+
+    value: either o/phase < break-point [
+        (rise-slope * o/phase) - 1.0
+    ] [
+        ((1.0 - o/phase) * (0.0 - fall-slope)) - 1.0
+    ]
+    held: make f64! o/ring/(o/cursor)
+    o/ring/(o/cursor): held + value
+
+    next-phase: o/phase + bounded-step
+
+    ; Rise to fall, at the break point.
+    if all [o/phase < break-point next-phase >= break-point] [
+        crossed: (break-point - o/phase) / bounded-step
+        brom-morph-apply-break :osc :table (1.0 - crossed)
+            ((fall-slope - rise-slope) * bounded-step)
+    ]
+    ; Fall to rise, at the wrap.
+    if next-phase >= 1.0 [
+        brom-morph-apply-break :osc :table ((next-phase - 1.0) / bounded-step)
+            ((rise-slope - fall-slope) * bounded-step)
+    ]
+
+    if o/primed < BROM-BLAMP-HALF [o/primed: o/primed + 1]
+    emit-index: (o/cursor - BROM-BLAMP-HALF) & BROM-MORPH-RING-MASK
+    result: make f64! o/ring/:emit-index
+    o/ring/:emit-index: 0.0
+    o/cursor: (o/cursor + 1) & BROM-MORPH-RING-MASK
+    o/phase: either next-phase >= 1.0 [next-phase - 1.0] [next-phase]
+    return result
+]
+
+; ---------------------------------------------------------------------------
+; Phase distortion
+; ---------------------------------------------------------------------------
+
+; 16384 points is the resolution at which linear interpolation stops being the
+; dominant error: the interpolation residual of a sine over one step is about
+; 2e-8, which is already down at single-precision rounding.
+BROM-WAVETABLE-SIZE: 16384
+BROM-WAVETABLE-MASK: 16383
+; A power-of-two table size is what makes the index wrap a mask rather than a
+; modulo, which matters because the read happens once per harmonic per sample.
+
+; Harmonics above this are never summed regardless of what the caller asks for.
+; At the bottom of the keyboard 128 harmonics already reach past 20 kHz.
+BROM-MAX-HARMONICS: 128
+
+; Maps a slope parameter of -1..+1 onto a 1/h^e spectral rolloff with e in
+; -8..+8. Offset by one elsewhere so that slope zero gives e = 1, which is a
+; sawtooth's 1/h.
+BROM-SLOPE-EXPONENT-RANGE: 8.0
+; Largest inter-channel phase offset the top of the spectrum is pushed to, in
+; cycles either side of centre. A sixteenth of a cycle is twenty-two degrees:
+; wide enough to hear as an image rather than as a level, and far enough below
+; the quarter cycle at which a partial cancels completely in mono that the
+; control widens the stereo picture instead of hollowing out the mono one.
+BROM-SPREAD-PHASE-MAX: 0.0625
+; --- keeping frequency modulation inside the band ---------------------------
+; Phase modulation puts sidebands either side of every component it touches,
+; and nothing downstream removes them: the harmonic sum caps harmonics at
+; Nyquist, but the sidebands are generated after that cap and are unbounded.
+; Measured on the unguarded engine, two-operator FM at full depth reached
+; -26 dBc at C6, which is five percent of the output.
+;
+; Carson's rule bounds it. A phase deviation of b radians at a modulating
+; frequency fm puts significant energy out to b*fm either side, so the upper
+; edge of harmonic h sits at h*fc + h*deviation + extra. Two facts make this
+; cheap to apply: the deviation scales with h, because harmonic h reads at h
+; times the modulated phase; and the same inequality solved the other way gives
+; the largest depth that still fits.
+;
+; The phase this oscillator adds is (input * amount * 0.5) CYCLES, so the
+; deviation in radians is pi * amount, and in hertz pi * amount * fm.
+BROM-FM-PI: 3.141592653589793
+
+brom-fm-deviation: func [
+    "Peak frequency deviation, in Hz, that a depth against a modulator produces."
+    #inline
+    depth [f64!] "Phase-modulation depth, in the units the FM amount uses."
+    modulator [f64!] "Frequency of whatever is doing the modulating, in Hz."
+    return: [f64!] "Deviation in Hz; zero when either operand is."
+] [
+    return BROM-FM-PI * (brom-abs-f64 depth) * modulator
+]
+
+brom-fm-budget: func [
+    "Largest total deviation whose sidebands still fit under Nyquist."
+    #inline
+    carrier [f64!] "Carrier frequency in Hz."
+    extra [f64!] "Sum of the modulating frequencies -- Carson's other term."
+    nyquist [f64!] "Highest frequency to synthesise."
+    return: [f64!] "Budget in Hz, never negative."
+] [
+    room: nyquist - carrier - extra
+    return either room > 0.0 [room] [0.0]
+]
+
+; Self-modulation does not obey the estimate above. Carson prices a modulator
+; of known bandwidth, but a feedback path's modulator IS the enriched output,
+; so the spectrum it needs grows far faster than one sinusoid's would. Measured
+; on this engine, the depth that stays under -60 dBc falls only from 0.90 to
+; 0.45 across four and a half octaves -- nothing like the 1/f the Carson term
+; predicts -- because the real constraint is how many HARMONICS self-FM needs,
+; and that count does not depend on pitch.
+;
+; The two constants below are a fit to that measurement, not a derivation:
+; N ~ 0.6 * exp(6.9 * depth) reproduces the depth at which every one of the
+; five probed pitches crosses the threshold. Re-measure them if the
+; oversampling factor or the decimator changes, because both move the target.
+BROM-FB-SPREAD: 0.6
+BROM-FB-GROWTH: 8.0
+
+brom-fm-feedback-limit: func [
+    "Largest self-modulation depth whose spectrum still fits under Nyquist."
+    #inline
+    carrier [f64!] "Carrier frequency in Hz."
+    nyquist [f64!] "Highest frequency to synthesise."
+    return: [f64!] "Cap on the depth; falls smoothly with pitch."
+] [
+    if carrier <= 0.0 [return 0.0]
+    available: nyquist / carrier
+    if available <= BROM-FB-SPREAD [return 0.0]
+    return (osc-math/log (available / BROM-FB-SPREAD)) / BROM-FB-GROWTH
+]
+
+brom-fm-harmonic-limit: func [
+    "Highest harmonic whose sidebands still fit, given a deviation."
+    #inline
+    carrier [f64!] "Carrier frequency in Hz."
+    deviation [f64!] "Total peak deviation in Hz, after any scaling back."
+    extra [f64!] "Sum of the modulating frequencies."
+    nyquist [f64!] "Highest frequency to synthesise."
+    return: [i32!] "Harmonic cap; BROM-MAX-HARMONICS when nothing is modulating."
+] [
+    ; Nothing modulating means no sidebands and nothing to bound, and the caller
+    ; keeps the limit it already had -- which is what makes an FM-free patch
+    ; render exactly the samples it rendered before this existed.
+    if deviation <= 0.0 [return BROM-MAX-HARMONICS]
+    room: nyquist - extra
+    if room <= 0.0 [return 1]
+    span: carrier + deviation
+    if span <= 0.0 [return BROM-MAX-HARMONICS]
+    limit: as i32! (room / span)
+    if limit < 1 [return 1]
+    if limit > BROM-MAX-HARMONICS [return BROM-MAX-HARMONICS]
+    return limit
+]
+
+; Two pi, spelled here because filter.rcl's copy is not imported by this module.
+BROM-DC-TAU: 6.283185307179586
+; Corner of the oscillator's DC blocker, in Hz. Five rather than the usual ten
+; because the bottom of a keyboard is real signal: at five hertz a twenty-hertz
+; fundamental loses a quarter of a decibel, at ten it loses a whole one.
+BROM-DC-BLOCK-HZ: 5.0
+
+brom-dc-coefficient: func [
+    "Pole of a one-pole DC blocker with the shared corner, for a given rate."
+    sample-rate [f64!] "Rate the blocker is ticked at, in Hz -- oversampled if it is."
+    return: [f64!] "Feedback coefficient, just under one; zero for an unusable rate."
+] [
+    ; The exact exp, not brom-fast-exp. This coefficient sits at 0.9998 and the
+    ; approximation's error is absolute, not relative -- it answers 0.971 for
+    ; exp(0) -- so it would put the corner in the kilohertz and take the whole
+    ; bottom of the instrument with it. The same mistake cost the Juno filter
+    ; its low cutoffs; it is a control-rate call, so there is nothing to buy.
+    if sample-rate <= 1.0 [return 0.0]
+    return osc-math/exp (0.0 - (BROM-DC-TAU * BROM-DC-BLOCK-HZ / sample-rate))
+]
+
+; Warp selectors. Plain integers rather than an enum!, because enum! variants
+; lower to unqualified C identifiers and `square` would collide with most
+; things a host links.
+BROM-PD-ALGO-SAWTOOTH: 0
+BROM-PD-ALGO-SINEPULSE: 1
+BROM-PD-ALGO-SQUARE: 2
+BROM-PD-ALGO-SAWSQUARE: 3
+BROM-PD-ALGO-TRAPEZOID: 4
+
+; --- the wavetable ----------------------------------------------------------
+; The instrument owns the storage. A PD oscillator reads one table many times
+; per sample, and which table it is (sine or cosine) is a property of the
+; algorithm, so handing it in beats hiding a static one in here.
+
+brom-wavetable!: make c-struct! [
+    samples: [c-array! [f64! 16384]]
+]
+
+brom-wavetable-bytes: func [
+    "Byte size a caller must allocate to hold one wavetable."
+    return: [i32!] "Size in bytes of a brom-wavetable!."
+] [
+    return as i32! size-of brom-wavetable!
+]
+
+brom-wavetable-fill: func [
+    "Write one cycle of a sine or cosine into caller-owned table storage."
+    :table [c-pointer!] "Borrowed address of brom-wavetable-bytes bytes."
+    cosine? [logic!] "True for a cosine table, false for a sine table."
+    return: [none!] "No value; the table is filled in place."
+] [
+    wt: make [#mutable brom-wavetable!] as brom-wavetable! :table
+    ; TAU / BROM-WAVETABLE-SIZE. Written as a literal because a binop between two
+    ; literals currently fails type inference (T4100).
+    step: 6.283185307179586 / 16384.0
+    repeat i BROM-WAVETABLE-SIZE [
+        angle: (as f64! i) * step
+        value: either cosine? [osc-math/cos angle] [osc-math/sin angle]
+        wt/samples/:i: value
+    ]
+    return none
+]
+
+brom-wavetable-read: func [
+    "Read a filled wavetable at a fractional phase, linearly interpolated."
+    #inline
+    :table [c-pointer!] "Borrowed address of a filled brom-wavetable!."
+    phase [f64!] "Phase in 0..1; values outside wrap through the index mask."
+    return: [f64!] "Interpolated table value."
+] [
+    wt: make [#mutable brom-wavetable!] as brom-wavetable! :table
+    scaled: (brom-wrap-phase phase) * 16384.0
+    whole: as i32! scaled
+    i1: whole & BROM-WAVETABLE-MASK
+    i2: (i1 + 1) & BROM-WAVETABLE-MASK
+    frac: scaled - (as f64! whole)
+    ; A dynamic c-array! read carries no inferred type, so both need naming.
+    low: make f64! wt/samples/:i1
+    high: make f64! wt/samples/:i2
+    return low + ((high - low) * frac)
+]
+
+brom-wavetable-read-fast: func [
+    "Read a bounded phase directly, falling back for arbitrary phases."
+    #inline
+    :table [c-pointer!] "Borrowed address of a filled brom-wavetable!."
+    phase [f64!] "Phase in cycles; large values use the general reader."
+    return: [f64!] "Interpolated table value."
+] [
+    ; Harmonic phases are small (at most the partial cap plus spread and
+    ; drift), so reducing them modulo one is unnecessary. The wide guard also
+    ; keeps the scaled phase inside signed 32-bit range; anything outside it
+    ; retains the public reader's arbitrary-phase behavior.
+    either all [phase >= -131071.0 phase <= 131071.0] [
+        wt: make [#mutable brom-wavetable!] as brom-wavetable! :table
+        scaled: phase * 16384.0
+        truncated: as i32! scaled
+        negative-fraction?: scaled < (as f64! truncated)
+        whole: either negative-fraction? [truncated - 1] [truncated]
+        frac: either negative-fraction? [
+            (scaled - (as f64! truncated)) + 1.0
+        ] [
+            scaled - (as f64! truncated)
+        ]
+        i1: whole & BROM-WAVETABLE-MASK
+        i2: (i1 + 1) & BROM-WAVETABLE-MASK
+        low: make f64! wt/samples/:i1
+        high: make f64! wt/samples/:i2
+        return low + ((high - low) * frac)
+    ] [
+        return brom-wavetable-read :table phase
+    ]
+]
+
+brom-wavetable-read-bounded: func [
+    "Read a phase already proven to fit the direct signed-index range."
+    #inline
+    :table [c-pointer!] "Borrowed address of a filled brom-wavetable!."
+    phase [f64!] "Phase in cycles; caller has proven the bounded domain."
+    return: [f64!] "Interpolated table value."
+] [
+    wt: make [#mutable brom-wavetable!] as brom-wavetable! :table
+    scaled: phase * 16384.0
+    truncated: as i32! scaled
+    negative-fraction?: scaled < (as f64! truncated)
+    whole: either negative-fraction? [truncated - 1] [truncated]
+    frac: either negative-fraction? [
+        (scaled - (as f64! truncated)) + 1.0
+    ] [
+        scaled - (as f64! truncated)
+    ]
+    i1: whole & BROM-WAVETABLE-MASK
+    i2: (i1 + 1) & BROM-WAVETABLE-MASK
+    low: make f64! wt/samples/:i1
+    high: make f64! wt/samples/:i2
+    return low + ((high - low) * frac)
+]
+
+; --- the two-segment warp ---------------------------------------------------
+; Sawtooth and Sinepulse both bend phase through one moveable breakpoint: the
+; first half of the cycle is compressed into 0..breakpoint and the second half
+; stretched over the rest. Reading a cosine table through it gives the classic
+; Casio PD sawtooth; reading a sine gives the pulse.
+
+brom-pd-cache!: make c-struct! [
+    modulation: [f64!]
+    breakpoint: [f64!]
+    recip: [f64!]
+    inv-recip: [f64!]
+]
+
+brom-pd-cache-update: func [
+    "Recompute the warp coefficients for a modulation depth."
+    :cache [c-pointer!] "Borrowed address of a caller-owned brom-pd-cache!."
+    modulation [f64!] "Warp depth in 0..1; zero leaves phase unchanged."
+    return: [none!] "No value; the cache is updated in place."
+] [
+    ; Control-rate: the two divides here are what buy a multiply-only warp on
+    ; the per-sample path, which is where the cache earns its keep.
+    c: make [#mutable brom-pd-cache!] as brom-pd-cache! :cache
+    depth: brom-clamp-f64 modulation 0.0 1.0
+    bp: brom-clamp-f64 (0.5 - (0.49 * depth)) 0.01 0.99
+    c/modulation: depth
+    c/breakpoint: bp
+    c/recip: 0.5 / bp
+    c/inv-recip: 0.5 / (1.0 - bp)
+    return none
+]
+
+brom-pd-warp: func [
+    "Bend a phase through the cached breakpoint."
+    #inline
+    :cache [c-pointer!] "Borrowed address of a brom-pd-cache! already updated."
+    phase [f64!] "Phase in 0..1."
+    return: [f64!] "Warped phase in 0..1."
+] [
+    ; min(p, bp) * recip + max(p - bp, 0) * inv-recip is the two-segment map
+    ; written without a branch: below the breakpoint only the first term is
+    ; live, above it the first term has saturated at exactly one half.
+    c: make [#mutable brom-pd-cache!] as brom-pd-cache! :cache
+    bp: c/breakpoint
+    below: either phase < bp [phase] [bp]
+    above: either phase > bp [phase - bp] [0.0]
+    return (below * c/recip) + (above * c/inv-recip)
+]
+
+; --- square -----------------------------------------------------------------
+
+brom-pd-square: func [
+    "Bend phase into a square-wave shape with a moveable transition width."
+    #inline
+    phase [f64!] "Phase in 0..1."
+    modulation [f64!] "Warp depth in 0..1; higher is a harder edge."
+    return: [f64!] "Warped phase in 0..1."
+] [
+    ; Two plateaux at a quarter and three quarters joined by three ramps. Each
+    ; ramp is a clamped unit ramp scaled by its own rise, so the segments sum
+    ; instead of branching, and every plateau falls out of two saturated terms.
+    width: brom-clamp-f64 (0.25 * (1.0 - modulation)) 0.01 0.25
+    first-edge: brom-clamp-f64 (phase / width) 0.0 1.0
+    middle: brom-clamp-f64 ((phase - (0.5 - width)) / (2.0 * width)) 0.0 1.0
+    last-edge: brom-clamp-f64 ((phase - (1.0 - width)) / width) 0.0 1.0
+    return (0.25 * first-edge) + (0.5 * middle) + (0.25 * last-edge)
+]
+
+; --- trapezoid --------------------------------------------------------------
+
+brom-pd-trapezoid: func [
+    "Bend phase through a five-segment trapezoid."
+    #inline
+    phase [f64!] "Phase in 0..1."
+    modulation [f64!] "Warp depth in 0..1; zero is the identity map."
+    return: [f64!] "Warped phase in 0..1."
+] [
+    ; Output breakpoints are fixed at 0.25 / 0.375 / 0.625 / 0.75 and the input
+    ; breakpoints slide with modulation, so depth changes how much of the cycle
+    ; each output band occupies. At modulation zero the input breakpoints land
+    ; on the output ones and the whole map collapses to the identity.
+    depth: brom-clamp-f64 modulation 0.0 1.0
+    rest: 1.0 - depth
+    x1: (0.25 * rest) + (0.01 * depth)
+    x2: (0.375 * rest) + (0.49 * depth)
+    x3: (0.625 * rest) + (0.51 * depth)
+    x4: (0.75 * rest) + (0.99 * depth)
+    s1: brom-clamp-f64 (phase / x1) 0.0 1.0
+    s2: brom-clamp-f64 ((phase - x1) / (x2 - x1)) 0.0 1.0
+    s3: brom-clamp-f64 ((phase - x2) / (x3 - x2)) 0.0 1.0
+    s4: brom-clamp-f64 ((phase - x3) / (x4 - x3)) 0.0 1.0
+    s5: brom-clamp-f64 ((phase - x4) / (1.0 - x4)) 0.0 1.0
+    return (0.25 * s1) + (0.125 * s2) + (0.25 * s3) + (0.125 * s4) + (0.25 * s5)
+]
+
+; --- dispatch ---------------------------------------------------------------
+
+brom-pd-distort: func [
+    "Bend a phase through the selected phase-distortion warp."
+    :cache [c-pointer!] "Borrowed brom-pd-cache!, already updated for this modulation."
+    phase [f64!] "Phase in 0..1."
+    modulation [f64!] "Warp depth in 0..1, for the warps that do not use the cache."
+    algorithm [i32!] "One of the BROM-PD-* selectors."
+    return: [f64!] "Warped phase in 0..1."
+] [
+    ; Normalize here rather than relying on the table read downstream: every
+    ; warp is defined on the unit interval, and clamping a negative FM phase in
+    ; a piecewise warp produces a different shape even if the later lookup
+    ; wraps. Depth is normalized here for direct callers as well as the stateful
+    ; oscillator.
+    wrapped: either any [phase < 0.0 phase > 1.0] [brom-wrap-phase phase] [phase]
+    depth: brom-clamp-f64 modulation 0.0 1.0
+
+    ; The selector is loop-invariant across a block, so this compare chain costs
+    ; a perfectly predicted branch rather than a real one.
+    if algorithm = BROM-PD-ALGO-SQUARE [return brom-pd-square wrapped depth]
+    if algorithm = BROM-PD-ALGO-TRAPEZOID [return brom-pd-trapezoid wrapped depth]
+    if algorithm = BROM-PD-ALGO-SAWSQUARE [
+        ; Two warped half-cycles back to back: the fractional part of twice the
+        ; phase is the position within the half, and its integer part is which
+        ; half. Both fall out of one truncation, so the split needs no branch.
+        doubled: wrapped * 2.0
+        half-index: as f64! (as i64! doubled)
+        return ((brom-pd-warp :cache (doubled - half-index)) * 0.5) + (half-index * 0.5)
+    ]
+    return brom-pd-warp :cache wrapped
+]
+
+; --- harmonic addressing ----------------------------------------------------
+
+brom-harmonic-phase: func [
+    "Phase at which to read the table for one harmonic, including drift."
+    #inline
+    distorted [f64!] "Warped fundamental phase in 0..1."
+    harmonic [i32!] "Harmonic number, one for the fundamental."
+    drift [f64!] "Phase drift across the spectrum; zero locks every harmonic to the fundamental."
+    max-harmonics [i32!] "Harmonic count the drift is spread over."
+    return: [f64!] "Read phase in 0..1."
+] [
+    ; Drift grows with harmonic number, so the top of the spectrum slides
+    ; against the bottom instead of every partial starting together. That is
+    ; what stops a high harmonic count from sounding like one bright click.
+    drift-amount: drift * (as f64! (harmonic - 1)) / (as f64! max-harmonics)
+    return brom-wrap-phase ((distorted * (as f64! harmonic)) + (drift-amount * 0.5))
+]
+
+brom-slope-exponent: func [
+    "Rolloff exponent for a slope parameter."
+    #inline
+    slope-param [f64!] "Slope in -1..+1."
+    return: [f64!] "Exponent e for a 1/h^e spectrum; one at slope zero."
+] [
+    return (slope-param * BROM-SLOPE-EXPONENT-RANGE) + 1.0
+]
+
+brom-slope-value: func [
+    "Amplitude of one harmonic under a 1/h^e spectral slope."
+    harmonic [i32!] "Harmonic number, one for the fundamental."
+    slope-param [f64!] "Slope in -1..+1; zero gives a sawtooth's 1/h rolloff."
+    return: [f64!] "Amplitude multiplier for that harmonic, one for the fundamental."
+] [
+    ; h^-e written as exp(-e * ln h), which is what makes a whole slope table
+    ; one cheap call per harmonic instead of a pow.
+    ;
+    ; The exp is the approximate one. A rebuild walks 129 harmonics for each of
+    ; the odd and even tables, per oscillator, whenever a slope or level moves --
+    ; a knob being dragged rebuilds it every stride -- so this is control-rate
+    ; but not rare, and it is exactly where Mach's Rust core spends the budget
+    ; it does not have. 3.7% on a harmonic's level is a third of a decibel.
+    if harmonic <= 1 [return 1.0]
+    exponent: brom-slope-exponent slope-param
+    scaled: (0.0 - exponent) * (osc-math/log (as f64! harmonic))
+    return brom-fast-exp scaled
+]
+
+; --- rebuilding a whole spectrum --------------------------------------------
+; The single-value function above computes a logarithm every call, and that
+; logarithm costs three times what the rest of the calculation does. Anything
+; rebuilding a whole table -- which is the only thing that happens at any rate
+; worth measuring -- should hold ln(h) still and walk it.
+
+brom-ln-table!: make c-struct! [
+    values: [c-array! [f64! 129]]
+]
+
+brom-slope-table!: make c-struct! [
+    values: [c-array! [f64! 129]]
+]
+
+brom-ln-table-bytes: func [
+    "Byte size a caller must allocate to hold the natural logarithms."
+    return: [i32!] "Size in bytes of a brom-ln-table!."
+] [
+    return as i32! size-of brom-ln-table!
+]
+
+brom-slope-table-bytes: func [
+    "Byte size a caller must allocate to hold one slope spectrum."
+    return: [i32!] "Size in bytes of a brom-slope-table!."
+] [
+    return as i32! size-of brom-slope-table!
+]
+
+brom-ln-table-fill: func [
+    "Tabulate ln(h) for every harmonic, once, so rebuilds never call log again."
+    :table [c-pointer!] "Borrowed address of brom-ln-table-bytes bytes."
+    return: [none!] "No value; the table is filled in place."
+] [
+    ln: make [#mutable brom-ln-table!] as brom-ln-table! :table
+    ; Slot zero is never read -- harmonics are one-based -- but leaving it
+    ; uninitialised would make a future off-by-one read garbage instead of zero.
+    ln/values/0: 0.0
+    repeat step BROM-MAX-HARMONICS [
+        harmonic: step + 1
+        ln/values/(harmonic): osc-math/log (as f64! harmonic)
+    ]
+    return none
+]
+
+brom-slope-table-fill: func [
+    "Rebuild a whole 1/h^e spectrum from a tabulated set of logarithms."
+    :table [c-pointer!] "Borrowed brom-slope-table! to write."
+    :ln-table [c-pointer!] "Borrowed brom-ln-table!, already filled."
+    slope-param [f64!] "Slope in -1..+1; zero gives a sawtooth's 1/h rolloff."
+    return: [none!] "No value; the table is filled in place."
+] [
+    ; Rebuilt whenever a slope or level parameter moves, which while a knob is
+    ; being dragged means every stride, for each of the odd and even spectra,
+    ; for every oscillator. That is why it is worth the approximate exp: a real
+    ; one costs this loop rather more than twice over.
+    slope: make [#mutable brom-slope-table!] as brom-slope-table! :table
+    ln: make [#mutable brom-ln-table!] as brom-ln-table! :ln-table
+    negated: 0.0 - (brom-slope-exponent slope-param)
+    slope/values/0: 1.0
+    slope/values/1: 1.0
+    repeat step BROM-MAX-HARMONICS [
+        harmonic: step + 1
+        if harmonic > 1 [
+            slope/values/(harmonic): brom-fast-exp (negated * (make f64! ln/values/(harmonic)))
+        ]
+    ]
+    return none
+]
+
+brom-slope-table-audible-limit: func [
+    "Highest harmonic of one parity in a filled spectrum still worth summing."
+    :table [c-pointer!] "Borrowed brom-slope-table!, already filled."
+    level [f64!] "Level the whole series is scaled by; louder reaches further."
+    parity [i32!] "One to scan the odd harmonics, two to scan the even ones."
+    floor [i32!] "Answer when no harmonic of this parity is audible."
+    return: [i32!] "Highest audible harmonic of that parity, or floor."
+] [
+    ; A harmonic is inaudible once its amplitude times the level it is scaled by
+    ; falls under a millionth -- around -120 dB, below what either a listener or
+    ; a 24-bit format resolves. Dividing the floor by the level rather than
+    ; multiplying every value by it keeps the level out of the loop.
+    ;
+    ; `floor` rather than a derived value because the two parities disagree about
+    ; what "none audible" means: the fundamental is summed unconditionally, so
+    ; the odd answer bottoms out at one, while a spectrum with no audible even
+    ; harmonic has none at all and bottoms out at zero.
+    slope: make [#mutable brom-slope-table!] as brom-slope-table! :table
+    magnitude: brom-abs-f64 level
+    if magnitude <= 0.000001 [return floor]
+    threshold: 0.000001 / magnitude
+    ; Scanned to the end rather than stopped at the first inaudible harmonic.
+    ; Every table brom-slope-table-fill produces is h^-e and so monotonic, and
+    ; on one of those an early exit would give the same answer for a quarter of
+    ; the work. The full scan is here because the argument is a filled table
+    ; from whoever filled it, not necessarily that one -- making the answer a
+    ; property of the table rather than of an assumption about it. Sixty-four
+    ; iterations at control rate is not a cost worth trading that for.
+    last: make [#mutable i32!] floor
+    h: make [#mutable i32!] parity
+    while [h <= BROM-MAX-HARMONICS] [
+        if (make f64! slope/values/(h)) >= threshold [last: h]
+        h: h + 2
+    ]
+    return last
+]
+
+; How many phase points the crest scan below evaluates. A power of two that
+; divides the wavetable, so a harmonic's index is a multiply and a mask rather
+; than any trigonometry at all: sin(2*pi*h*j/P) is just the table entry at
+; (h * j * SIZE/P) masked to the table.
+;
+; 256 points because the parameter caps the series at 33 partials, which is
+; near enough eight points per cycle on the highest one -- within about half a
+; decibel of its true peak. What the scan misses low is what the output
+; saturator is for.
+BROM-CREST-POINTS: 256
+BROM-CREST-STRIDE: 64
+
+brom-slope-table-crest: func [
+    "Largest absolute value a filled spectrum reaches over one cycle, with the fundamental at unity."
+    :odd-table [c-pointer!] "Borrowed brom-slope-table! holding the odd series."
+    :even-table [c-pointer!] "Borrowed brom-slope-table! holding the even series."
+    :wave [c-pointer!] "Borrowed brom-wavetable!; pass the same table the oscillator will read."
+    odd-level [f64!] "Level the odd harmonics above the fundamental are scaled by."
+    even-level [f64!] "Level the even harmonics are scaled by."
+    count [i32!] "Harmonic count the patch asked for; the series runs to count + 1, as the render does."
+    return: [f64!] "Peak of the summed series."
+] [
+    ; The number the energy sum cannot give. Energy fixes RMS, and a spectrum
+    ; whose partials RISE with harmonic number sums to a narrow spike: same
+    ; energy, several times the peak. This is the term that catches it.
+    ;
+    ; Which table matters. A sine-phase series crosses zero at phase zero and
+    ; spreads its peak out; a cosine-phase one has every partial aligned there
+    ; and peaks at the sum of their magnitudes. The sawtooth warp is read with a
+    ; cosine and every other warp with a sine, so the caller passes whichever
+    ; this oscillator is actually going to use.
+    ;
+    ; The phase distortion itself does NOT enter here, and that is not an
+    ; omission: a PD warp is a monotonic remapping of the unit interval onto
+    ; itself, so it changes when each value occurs and never which values occur.
+    ; The set of samples is the same set, and so is its largest member.
+    ;
+    ; What is left out is per-voice: the envelope corrections and the stereo
+    ; spread's pan gains both scale individual partials after this runs. The
+    ; answer is therefore a good ceiling for the shared spectrum rather than a
+    ; guarantee about a particular voice.
+    odd: make [#mutable brom-slope-table!] as brom-slope-table! :odd-table
+    even: make [#mutable brom-slope-table!] as brom-slope-table! :even-table
+    wt: make [#mutable brom-wavetable!] as brom-wavetable! :wave
+    peak: make [#mutable f64!] 0.0
+    repeat j BROM-CREST-POINTS [
+        ; The fundamental is always present and always at unity, exactly as
+        ; brom-sum-harmonics has it.
+        total: make [#mutable f64!] wt/samples/(j * BROM-CREST-STRIDE)
+        repeat step count [
+            harmonic: step + 2
+            if harmonic <= BROM-MAX-HARMONICS [
+                level: either (harmonic % 2) = 0 [
+                    even-level * (make f64! even/values/(harmonic))
+                ] [
+                    odd-level * (make f64! odd/values/(harmonic))
+                ]
+                index: ((harmonic * j * BROM-CREST-STRIDE) & BROM-WAVETABLE-MASK)
+                total: total + (level * wt/samples/(index))
+            ]
+        ]
+        magnitude: brom-abs-f64 total
+        if magnitude > peak [peak: magnitude]
+    ]
+    return peak
+]
+
+; ---------------------------------------------------------------------------
+; A phase-distortion oscillator with state
+; ---------------------------------------------------------------------------
+; Everything above is stateless -- a warp, a table read, an addressing rule.
+; This is the oscillator those add up to: it owns a phase, a PD cache, and the
+; per-voice corrections that let one shared slope spectrum be modulated
+; differently by every voice playing it.
+
+; How an envelope is applied to a parameter. Plain integers rather than an
+; enum!, whose variants lower to unqualified C identifiers.
+BROM-ENV-MULTIPLY: 0
+BROM-ENV-ADD: 1
+BROM-ENV-BIPOLAR: 2
+
+brom-modulate: func [
+    "Apply an envelope to a parameter in one of three ways."
+    #inline
+    base [f64!] "Unmodulated parameter value."
+    level [f64!] "Envelope level, zero to one."
+    amount [f64!] "How much of the modulation to apply, zero to one."
+    mode [i32!] "One of the BROM-ENV-* constants."
+    return: [f64!] "Modulated value; equal to base when amount is zero."
+] [
+    ; Each mode picks a different fully-modulated target and then interpolates
+    ; toward it, so amount zero is exactly the base value in all three -- which
+    ; is what lets a modulation source be wired up and left at zero for free.
+    modulated: make [#mutable f64!] base
+    if mode = BROM-ENV-MULTIPLY [modulated: base * level]
+    if mode = BROM-ENV-ADD [
+        ; Scaled by the parameter's own size, with a floor so that a parameter
+        ; sitting near zero can still be modulated away from it.
+        span: either (brom-abs-f64 base) > 0.5 [brom-abs-f64 base] [0.5]
+        modulated: base + ((level - 0.5) * span * 2.0)
+    ]
+    if mode = BROM-ENV-BIPOLAR [modulated: base * ((level * 2.0) - 1.0)]
+    return base + ((modulated - base) * amount)
+]
+
+brom-osc-params!: make c-struct! [
+    odd-level: [f64!]
+    odd-level-env-amount: [f64!]
+    even-level: [f64!]
+    even-level-env-amount: [f64!]
+    odd-slope: [f64!]
+    odd-slope-env-amount: [f64!]
+    even-slope: [f64!]
+    even-slope-env-amount: [f64!]
+    phase-drift: [f64!]
+    num-harmonics: [i32!]
+    mix-level: [f64!]
+    fm-amount: [f64!]
+    fm-ratio: [f64!]
+    fm-env-amount: [f64!]
+    pd-env-amount: [f64!]
+    ; How far the spectrum opens across the stereo field, and how far the two
+    ; channels are pushed out of phase with each other doing it. Both nought to
+    ; one, and both nought means one channel's worth of work and a sum that is
+    ; the mono signal to the bit.
+    ; Self-modulation depth. An operator folded back on itself is what lets one
+    ; reach a sawtooth-like spectrum, and it is the thing a two-operator voice
+    ; most obviously lacks without it.
+    feedback: [f64!]
+    ; Frequency the modulator runs at, in Hz, when this oscillator is a carrier
+    ; and something is fixed rather than tracking the key. Zero means the ratio
+    ; decides, which is what the caller passes for every ordinary patch.
+    fm-fixed-hz: [f64!]
+    stereo-width: [f64!]
+    spread-phase: [f64!]
+    ; Pole of the DC blocker, for the rate this oscillator is ticked at --
+    ; the oversampled one. Zero disables the blocker outright, which is how the
+    ; before-and-after is measured rather than argued about.
+    dc-coefficient: [f64!]
+]
+
+brom-osc-env!: make c-struct! [
+    pd-level: [f64!]
+    odd-level-mod: [f64!]
+    even-level-mod: [f64!]
+    odd-slope-mod: [f64!]
+    even-slope-mod: [f64!]
+    amp-level: [f64!]
+    fm-level: [f64!]
+]
+
+brom-pd-osc!: make c-struct! [
+    phase: [f64!]
+    phase-delta: [f64!]
+    cache: [brom-pd-cache!]
+    ; Counts down from three after a trigger, halving the harmonic count each
+    ; step. elapsed samples make the opening independent of host block size.
+    harmonic-ramp: [i32!]
+    harmonic-ramp-elapsed: [i32!]
+    ; Per-voice multipliers over the shared slope spectrum, so sixteen voices
+    ; can modulate one table differently without each owning a copy of it. Both
+    ; sit at one when nothing is modulating them, which costs a multiply.
+    odd-correction: [c-array! [f64! 129]]
+    even-correction: [c-array! [f64! 129]]
+    ; Highest harmonic of each parity currently holding a value other than one,
+    ; or zero when the whole series is flat. Without it, returning a parity to
+    ; unity means writing over all sixty-four of its slots whether or not any
+    ; of them was ever displaced -- which, for a patch with no slope envelope,
+    ; is every one of them, every stride, forever.
+    odd-written: [i32!]
+    even-written: [i32!]
+    gain-compensation: [f64!]
+    ; The difference between the two channels for the sample just rendered.
+    ; A second return value, in the only place a function has to put one: the
+    ; caller reads it straight after brom-pd-osc-render. Zero unless the
+    ; spectrum is being spread, and the mono path never looks at it.
+    last-side: [f64!]
+    ; One-pole DC blocker per channel. It sits inside the oscillator, ahead of
+    ; the amplitude envelope, which is the placement that matters: the offset is
+    ; removed while the signal is still at constant level, so the envelope
+    ; shapes something already centred and there is no thump at the note
+    ; boundaries. Blocking after the envelope would only move the problem.
+    dc-x1: [f64!]
+    dc-y1: [f64!]
+    dc-side-x1: [f64!]
+    dc-side-y1: [f64!]
+    ; The last two outputs, for self-modulation. Averaged rather than used
+    ; singly: a one-sample feedback path goes chaotic well before the depth
+    ; control runs out, and the two-sample mean is the standard damping -- it is
+    ; what the DX7 does, for the same reason.
+    fb-y1: [f64!]
+    fb-y2: [f64!]
+]
+
+brom-pd-osc-bytes: func [
+    "Byte size a caller must allocate for one phase-distortion oscillator."
+    return: [i32!] "Size in bytes of a brom-pd-osc!."
+] [
+    return as i32! size-of brom-pd-osc!
+]
+
+brom-pd-osc-reset: func [
+    "Return an oscillator to silence, with no modulation and a flat correction."
+    :osc [c-pointer!] "Borrowed address of a caller-owned brom-pd-osc!."
+    return: [none!] "No value."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    o/phase: 0.0
+    o/phase-delta: 0.0
+    o/harmonic-ramp: 0
+    o/harmonic-ramp-elapsed: 0
+    o/gain-compensation: 1.0
+    o/last-side: 0.0
+    o/fb-y1: 0.0
+    o/fb-y2: 0.0
+    o/dc-x1: 0.0
+    o/dc-y1: 0.0
+    o/dc-side-x1: 0.0
+    o/dc-side-y1: 0.0
+    brom-pd-cache-update (addr-of o/cache) 0.0
+    repeat i 129 [
+        o/odd-correction/(i): 1.0
+        o/even-correction/(i): 1.0
+    ]
+    o/odd-written: 0
+    o/even-written: 0
+    return none
+]
+
+brom-pd-osc-set-frequency: func [
+    "Set how far the phase advances per sample."
+    #inline
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    frequency [f64!] "Oscillator frequency in Hz."
+    sample-rate [f64!] "Sample rate in Hz."
+    return: [none!] "No value."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    o/phase-delta: frequency / sample-rate
+    return none
+]
+
+brom-pd-osc-advance-phase: func [
+    "Advance the phase without producing a sample."
+    #inline
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    return: [none!] "No value."
+] [
+    ; For a voice too quiet to be worth rendering. Skipping the render is the
+    ; saving; skipping the phase as well would make the voice jump when it
+    ; became audible again.
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    o/phase: brom-wrap-phase (o/phase + o/phase-delta)
+    ; Nothing was rendered, so there is no side either. Left standing it would
+    ; be the previous sample's, and a silent oscillator would go on pushing an
+    ; image the caller can no longer hear the centre of.
+    o/last-side: 0.0
+    return none
+]
+
+brom-pd-osc-set-phase: func [
+    "Place an oscillator's phase, for a caller seeding one voice against another."
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    phase [f64!] "Phase in nought to one; wrapped if it is not."
+    return: [none!] "No value."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    o/phase: brom-wrap-phase phase
+    return none
+]
+
+brom-pd-osc-trigger: func [
+    "Restart an oscillator for a new note."
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    return: [none!] "No value."
+] [
+    ; The phase is deliberately left where it was. An oscillator that restarted
+    ; at zero on every note gave every note an identical attack transient and
+    ; locked every voice of a chord into the same phase relationship -- which is
+    ; most of what "sounds digital" means, and is not what the circuits this is
+    ; shaped after did. brom-pd-osc-reset still zeroes it, because that is a
+    ; real reset; a note is not one.
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    o/harmonic-ramp: 3
+    o/harmonic-ramp-elapsed: 0
+    o/gain-compensation: 1.0
+    o/last-side: 0.0
+    o/fb-y1: 0.0
+    o/fb-y2: 0.0
+    ; The DC blocker is deliberately NOT cleared here, for the same reason the
+    ; phase is not: it is part of a circuit that runs whether or not a note is
+    ; sounding, and clearing it would make every note begin with the blocker
+    ; settling from cold -- an offset decaying over ninety milliseconds under
+    ; the attack, which is audible as a thump and is exactly the artefact the
+    ; blocker exists to remove. brom-pd-osc-reset still clears it.
+    repeat i 129 [
+        o/odd-correction/(i): 1.0
+        o/even-correction/(i): 1.0
+    ]
+    o/odd-written: 0
+    o/even-written: 0
+    return none
+]
+
+brom-pd-osc-ramp: func [
+    "Return a harmonic limit reduced while a new note is still opening."
+    #inline
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    limit [i32!] "Harmonic limit the parameters ask for."
+    floor [i32!] "Smallest limit to return."
+    return: [i32!] "Limit for the current ramp stage."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    if o/harmonic-ramp <= 0 [return limit]
+    ; Halved once per remaining ramp step, so the spectrum opens out as an
+    ; eighth, a quarter, a half, then all of it.
+    divisor: 1 << o/harmonic-ramp
+    reduced: limit / divisor
+    return either reduced < floor [floor] [reduced]
+]
+
+brom-pd-osc-decay-ramp: func [
+    "Advance the harmonic ramp by one stage toward its full spectrum."
+    #inline
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    return: [none!] "No value."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    if o/harmonic-ramp > 0 [
+        o/harmonic-ramp: o/harmonic-ramp - 1
+        o/harmonic-ramp-elapsed: 0
+    ]
+    return none
+]
+
+brom-pd-osc-advance-ramp: func [
+    "Advance a triggered harmonic ramp by one output sample."
+    #inline
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    stage-samples [i32!] "Output samples in each ramp stage; values below one act as one."
+    return: [none!] "No value; the oscillator's ramp counters are updated."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    if o/harmonic-ramp <= 0 [return none]
+    span: either stage-samples > 0 [stage-samples] [1]
+    o/harmonic-ramp-elapsed: o/harmonic-ramp-elapsed + 1
+    if o/harmonic-ramp-elapsed >= span [brom-pd-osc-decay-ramp :osc]
+    return none
+]
+
+brom-pd-osc-set-correction: func [
+    "Write one parity's per-voice multipliers over the shared slope spectrum."
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    :ln-table [c-pointer!] "Borrowed brom-ln-table!, already filled."
+    odd? [logic!] "True for the odd series, false for the even."
+    delta-exponent [f64!] "How far this voice's slope is displaced from the shared one."
+    limit [i32!] "Highest harmonic to write; lower ones are not read."
+    return: [none!] "No value; the oscillator's corrections are updated in place."
+] [
+    ; The shared spectrum is one table for every voice playing the patch. A
+    ; voice whose slope envelope has moved it somewhere else does not get its
+    ; own copy -- it gets a multiplier, h^-delta, which is exactly the ratio
+    ; between the spectrum it wants and the one it is reading.
+    ;
+    ; Written rather than folded into the sum because the sum runs per sample
+    ; and this runs per stride group.
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    ln: make [#mutable brom-ln-table!] as brom-ln-table! :ln-table
+    negated: 0.0 - delta-exponent
+    start: either odd? [1] [2]
+    h: make [#mutable i32!] start
+    while [h <= limit] [
+        value: brom-fast-exp (negated * (make f64! ln/values/(h)))
+        either odd? [o/odd-correction/(h): value] [o/even-correction/(h): value]
+        h: h + 2
+    ]
+    ; If the audible limit has SHRUNK since the last write -- a spectrum that
+    ; darkened, a note that climbed and lost its top partials to Nyquist -- the
+    ; slots above it still hold the displacement they were given last time.
+    ; They are unread while the limit stays low and wrong the moment it rises
+    ; again, so they are returned to unity here rather than left to be
+    ; discovered later.
+    previous: either odd? [o/odd-written] [o/even-written]
+    while [h <= previous] [
+        either odd? [o/odd-correction/(h): 1.0] [o/even-correction/(h): 1.0]
+        h: h + 2
+    ]
+    either odd? [o/odd-written: limit] [o/even-written: limit]
+    return none
+]
+
+brom-pd-osc-clear-correction: func [
+    "Return one parity's per-voice multipliers to unity, doing nothing when they already are."
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    odd? [logic!] "True for the odd series, false for the even."
+    return: [none!] "No value."
+] [
+    ; Separate from writing them because a displacement too small to hear still
+    ; costs a table of exponentials to express, and unity is what it means.
+    ;
+    ; The early return is the whole point of the watermark. A patch whose slope
+    ; envelopes are unwired -- which is the default, and most patches -- takes
+    ; this branch on every stride of every voice, for both parities of both
+    ; oscillators. It used to write one over one across all sixty-four slots
+    ; each time: some hundred and twenty-eight pointless stores per frame per
+    ; voice, none of which changed a value. Now the first call flattens the
+    ; series and every call after it costs a compare.
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    written: either odd? [o/odd-written] [o/even-written]
+    if written = 0 [return none]
+    start: either odd? [1] [2]
+    h: make [#mutable i32!] start
+    while [h <= written] [
+        either odd? [o/odd-correction/(h): 1.0] [o/even-correction/(h): 1.0]
+        h: h + 2
+    ]
+    either odd? [o/odd-written: 0] [o/even-written: 0]
+    return none
+]
+
+brom-pd-osc-set-gain: func [
+    "Set the level correction applied to this oscillator's summed output."
+    #inline
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    gain [f64!] "Multiplier applied after the harmonics are summed."
+    return: [none!] "No value."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    o/gain-compensation: gain
+    return none
+]
+
+brom-sum-harmonics-bounded: func [
+    "Sum a harmonic series whose complete phase range passed the entry guard."
+    :table [c-pointer!] "Borrowed filled brom-wavetable!."
+    :osc [c-pointer!] "Borrowed brom-pd-osc!, for its per-voice corrections."
+    :params [c-pointer!] "Borrowed brom-osc-params!."
+    :odd-slope [c-pointer!] "Borrowed brom-slope-table! for the odd harmonics."
+    :even-slope [c-pointer!] "Borrowed brom-slope-table! for the even harmonics."
+    :ln-table [c-pointer!] "Borrowed brom-ln-table!, for the stereo spread curve."
+    distorted [f64!] "Warped fundamental phase."
+    frequency [f64!] "Oscillator frequency in Hz."
+    nyquist [f64!] "Highest frequency to synthesise; harmonics above it are dropped."
+    odd-level [f64!] "Level of the odd harmonics, already modulated."
+    even-level [f64!] "Level of the even harmonics, already modulated."
+    max-odd [i32!] "Highest audible odd harmonic."
+    max-even [i32!] "Highest audible even harmonic."
+    bandwidth-limit [i32!] "Harmonic cap from the modulation budget; BROM-MAX-HARMONICS when idle."
+    return: [f64!] "The centre of the sample; the side is left in the oscillator."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    p: make [#mutable brom-osc-params!] as brom-osc-params! :params
+    odd: make [#mutable brom-slope-table!] as brom-slope-table! :odd-slope
+    even: make [#mutable brom-slope-table!] as brom-slope-table! :even-slope
+
+    ; Three limits, and the tightest wins: what fits under Nyquist at this
+    ; pitch, what the patch asked for, and what the table can hold. The first is
+    ; why a low note is bright and the same patch an octave up is not.
+    by-frequency: as i32! (nyquist / frequency)
+    requested: p/num-harmonics + 1
+    limit: make [#mutable i32!] brom-clamp-i32 by-frequency 1 BROM-MAX-HARMONICS
+    if requested < limit [limit: requested]
+    ; A fourth limit, and the tightest still wins. It is BROM-MAX-HARMONICS
+    ; whenever nothing is modulating this oscillator, so this line changes
+    ; nothing for a patch that uses no FM and no feedback.
+    if bandwidth-limit < limit [limit: bandwidth-limit]
+
+    drift-step: either limit > 1 [p/phase-drift / (as f64! limit)] [0.0]
+    total: make [#mutable f64!] 0.0
+    side: make [#mutable f64!] 0.0
+
+    ; --- the stereo spread --------------------------------------------------
+    ; The fundamental stays in the centre and each harmonic above it is pushed
+    ; further out, alternating sides by parity: the spectrum opens outward from
+    ; a fixed anchor rather than being panned as a block, which is how a source
+    ; with a directional radiation pattern actually behaves.
+    ;
+    ; The curve is ln(h)/ln(cap) rather than a straight ramp in h, because the
+    ; partials crowd together at the top of the series and a linear spread
+    ; spends most of its travel where the ear resolves least.
+    ;
+    ; Normalized by what the patch ASKED for, not by the limit actually
+    ; rendered. The limit falls as the note rises -- Nyquist takes the top
+    ; harmonics away -- and normalizing by it would narrow the image as the
+    ; player went up the keyboard and move it whenever Harmonics was touched.
+    ln: make [#mutable brom-ln-table!] as brom-ln-table! :ln-table
+    stereo?: any [p/stereo-width > 0.0 p/spread-phase > 0.0]
+    cap: either requested > BROM-MAX-HARMONICS [BROM-MAX-HARMONICS] [requested]
+    inverse-ln-cap: either cap > 1 [1.0 / (make f64! ln/values/(cap))] [0.0]
+    phase-depth: p/spread-phase * BROM-SPREAD-PHASE-MAX
+
+    ; The fundamental is always present and always at unity -- it is the level
+    ; every other harmonic is expressed relative to. It is also the one partial
+    ; that is never spread, which is what gives the image something to sit on.
+    total: brom-wavetable-read-bounded :table distorted
+
+    even-limit: either max-even < limit [max-even] [limit]
+    h: make [#mutable i32!] 2
+    while [h <= even-limit] [
+        offset: (as f64! (h - 1)) * drift-step * 0.5
+        base: (distorted * (as f64! h)) + offset
+        level: even-level * (make f64! even/values/(h)) * (make f64! o/even-correction/(h))
+        either stereo? [
+            ; Two reads of the same table, not two harmonic sums. The level, the
+            ; slope, the correction and the warped phase are computed once and
+            ; shared; only the lookup happens twice, which is why an
+            ; inter-channel phase difference costs about half again on this loop
+            ; rather than double.
+            ;
+            ; The pan law is linear -- gains summing to two rather than to root
+            ; two -- so the two channels add back to exactly the centre signal.
+            ; Constant power would cost a hard-panned partial three decibels in
+            ; mono, an audible change of timbre between stereo and mono on a
+            ; bright patch.
+            curve: (make f64! ln/values/(h)) * inverse-ln-cap
+            pan: (p/stereo-width * curve)
+            delta: (phase-depth * curve)
+            left: (brom-wavetable-read-bounded :table (base + delta))
+                * level * (1.0 + pan)
+            right: (brom-wavetable-read-bounded :table (base - delta))
+                * level * (1.0 - pan)
+            total: total + ((left + right) * 0.5)
+            side: side + ((left - right) * 0.5)
+        ] [
+            total: total + ((brom-wavetable-read-bounded :table base) * level)
+        ]
+        h: h + 2
+    ]
+
+    odd-limit: either max-odd < limit [max-odd] [limit]
+    h: 3
+    while [h <= odd-limit] [
+        offset: (as f64! (h - 1)) * drift-step * 0.5
+        base: (distorted * (as f64! h)) + offset
+        level: odd-level * (make f64! odd/values/(h)) * (make f64! o/odd-correction/(h))
+        either stereo? [
+            ; Two reads of the same table, not two harmonic sums. The level, the
+            ; slope, the correction and the warped phase are computed once and
+            ; shared; only the lookup happens twice, which is why an
+            ; inter-channel phase difference costs about half again on this loop
+            ; rather than double.
+            ;
+            ; The pan law is linear -- gains summing to two rather than to root
+            ; two -- so the two channels add back to exactly the centre signal.
+            ; Constant power would cost a hard-panned partial three decibels in
+            ; mono, an audible change of timbre between stereo and mono on a
+            ; bright patch.
+            ; Opposite side from the even series, so the two interleaved
+            ; combs of the spectrum lean against each other.
+            curve: (make f64! ln/values/(h)) * inverse-ln-cap
+            pan: 0.0 - (p/stereo-width * curve)
+            delta: 0.0 - (phase-depth * curve)
+            left: (brom-wavetable-read-bounded :table (base + delta))
+                * level * (1.0 + pan)
+            right: (brom-wavetable-read-bounded :table (base - delta))
+                * level * (1.0 - pan)
+            total: total + ((left + right) * 0.5)
+            side: side + ((left - right) * 0.5)
+        ] [
+            total: total + ((brom-wavetable-read-bounded :table base) * level)
+        ]
+        h: h + 2
+    ]
+
+    o/last-side: side * o/gain-compensation
+    return total * o/gain-compensation
+]
+
+
+brom-sum-harmonics: func [
+    "Sum a harmonic series read from one wavetable at a warped phase."
+    :table [c-pointer!] "Borrowed filled brom-wavetable!."
+    :osc [c-pointer!] "Borrowed brom-pd-osc!, for its per-voice corrections."
+    :params [c-pointer!] "Borrowed brom-osc-params!."
+    :odd-slope [c-pointer!] "Borrowed brom-slope-table! for the odd harmonics."
+    :even-slope [c-pointer!] "Borrowed brom-slope-table! for the even harmonics."
+    :ln-table [c-pointer!] "Borrowed brom-ln-table!, for the stereo spread curve."
+    distorted [f64!] "Warped fundamental phase."
+    frequency [f64!] "Oscillator frequency in Hz."
+    nyquist [f64!] "Highest frequency to synthesise; harmonics above it are dropped."
+    odd-level [f64!] "Level of the odd harmonics, already modulated."
+    even-level [f64!] "Level of the even harmonics, already modulated."
+    max-odd [i32!] "Highest audible odd harmonic."
+    max-even [i32!] "Highest audible even harmonic."
+    bandwidth-limit [i32!] "Harmonic cap from the modulation budget; BROM-MAX-HARMONICS when idle."
+    return: [f64!] "The centre of the sample; the side is left in the oscillator."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    p: make [#mutable brom-osc-params!] as brom-osc-params! :params
+    odd: make [#mutable brom-slope-table!] as brom-slope-table! :odd-slope
+    even: make [#mutable brom-slope-table!] as brom-slope-table! :even-slope
+
+    ; The public function also serves direct callers whose warped phase and
+    ; parameters may be outside the oscillator's normal bounded domain. Bound
+    ; every possible harmonic conservatively once, then keep range handling out
+    ; of the table reads. The harmonic cap is BROM-MAX-HARMONICS; drift offsets
+    ; stay within half the requested drift, and the spread curve never exceeds
+    ; one.
+    phase-span: ((brom-abs-f64 distorted) * (as f64! BROM-MAX-HARMONICS))
+        + ((brom-abs-f64 p/phase-drift) * 0.5)
+        + ((brom-abs-f64 p/spread-phase) * BROM-SPREAD-PHASE-MAX)
+    if phase-span <= 131070.0 [
+        return brom-sum-harmonics-bounded
+            :table :osc :params :odd-slope :even-slope :ln-table
+            distorted frequency nyquist odd-level even-level max-odd max-even
+            bandwidth-limit
+    ]
+
+    ; Three limits, and the tightest wins: what fits under Nyquist at this
+    ; pitch, what the patch asked for, and what the table can hold. The first is
+    ; why a low note is bright and the same patch an octave up is not.
+    by-frequency: as i32! (nyquist / frequency)
+    requested: p/num-harmonics + 1
+    limit: make [#mutable i32!] brom-clamp-i32 by-frequency 1 BROM-MAX-HARMONICS
+    if requested < limit [limit: requested]
+    ; A fourth limit, and the tightest still wins. It is BROM-MAX-HARMONICS
+    ; whenever nothing is modulating this oscillator, so this line changes
+    ; nothing for a patch that uses no FM and no feedback.
+    if bandwidth-limit < limit [limit: bandwidth-limit]
+
+    drift-step: either limit > 1 [p/phase-drift / (as f64! limit)] [0.0]
+    total: make [#mutable f64!] 0.0
+    side: make [#mutable f64!] 0.0
+
+    ; --- the stereo spread --------------------------------------------------
+    ; The fundamental stays in the centre and each harmonic above it is pushed
+    ; further out, alternating sides by parity: the spectrum opens outward from
+    ; a fixed anchor rather than being panned as a block, which is how a source
+    ; with a directional radiation pattern actually behaves.
+    ;
+    ; The curve is ln(h)/ln(cap) rather than a straight ramp in h, because the
+    ; partials crowd together at the top of the series and a linear spread
+    ; spends most of its travel where the ear resolves least.
+    ;
+    ; Normalized by what the patch ASKED for, not by the limit actually
+    ; rendered. The limit falls as the note rises -- Nyquist takes the top
+    ; harmonics away -- and normalizing by it would narrow the image as the
+    ; player went up the keyboard and move it whenever Harmonics was touched.
+    ln: make [#mutable brom-ln-table!] as brom-ln-table! :ln-table
+    stereo?: any [p/stereo-width > 0.0 p/spread-phase > 0.0]
+    cap: either requested > BROM-MAX-HARMONICS [BROM-MAX-HARMONICS] [requested]
+    inverse-ln-cap: either cap > 1 [1.0 / (make f64! ln/values/(cap))] [0.0]
+    phase-depth: p/spread-phase * BROM-SPREAD-PHASE-MAX
+
+    ; The fundamental is always present and always at unity -- it is the level
+    ; every other harmonic is expressed relative to. It is also the one partial
+    ; that is never spread, which is what gives the image something to sit on.
+    total: brom-wavetable-read-fast :table distorted
+
+    even-limit: either max-even < limit [max-even] [limit]
+    h: make [#mutable i32!] 2
+    while [h <= even-limit] [
+        offset: (as f64! (h - 1)) * drift-step * 0.5
+        base: (distorted * (as f64! h)) + offset
+        level: even-level * (make f64! even/values/(h)) * (make f64! o/even-correction/(h))
+        either stereo? [
+            ; Two reads of the same table, not two harmonic sums. The level, the
+            ; slope, the correction and the warped phase are computed once and
+            ; shared; only the lookup happens twice, which is why an
+            ; inter-channel phase difference costs about half again on this loop
+            ; rather than double.
+            ;
+            ; The pan law is linear -- gains summing to two rather than to root
+            ; two -- so the two channels add back to exactly the centre signal.
+            ; Constant power would cost a hard-panned partial three decibels in
+            ; mono, an audible change of timbre between stereo and mono on a
+            ; bright patch.
+            curve: (make f64! ln/values/(h)) * inverse-ln-cap
+            pan: (p/stereo-width * curve)
+            delta: (phase-depth * curve)
+            left: (brom-wavetable-read-fast :table (base + delta))
+                * level * (1.0 + pan)
+            right: (brom-wavetable-read-fast :table (base - delta))
+                * level * (1.0 - pan)
+            total: total + ((left + right) * 0.5)
+            side: side + ((left - right) * 0.5)
+        ] [
+            total: total + ((brom-wavetable-read-fast :table base) * level)
+        ]
+        h: h + 2
+    ]
+
+    odd-limit: either max-odd < limit [max-odd] [limit]
+    h: 3
+    while [h <= odd-limit] [
+        offset: (as f64! (h - 1)) * drift-step * 0.5
+        base: (distorted * (as f64! h)) + offset
+        level: odd-level * (make f64! odd/values/(h)) * (make f64! o/odd-correction/(h))
+        either stereo? [
+            ; Two reads of the same table, not two harmonic sums. The level, the
+            ; slope, the correction and the warped phase are computed once and
+            ; shared; only the lookup happens twice, which is why an
+            ; inter-channel phase difference costs about half again on this loop
+            ; rather than double.
+            ;
+            ; The pan law is linear -- gains summing to two rather than to root
+            ; two -- so the two channels add back to exactly the centre signal.
+            ; Constant power would cost a hard-panned partial three decibels in
+            ; mono, an audible change of timbre between stereo and mono on a
+            ; bright patch.
+            ; Opposite side from the even series, so the two interleaved
+            ; combs of the spectrum lean against each other.
+            curve: (make f64! ln/values/(h)) * inverse-ln-cap
+            pan: 0.0 - (p/stereo-width * curve)
+            delta: 0.0 - (phase-depth * curve)
+            left: (brom-wavetable-read-fast :table (base + delta))
+                * level * (1.0 + pan)
+            right: (brom-wavetable-read-fast :table (base - delta))
+                * level * (1.0 - pan)
+            total: total + ((left + right) * 0.5)
+            side: side + ((left - right) * 0.5)
+        ] [
+            total: total + ((brom-wavetable-read-fast :table base) * level)
+        ]
+        h: h + 2
+    ]
+
+    o/last-side: side * o/gain-compensation
+    return total * o/gain-compensation
+]
+
+brom-pd-osc-render: func [
+    "Produce one sample and advance the oscillator."
+    :osc [c-pointer!] "Borrowed brom-pd-osc!."
+    :table [c-pointer!] "Borrowed filled brom-wavetable!."
+    :params [c-pointer!] "Borrowed brom-osc-params!."
+    :env [c-pointer!] "Borrowed brom-osc-env! holding this sample's envelope levels."
+    :odd-slope [c-pointer!] "Borrowed brom-slope-table! for the odd harmonics."
+    :even-slope [c-pointer!] "Borrowed brom-slope-table! for the even harmonics."
+    :ln-table [c-pointer!] "Borrowed brom-ln-table!, for the stereo spread curve."
+    fm-frequency [f64!] "Frequency of the oscillator modulating this one; zero when none is."
+    frequency [f64!] "Oscillator frequency in Hz."
+    nyquist [f64!] "Highest frequency to synthesise."
+    algorithm [i32!] "One of the BROM-PD-ALGO-* selectors."
+    modulation [f64!] "Warp depth before envelope modulation."
+    level-mode [i32!] "How envelopes apply to levels; a BROM-ENV-* constant."
+    fm-input [f64!] "Sample from a modulating oscillator, or zero."
+    pd-offset [f64!] "Per-voice shift on the warp depth, from velocity; zero for none."
+    max-odd [i32!] "Highest audible odd harmonic."
+    max-even [i32!] "Highest audible even harmonic."
+    return: [f64!] "One sample."
+] [
+    o: make [#mutable brom-pd-osc!] as brom-pd-osc! :osc
+    p: make [#mutable brom-osc-params!] as brom-osc-params! :params
+    e: make [#mutable brom-osc-env!] as brom-osc-env! :env
+
+    odd-level: brom-modulate p/odd-level e/odd-level-mod p/odd-level-env-amount level-mode
+    even-level: brom-modulate p/even-level e/even-level-mod p/even-level-env-amount level-mode
+
+    ; Frequency modulation is applied to the phase rather than to the frequency,
+    ; which is phase modulation strictly speaking -- it is what every digital FM
+    ; instrument does, because it needs no integrator and cannot drift.
+    ;
+    ; Normalize before the warp, not merely at the final table lookup. A warp is
+    ; piecewise on the unit interval and would otherwise treat a negative FM
+    ; phase as a different shape.
+    ; Multiply, not the level envelope's mode. That mode belongs to the odd and
+    ; even LEVELS, and reading it here made a bipolar setting -- the default --
+    ; sweep the modulator from phase-inverted to full rather than silent to
+    ; full, which for FM wastes half the control: a negated modulator has the
+    ; same magnitude spectrum as the original.
+    fm-amount: make [#mutable f64!]
+        brom-modulate p/fm-amount e/fm-level p/fm-env-amount BROM-ENV-MULTIPLY
+    feedback: make [#mutable f64!] p/feedback
+    ; Paid for only by a patch that actually uses feedback: the logarithm sits
+    ; behind this test, and the overwhelming majority of patches never reach it.
+    if feedback > 0.0 [
+        feedback-cap: brom-fm-feedback-limit frequency nyquist
+        if feedback > feedback-cap [feedback: feedback-cap]
+    ]
+
+    ; Everything modulating this oscillator, priced in hertz of deviation and
+    ; held inside what the band can carry. When the two together ask for more
+    ; room than there is, BOTH are scaled by the same factor: the balance
+    ; between them is the sound the player dialled, and clamping one alone
+    ; would quietly rewrite it.
+    extra: make [#mutable f64!] 0.0
+    if fm-amount <> 0.0 [extra: extra + fm-frequency]
+    if feedback <> 0.0 [extra: extra + frequency]
+    deviation: make [#mutable f64!]
+        (brom-fm-deviation fm-amount fm-frequency) + (brom-fm-deviation feedback frequency)
+    if deviation > 0.0 [
+        budget: brom-fm-budget frequency extra nyquist
+        if deviation > budget [
+            scale: budget / deviation
+            fm-amount: fm-amount * scale
+            feedback: feedback * scale
+            deviation: budget
+        ]
+    ]
+    bandwidth-limit: brom-fm-harmonic-limit frequency deviation extra nyquist
+
+    ; The feedback term is the mean of the last two outputs; a single-sample
+    ; path reaches its chaotic region long before the control runs out.
+    fed-back: (o/fb-y1 + o/fb-y2) * 0.5
+    current-phase: brom-wrap-phase
+        (o/phase + (fm-input * fm-amount * 0.5) + (fed-back * feedback * 0.5))
+
+    ; The offset is added before the clamp, so a velocity that would drive the
+    ; warp past either end simply arrives at the end rather than wrapping into
+    ; a different shape.
+    pd-depth: brom-clamp-f64
+        ((brom-modulate modulation e/pd-level p/pd-env-amount level-mode) + pd-offset)
+        0.0 1.0
+    if (brom-abs-f64 (pd-depth - o/cache/modulation)) > 0.000000001 [
+        brom-pd-cache-update (addr-of o/cache) pd-depth
+    ]
+    distorted: brom-pd-distort (addr-of o/cache) current-phase pd-depth algorithm
+
+    out: brom-sum-harmonics :table :osc :params :odd-slope :even-slope :ln-table
+        distorted frequency nyquist odd-level even-level max-odd max-even
+        bandwidth-limit
+
+    ; The two-segment warp read through a sine -- the Sinepulse algorithm --
+    ; has a mean of (2/pi)(2*bp - 1) at one harmonic, which at full depth is
+    ; five eighths of the peak and stays there whatever the pitch. Every odd
+    ; harmonic above it adds its own term, so the offset is a property of the
+    ; whole patch and not of the algorithm alone. Left in, it costs headroom,
+    ; leaks one oscillator into the other through the ring modulator, and sums
+    ; across sixteen voices into a filter that passes it.
+    ;
+    ; A blocker rather than subtracting the closed form: the depth is modulated
+    ; per sample by the PD envelope, FM moves the phase the warp reads, and the
+    ; harmonic count changes the sum -- a filter tracks all three and an
+    ; expression tracks none of them.
+    centred: make [#mutable f64!] out
+    if p/dc-coefficient > 0.0 [
+        centred: out - o/dc-x1 + (p/dc-coefficient * o/dc-y1)
+        o/dc-x1: out
+        o/dc-y1: centred
+        ; The side carries its own offset once the spectrum is spread: the two
+        ; channels take different fractions of each harmonic, so their DC no
+        ; longer cancels in the difference.
+        side-in: o/last-side
+        side-out: side-in - o/dc-side-x1 + (p/dc-coefficient * o/dc-side-y1)
+        o/dc-side-x1: side-in
+        o/dc-side-y1: side-out
+        o/last-side: side-out
+    ]
+
+    ; The centred sample feeds the self-modulation path, so a constant term
+    ; cannot walk the oscillator off its own pitch.
+    o/fb-y2: o/fb-y1
+    o/fb-y1: centred
+
+    ; Advanced from the oscillator's own phase, not from the modulated one --
+    ; otherwise FM would make the pitch drift as well as the timbre.
+    o/phase: brom-wrap-phase (o/phase + o/phase-delta)
+    return centred
+]

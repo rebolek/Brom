@@ -1,0 +1,126 @@
+Recoil [
+    Title: "Brom shared state format dispatcher"
+    Description: {
+        Owns format sniffing between the two shapes a Brom plug-in's plain
+        state can take -- ASCII preset text (brom/plugin/preset) and the
+        BROM binary container (brom/plugin/state/codec) -- so a shell (CLAP,
+        VST3) calls exactly one load and one save entry point regardless of
+        which format the plug-in it is currently driving uses.
+
+        brom-state-load sniffs the blob itself: 'R' opens ASCII preset text
+        ("Recoil-Preset ["), the four bytes "BROM" open the binary
+        container, anything else is rejected outright. Every parameter is
+        reset to its param-info-fn default before ASCII text is applied,
+        since preset-apply only overwrites the keys the text mentions.
+
+        brom-state-save picks its format from state-save-ascii rather than
+        sniffing anything, because there is nothing to sniff when writing.
+
+        brom-state-save-context is what CLAP's clap.state-context extension
+        calls: FOR_PRESET is always ASCII regardless of state-save-ascii,
+        FOR_DUPLICATE/FOR_PROJECT follow the same choice brom-state-save
+        would make. Unlike brom-state-save, it reports the exact byte count
+        written, since which branch ran determines it.
+    }
+    Type: module
+    Module: brom/plugin/state/dispatch
+    Imports: [
+        brom/plugin/engine [engine! param-info!]
+        brom/plugin/preset [preset-cstr-view! preset-cstr-string preset-format preset-apply preset-fill-buffer]
+        brom/plugin/state/codec [state-codec-load-engine state-codec-save-engine]
+    ]
+    Exports: [
+        brom-state-load brom-state-save brom-state-save-context
+    ]
+]
+
+brom-state-reset-to-defaults: func [
+    "Set every parameter to its declared default, ahead of applying a sparse ASCII preset."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed mutable engine instance."
+    return: [none!] "No value."
+] [
+    info: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+    if not none? info [
+        unsafe/memset info 0 (as i32! size-of param-info!)
+        repeat index engine/param-count [
+            if engine/param-info-fn index info [
+                p: make [#mutable param-info!] as param-info! info
+                engine/set-param-fn :core (as u32! index) p/default-value
+            ]
+        ]
+        unsafe/free info
+    ]
+    return none
+]
+
+brom-state-load: func [
+    "Load a plug-in's state from either the ASCII preset format or the BROM binary container."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed mutable engine instance to write into."
+    :bytes [c-pointer!] "Borrowed source bytes."
+    size [size!] "Available source bytes."
+    return: [logic!] "True when the blob was recognized and applied."
+] [
+    if any [none? bytes size < (as size! 1)] [return false]
+    head: make [#mutable preset-cstr-view!] as preset-cstr-view! bytes
+    if (as char! head/bytes/0) = #"R" [
+        brom-state-reset-to-defaults :engine :core
+        text: preset-cstr-string bytes
+        if (length? text) = 0 [return false]
+        applied: preset-apply :engine :core :text
+        return applied > 0
+    ]
+    if size >= (as size! 4) [
+        if all [
+            head/bytes/0 = (as u8! 66)
+            head/bytes/1 = (as u8! 82)
+            head/bytes/2 = (as u8! 79)
+            head/bytes/3 = (as u8! 77)
+        ] [
+            return state-codec-load-engine :engine :core bytes size
+        ]
+    ]
+    return false
+]
+
+brom-state-save: func [
+    "Write a plug-in's current parameter state, in whichever plain-save format the engine declares."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed engine instance the values are read from."
+    :out [c-pointer!] "Borrowed destination bytes."
+    capacity [size!] "Destination capacity in bytes."
+    return: [logic!] "True when the state fitted and was written."
+] [
+    either engine/state-save-ascii [
+        text: preset-format :engine :core (make string! "session")
+        return preset-fill-buffer :text :out (as i32! capacity)
+    ] [
+        return state-codec-save-engine :engine :core :out capacity
+    ]
+]
+
+brom-state-save-context: func [
+    "Write a plug-in's state for one CLAP save context, reporting the exact byte count written."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed engine instance the values are read from."
+    :out [c-pointer!] "Borrowed destination bytes."
+    capacity [size!] "Destination capacity in bytes."
+    context [i32!] "CLAP_STATE_CONTEXT_FOR_PRESET (1) / FOR_DUPLICATE (2) / FOR_PROJECT (3)."
+    return: [size!] "Bytes written, or zero on failure."
+] [
+    either any [context = 1 engine/state-save-ascii] [
+        ; FOR_PRESET is always ASCII text regardless of state-save-ascii, and
+        ; FOR_DUPLICATE/FOR_PROJECT on an ASCII-plain-save engine take the
+        ; same text path -- both need the text in hand to report its exact
+        ; length, so this runs preset-format/preset-fill-buffer inline rather
+        ; than through brom-state-save.
+        title: either context = 1 [make string! "preset"] [make string! "session"]
+        text: preset-format :engine :core :title
+        if not preset-fill-buffer :text :out (as i32! capacity) [return as size! 0]
+        return as size! ((length? text) + 1)
+    ] [
+        if not state-codec-save-engine :engine :core :out capacity [return as size! 0]
+        return as size! engine/state-size
+    ]
+]

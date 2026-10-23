@@ -1,0 +1,7 @@
+Recoil [
+    Title: "Pokuston CLAP SDK source package"
+    Type: module
+    Module: pokuston/clap/sdk
+    Imports: []
+    Exports: []
+]

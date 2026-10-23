@@ -1,0 +1,73 @@
+Recoil [
+    Title: "brom-fast-exp exercise"
+    Description: {
+        Pins the accuracy brom-fast-exp is documented to have. An approximation
+        with no measured bound is not a trade, it is a guess -- and the failure
+        mode of a bit-trick exp is silent: it keeps returning plausible numbers
+        while being wrong by any amount.
+    }
+    Type: module
+    Module: recoil-brom/test/fast-exp-test
+    Imports: [
+        brom/dsp/utils [brom-fast-exp brom-abs-f64]
+    ]
+    Exports: []
+]
+
+libm: foreign <math.h> [
+    exp: "exp" [f64! return: [f64!]]
+]
+
+check: func [
+    "Record one assertion as a PASS or FAIL line."
+    ok? [logic!] "Whether the assertion held."
+    return: [none!] "No value; the marker is written to stdout."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+; --- the documented error bound ---------------------------------------------
+; Swept across the range a slope table actually uses and well beyond it. The
+; bound is asserted in both directions: never worse than documented, and never
+; so much better that the docstring is describing a different function.
+
+worst: make [#mutable f64!] 0.0
+repeat i 4001 [
+    power: ((as f64! i) / 100.0) - 20.0
+    exact: libm/exp power
+    approximate: brom-fast-exp power
+    relative: (brom-abs-f64 (approximate - exact)) / exact
+    if relative > worst [worst: relative]
+]
+check worst < 0.040
+check worst > 0.038
+
+; --- and the shape --------------------------------------------------------
+
+; Not one. The bias minimises error across the whole range instead of pinning
+; any single point, so zero is off by the same few percent as everywhere else.
+; Asserted at its actual value so that a change to the constants cannot pass
+; unnoticed.
+check (brom-fast-exp 0.0) > 0.9709
+check (brom-fast-exp 0.0) < 0.9711
+
+rising: make [#mutable logic!] true
+previous: make [#mutable f64!] 0.0
+repeat i 2001 [
+    power: ((as f64! i) / 20.0) - 50.0
+    value: brom-fast-exp power
+    if value < previous [rising: false]
+    if value <= 0.0 [rising: false]
+    previous: value
+]
+check rising
+
+; The clamp holds at both ends rather than wrapping the exponent field into a
+; NaN or a negative number, which is what an unclamped bit write would do.
+check (brom-fast-exp -1000.0) >= 0.0
+check (brom-fast-exp -1000.0) < 0.000001
+check (brom-fast-exp 1000.0) > 1000000000.0
+check (brom-fast-exp 1000.0) = (brom-fast-exp 1000.0)
+
+print "done"

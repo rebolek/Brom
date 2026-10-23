@@ -1,0 +1,336 @@
+Recoil [
+    Title: "Loos architecture invariants: voice-local rooms, one contour, a permanent lower register"
+    Description: {
+        The three claims the namesake note asks Loos to make good on, each
+        written as a property that the previous architecture could not satisfy.
+        They are here rather than in a commit message because every one of them
+        is the kind of claim that is easy to assert and easy to get wrong.
+
+        1. Voices are separate rooms, stated as superposition. Two notes rendered
+           together must give sample for sample what the two rendered alone and
+           added give. That is exact rather than a threshold, and the old
+           architecture could not satisfy it in two independent ways: one ladder
+           served the whole instrument, and its cutoff came from the MAXIMUM of
+           the four filter contours, so a second note both re-opened the first
+           note's filter and pushed its own signal through the same filter
+           state.
+
+        2. One contour has two consequences. There is no filter ADSR to set, so
+           the only way colour can move is through the amount control -- and it
+           is bipolar, which the old unipolar filter envelope could not express.
+           The check measures brightness at a positive amount and at the mirrored
+           negative one and requires the second to be darker than the first.
+
+        3. The lower register is always there. The sub is not a feature to be
+           switched on, so the check measures the octave below the played note
+           directly, with a Goertzel filter at that exact frequency, and requires
+           real energy in it rather than the leakage a bandpass would show.
+
+        4. The schema round-trips. The normalized domain every host automates
+           through is derived from the one range table now rather than
+           tabulated per parameter, so it is checked for every parameter
+           rather than for the three that used to have their own arm.
+    }
+    Type: module
+    Module: examples/pokuston/loos/architecture-test
+    Imports: [
+        examples/pokuston/loos/core [
+            LOOS_MAX_VOICES LOOS_MAX_BLOCK
+            LOOS_PARAM_CUTOFF LOOS_PARAM_RESONANCE LOOS_PARAM_ENV_AMOUNT
+            LOOS_PARAM_SUSTAIN LOOS_PARAM_DECAY LOOS_PARAM_COUNT
+            loos-create loos-destroy loos-activate loos-reset
+            loos-note-on loos-process-block loos-output
+            loos-set-parameter loos-parameter-min loos-parameter-max
+            loos-parameter-default
+            loos-parameter-to-normalized loos-parameter-from-normalized
+        ]
+    ]
+    Exports: []
+]
+
+math-ffi: foreign <math.h> [
+    sqrt: "sqrt" [f64! return: [f64!]]
+    cos: "cos" [f64! return: [f64!]]
+    fabs: "fabs" [f64! return: [f64!]]
+]
+
+TEST-SAMPLE-RATE: 48000.0
+TEST-TAU: 6.283185307179586
+
+output-view!: make c-struct! [samples: [c-array! [f64! 512]]]
+
+failures: make [#mutable i32!] 0
+checks: make [#mutable i32!] 0
+
+check: func [
+    "Record one architecture condition."
+    condition [logic!] "Condition that must hold."
+    return: [none!] "No value."
+] [
+    checks: checks + 1
+    if not condition [failures: failures + 1]
+    return none
+]
+
+; --- measurement -------------------------------------------------------------
+
+goertzel-state!: make c-struct! [
+    coefficient: [f64!]
+    s1: [f64!]
+    s2: [f64!]
+    counted: [f64!]
+]
+
+goertzel-begin: func [
+    {Prepare a single-bin energy measurement at one frequency.
+
+     A whole FFT would answer a question nobody here is asking. One bin at a
+     frequency known in advance is four multiplies a sample and, unlike a
+     band measurement, cannot confuse the octave below a note with everything
+     else that happens to be low.}
+    :raw [c-pointer!] "Borrowed caller-owned goertzel-state!."
+    frequency [f64!] "Frequency of interest in hertz."
+    return: [none!] "No value."
+] [
+    g: make [#mutable goertzel-state!] as goertzel-state! :raw
+    g/coefficient: 2.0 * (math-ffi/cos (TEST-TAU * frequency / TEST-SAMPLE-RATE))
+    g/s1: 0.0
+    g/s2: 0.0
+    g/counted: 0.0
+    return none
+]
+
+goertzel-feed: func [
+    "Fold one sample into a running single-bin measurement."
+    :raw [c-pointer!] "Borrowed goertzel-state! from goertzel-begin."
+    sample [f64!] "Sample value."
+    return: [none!] "No value."
+] [
+    g: make [#mutable goertzel-state!] as goertzel-state! :raw
+    s0: sample + (g/coefficient * g/s1) - g/s2
+    g/s2: g/s1
+    g/s1: s0
+    g/counted: g/counted + 1.0
+    return none
+]
+
+goertzel-magnitude: func [
+    "The measured amplitude at the chosen frequency, per sample."
+    :raw [c-pointer!] "Borrowed goertzel-state! that has been fed."
+    return: [f64!] "Amplitude, or nought when nothing was fed."
+] [
+    g: make [#mutable goertzel-state!] as goertzel-state! :raw
+    if g/counted <= 0.0 [return 0.0]
+    power: (g/s1 * g/s1) + (g/s2 * g/s2) - (g/coefficient * g/s1 * g/s2)
+    return (math-ffi/sqrt (math-ffi/fabs power)) / g/counted
+]
+
+block-peak: func [
+    "The largest absolute sample in the instance's last rendered block."
+    :raw [c-pointer!] "Opaque Loos instance."
+    frames [i32!] "Frames rendered into the block."
+    return: [f64!] "Peak absolute sample value."
+] [
+    view: make [#mutable output-view!] as output-view! (loos-output :raw)
+    peak: make [#mutable f64!] 0.0
+    repeat frame frames [
+        magnitude: math-ffi/fabs view/samples/:frame
+        if magnitude > peak [peak: magnitude]
+    ]
+    return peak
+]
+
+; --- 1. voices are separate rooms --------------------------------------------
+; Stated as superposition, which is exact rather than a threshold: if every
+; voice owns its filter, then rendering two notes together must give sample for
+; sample what rendering each alone and adding gives. Nothing in the voice path
+; can then depend on what another voice is doing.
+;
+; The old architecture could not satisfy this and it is worth being precise
+; about why. One ladder served the whole instrument, and its cutoff came from
+; the MAXIMUM of the four filter contours, so a second note both re-opened the
+; first note's filter and pushed its own signal through the same filter state.
+; Neither term is present in a sum of separate renders.
+;
+; The three instances run in lockstep on the same slots -- slot 0 for the first
+; note, slot 1 for the second -- because a slot carries its own detune, drift
+; and starting phase, and comparing across slots would compare two different
+; oscillators.
+
+alone-a: loos-create
+alone-b: loos-create
+together: loos-create
+loos-activate :alone-a TEST-SAMPLE-RATE
+loos-activate :alone-b TEST-SAMPLE-RATE
+loos-activate :together TEST-SAMPLE-RATE
+
+; A large amount and a resonant, low cutoff: every way one voice could reach
+; another -- shared filter position, shared filter state -- is made loud.
+configure-separation: func [
+    "Set the voicing that makes cross-voice coupling audible."
+    :instance [c-pointer!] "Opaque Loos instance."
+    return: [none!] "No value."
+] [
+    loos-set-parameter :instance (as u32! LOOS_PARAM_ENV_AMOUNT) 4.0
+    loos-set-parameter :instance (as u32! LOOS_PARAM_CUTOFF) 300.0
+    loos-set-parameter :instance (as u32! LOOS_PARAM_RESONANCE) 0.8
+    loos-set-parameter :instance (as u32! LOOS_PARAM_DECAY) 0.05
+    loos-set-parameter :instance (as u32! LOOS_PARAM_SUSTAIN) 0.3
+    return none
+]
+configure-separation :alone-a
+configure-separation :alone-b
+configure-separation :together
+
+; The first note is already sustaining when the second arrives, so the two are
+; at genuinely different points on their contours.
+loos-note-on :alone-a 0 220.0 1.0
+loos-note-on :together 0 220.0 1.0
+repeat settle 20 [
+    loos-process-block :alone-a LOOS_MAX_BLOCK
+    loos-process-block :together LOOS_MAX_BLOCK
+]
+loos-note-on :alone-b 1 660.0 1.0
+loos-note-on :together 1 660.0 1.0
+
+worst: make [#mutable f64!] 0.0
+energy: make [#mutable f64!] 0.0
+repeat compare 20 [
+    loos-process-block :alone-a LOOS_MAX_BLOCK
+    loos-process-block :alone-b LOOS_MAX_BLOCK
+    loos-process-block :together LOOS_MAX_BLOCK
+    view-a: make [#mutable output-view!] as output-view! (loos-output :alone-a)
+    view-b: make [#mutable output-view!] as output-view! (loos-output :alone-b)
+    view-t: make [#mutable output-view!] as output-view! (loos-output :together)
+    repeat frame LOOS_MAX_BLOCK [
+        ; A dynamic c-array element read carries no inferred type (T4100).
+        expected: make f64! (view-a/samples/:frame + view-b/samples/:frame)
+        actual: make f64! view-t/samples/:frame
+        deviation: math-ffi/fabs (actual - expected)
+        if deviation > worst [worst: deviation]
+        level: math-ffi/fabs actual
+        if level > energy [energy: level]
+    ]
+]
+
+; There is real signal to be wrong about, and the two renders agree to floating
+; point. The tolerance is for summation order, not for coupling: under one
+; shared filter this deviation is the same order as the signal itself.
+check (energy > 0.01)
+check (worst < 0.000000001)
+
+loos-destroy alone-a
+loos-destroy alone-b
+loos-destroy together
+
+; --- 2. one contour, and it goes both ways -----------------------------------
+; The bipolar amount is the whole of what replaced a second ADSR, so the two
+; directions have to be measurably different things.
+
+brightness-of: func [
+    "Peak output of one note rendered at a given envelope amount."
+    amount [f64!] "Signed envelope amount in octaves."
+    return: [f64!] "Peak absolute sample over the sustained portion."
+] [
+    instance: loos-create
+    loos-activate :instance TEST-SAMPLE-RATE
+    loos-set-parameter :instance (as u32! LOOS_PARAM_ENV_AMOUNT) amount
+    ; A cutoff low enough that opening and closing around it both have room.
+    loos-set-parameter :instance (as u32! LOOS_PARAM_CUTOFF) 600.0
+    loos-set-parameter :instance (as u32! LOOS_PARAM_SUSTAIN) 1.0
+    loos-note-on :instance 0 220.0 1.0
+    repeat settle 30 [loos-process-block :instance LOOS_MAX_BLOCK]
+    peak: block-peak :instance LOOS_MAX_BLOCK
+    loos-destroy instance
+    return peak
+]
+
+opened: brightness-of 3.0
+darkened: brightness-of -3.0
+; Opening the filter passes more of the source than closing it does. This is
+; the direction the old unipolar filter envelope had no way to express.
+check (opened > 0.0001)
+check (darkened > 0.0)
+check (darkened < opened)
+
+; --- 3. the lower register is always there -----------------------------------
+; Measured at the sub's own frequency rather than in a low band: a band tells
+; you how much low content there is, which for a low note is nearly all of it,
+; and would have called a silent sub a success.
+
+sub: loos-create
+loos-activate :sub TEST-SAMPLE-RATE
+loos-set-parameter :sub (as u32! LOOS_PARAM_SUSTAIN) 1.0
+; Wide open, so what is measured is the oscillator pair and not the filter.
+loos-set-parameter :sub (as u32! LOOS_PARAM_CUTOFF) 18000.0
+loos-set-parameter :sub (as u32! LOOS_PARAM_ENV_AMOUNT) 0.0
+loos-note-on :sub 0 440.0 1.0
+repeat settle 20 [loos-process-block :sub LOOS_MAX_BLOCK]
+
+fundamental: make [#mutable goertzel-state!] make goertzel-state! [
+    coefficient: 0.0 s1: 0.0 s2: 0.0 counted: 0.0
+]
+octave-below: make [#mutable goertzel-state!] make goertzel-state! [
+    coefficient: 0.0 s1: 0.0 s2: 0.0 counted: 0.0
+]
+goertzel-begin (addr-of fundamental) 440.0
+goertzel-begin (addr-of octave-below) 220.0
+repeat measure 16 [
+    loos-process-block :sub LOOS_MAX_BLOCK
+    view: make [#mutable output-view!] as output-view! (loos-output :sub)
+    repeat frame LOOS_MAX_BLOCK [
+        goertzel-feed (addr-of fundamental) view/samples/:frame
+        goertzel-feed (addr-of octave-below) view/samples/:frame
+    ]
+]
+fundamental-level: goertzel-magnitude (addr-of fundamental)
+octave-level: goertzel-magnitude (addr-of octave-below)
+check (fundamental-level > 0.0001)
+; A quarter of the fundamental is far above leakage and far below parity: with
+; the sub silenced this ratio measures about two thousandths.
+check (octave-level > (fundamental-level * 0.25))
+check (octave-level < fundamental-level)
+; A reset must silence the active voice immediately and leave the instrument
+; ready to sound again, rather than sending the voice through its release.
+loos-reset :sub
+loos-process-block :sub LOOS_MAX_BLOCK
+check ((block-peak :sub LOOS_MAX_BLOCK) = 0.0)
+loos-note-on :sub 0 220.0 1.0
+repeat settle 20 [loos-process-block :sub LOOS_MAX_BLOCK]
+check ((block-peak :sub LOOS_MAX_BLOCK) > 0.0001)
+loos-destroy sub
+
+; --- 4. the schema round-trips ------------------------------------------------
+; The normalized mapping is now derived from the one range table rather than
+; tabulated per parameter, so every parameter has to be checked rather than the
+; three that used to have their own arm. A control whose UI domain does not
+; round-trip is a control a host cannot automate faithfully.
+
+repeat id LOOS_PARAM_COUNT [
+    param: make u32! as u32! id
+    low: make f64! loos-parameter-min param
+    high: make f64! loos-parameter-max param
+    check (high > low)
+    ; The ends of the range are the ends of the UI domain.
+    check ((math-ffi/fabs (loos-parameter-to-normalized param low)) < 0.000001)
+    check ((math-ffi/fabs ((loos-parameter-to-normalized param high) - 1.0)) < 0.000001)
+    ; And every point between comes back where it started.
+    repeat step 5 [
+        want: make f64! ((as f64! step) * 0.2)
+        physical: make f64! loos-parameter-from-normalized param want
+        back: make f64! loos-parameter-to-normalized param physical
+        check ((math-ffi/fabs (back - want)) < 0.000001)
+        check (physical >= low)
+        check (physical <= high)
+    ]
+    ; The default a double-click writes has to be inside the range it is in.
+    fallback: make f64! loos-parameter-default param
+    check (fallback >= low)
+    check (fallback <= high)
+]
+
+print "checks:"
+print checks
+print "failures:"
+print failures
+either failures = 0 [print "PASS"] [print "FAIL"]

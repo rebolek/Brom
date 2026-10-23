@@ -1,0 +1,3040 @@
+Recoil [
+    Title: "VID -- runtime GUI dialect over the recoil-gui capability"
+    To-Do: {
+        Stop exporting facet-result!. It is in Exports: only because a private
+        sum! returned from a module function and matched through an untyped
+        local fails with P1614 (istar #160: private module types are renamed
+        after parsing). Once that is fixed, drop it from Exports: below and
+        confirm facet-or still compiles.
+    }
+    Type: module
+    Module: gui/vid
+    Imports: [
+        gui/gui [
+            gui-open-window gui-window-should-close? gui-close-window gui-set-target-fps gui-run-loop
+            gui-attach gui-detach gui-set-frame gui-tick
+            gui-begin-frame gui-end-frame gui-clear
+            gui-draw-rect gui-draw-rect-gradient-v gui-draw-line gui-draw-text gui-measure-text
+            gui-context-draw-rect-gradient-v
+            gui-mouse-pos gui-mouse-down? gui-mouse-pressed? gui-key-pressed? gui-char-pressed
+            gui-key-backspace
+            gui-native-supported? gui-native-natural-size
+            gui-native-begin gui-native-face gui-native-end
+            gui-native-take-click gui-native-take-change gui-native-take-text
+            gui-context-attach gui-context-detach gui-context-tick
+            gui-context-begin-frame gui-context-end-frame gui-context-clear
+            gui-context-draw-rect gui-context-draw-text gui-context-measure-text
+            gui-context-mouse-pos gui-context-mouse-down? gui-context-mouse-pressed?
+            gui-context-mouse-released? gui-context-mouse-double-clicked?
+            gui-context-shift-down?
+            gui-path-supported?
+        ]
+        gui/widget [
+            knob-style! knob-style-default knob-style-mach knob-style-loos
+            knob-style-kapralova knob-style-kapralova-choice
+            widget-knob widget-knob-hit?
+            widget-knob-label-band widget-knob-ring-overspill
+            fader-style! fader-style-default fader-style-loos
+            widget-fader widget-fader-hit?
+            widget-text-centred widget-text-wrapped
+            widget-colour
+            envelope-shape! widget-envelope-curve
+            widget-envelope-editor widget-envelope-editor-hit
+        ]
+        std/geometry [fpair! rect! fxy rect-of]
+    ]
+    Exports: [
+        actor actor-data actor-text actor-frame actor-draw
+        actor-edit actor-default actor-value actor-format
+        ph-begin ph-change ph-end
+        view view-window view-build view-attach view-detach
+        view-context-attach view-context-detach view-context-tick view-select
+        view-current-user
+        face-data set-face-data set-face-draw face-text set-face-text
+        view-parameter-tally view-hit-parameter view-hit-page
+        view-envelope-base
+        facet-result!
+    ]
+]
+
+; Face kinds are plain i32! constants rather than enum! -- a struct field
+; that is enum!-typed hits a pre-existing compiler bug (the enum's C
+; typedef gets emitted after the struct that references it), avoided here
+; rather than fixed as part of this dialect slice.
+fk-button: 0
+fk-text: 1
+fk-slider: 2
+fk-field: 3
+fk-canvas: 4
+fk-knob: 5
+fk-panel: 6
+fk-tabs: 7
+fk-env-preview: 8
+fk-env-editor: 9
+fk-fader: 10
+
+; Widget styles, named in a spec by word rather than by colour. Mach keeps its
+; established blue hardware; Loos selects its paper/oxblood drafting controls;
+; anything else stays on the neutral dark default.
+ks-default: 0
+ks-mach: 1
+ks-loos: 2
+ks-kapralova: 3
+ks-kapralova-choice: 4
+
+; --- the edit gesture ---------------------------------------------------------
+; A parameter-bound face reports what the pointer did as a gesture, not as a
+; stream of values: a plug-in host records an automation edit only between a
+; begin and an end, so a bare change is dropped. The three plug-in editors in
+; this tree each wrote this sequence out by hand; a `param`-carrying face now
+; gets it from the dialect.
+ph-begin: 0
+ph-change: 1
+ph-end: 2
+
+; Pixels of vertical travel for a parameter control's whole range, and the
+; divisor `shift` applies to it. Knobs and faders deliberately share this path.
+parameter-travel: 200.0
+parameter-fine: 10.0
+
+; --- native-widget mode -------------------------------------------------------
+; Native rendering is the default; `custom` in a view spec opts a view out.
+; The backend capability is probed per kind at view-build time. A face renders
+; natively only when the view is in native mode AND its kind is a control kind
+; AND the active backend supports it; otherwise it falls back to custom chrome.
+native-mode: make [#mutable i32!] 1
+native-supported-button: make [#mutable i32!] 0
+native-supported-slider: make [#mutable i32!] 0
+native-supported-field: make [#mutable i32!] 0
+
+control-native-kind: func [
+    "Map a VID face kind to its backend native kind, or -1 if not a control."
+    fkind [i32!] "VID face kind (fk-*)."
+    return: [i32!] "Native kind (0=button, 1=slider, 2=field) or -1."
+] [
+    if fkind = fk-button [return 0]
+    if fkind = fk-slider [return 1]
+    if fkind = fk-field [return 2]
+    return -1
+]
+
+face-native?: func [
+    "True if the face is rendered by a real OS widget rather than custom chrome."
+    f [face!] "Face to classify."
+    return: [logic!]
+] [
+    if native-mode <> 1 [return false]
+    if f/kind = fk-button [return native-supported-button = 1]
+    if f/kind = fk-slider [return native-supported-slider = 1]
+    if f/kind = fk-field [return native-supported-field = 1]
+    return false
+]
+
+; Default flow-layout spacing: inter-widget gap for across/below advances and
+; the outer margin the cursor starts at. One fixed constant for this slice; a
+; per-view spec override is future work (see the VID padding design doc).
+vid-default-gap: 8x8
+
+; --- face model -------------------------------------------------------------
+
+face!: make c-struct! [
+    kind: [i32!]
+    name: [word!]
+    pos: [pair!]
+    size: [pair!]
+    label: [string!]
+    color: [u32!]
+    data: [f64!]
+    text: [string!]
+    hidden: [i32!]
+    on-click: [word!]
+    on-change: [word!]
+    on-draw: [word!]
+    on-edit: [word!]
+    on-default: [word!]
+    on-value: [word!]
+    on-format: [word!]
+    ; Slot of the panel this face sits in, or -1 at the top level. A flat
+    ; store with a parent index rather than a real tree: a `pane` field would
+    ; have to be an array! of face!, which is exactly the value construction
+    ; the language cannot express as an inline struct-init field.
+    parent: [i32!]
+    ; Where this face's facets start in the view's facet region, and how many
+    ; it has. A face that declares none has a count of 0: absence is an empty
+    ; range, not a -1 in a field every other kind of face also carries.
+    facet-at: [i32!]
+    facet-count: [i32!]
+]
+
+; A bare top-level #flexible array of a struct type cannot be indexed
+; directly (element+field-access mis-lowers to raw IR text); wrapping it as
+; the field of an outer #mutable-tagged container struct works for both
+; indexed reads and in-place field mutation via `faces/items/:i/field`.
+;
+; The wrapper shares the store's vec: making it retains the vec, so the store
+; and the holder point at one buffer with a reference count of 2. Writing a
+; slot is seen through both, but GROWING a vector whose count is above 1 copies
+; it -- the binding that grew moves to the copy and the other keeps the old
+; vec. If `faces-store` grew after `faces:` was made, `faces/items` would
+; keep the original, shorter vec (an ASan-caught write past its small
+; allocation in one earlier shape, and a store that read as empty in another).
+; Length matters as well as capacity: a #flexible vec starts at length 0
+; whatever capacity it was given, and the whole-struct copy read `make face!
+; faces/items/(idx)` bounds-checks against that length (a direct field read
+; like `faces/items/(idx)/kind` does not check it, which kept that path
+; working and made it look as if only the copy was broken). A holder made over
+; a still-empty store therefore returned zeroed faces for ever -- every param,
+; hit test and tally reading as if no control existed.
+;
+; So the store is filled to its full length with real `append` calls BEFORE
+; `faces:` is made, and nothing grows it afterward. That order has to hold when
+; the module is compiled as a library (a plug-in) too, which runs its
+; top-level statements in source order, as a program does. Stores that DO grow
+; after init -- the actor registries below -- have no holder and are read
+; directly.
+faces-holder!: make map! [items: array! [face!]]
+faces-store: make [#flexible [array! [face!] 768]] none
+repeat i 768 [
+    append faces-store make face! [
+        kind: fk-text
+        name: 'no-actor-sentinel
+        pos: 0x0
+        size: 0x0
+        label: ""
+        color: 0
+        data: 0.0
+        text: ""
+        hidden: 1
+        on-click: 'no-actor-sentinel
+        on-change: 'no-actor-sentinel
+        on-draw: 'no-actor-sentinel
+        facet-at: 0
+        facet-count: 0
+    ]
+]
+faces: make [#mutable faces-holder!] make faces-holder! [items: faces-store]
+
+; --- the view pool ------------------------------------------------------------
+; A plug-in editor is not the standalone window this dialect started as: a CLAP
+; host may open two instances of the same plug-in, and a module-global face
+; array would have them overwrite each other's controls. Views are therefore
+; allocated from a fixed pool, and each owns a contiguous, fixed-width region of
+; the one face array -- view `id` owns `[id * VIEW-FACE-CAP, +VIEW-FACE-CAP)`.
+;
+; Fixed regions rather than per-view arrays, deliberately. A `view!` struct
+; owning an `array! [face!]` field is exactly the construction the language
+; cannot express (see docs/plans/research/gui-retained-mode-and-value-
+; construction.md: an array! is a heap vec and cannot be an inline struct-init
+; field value), and the faces-holder! wrapper above is already a workaround for
+; a neighbouring limit. Fixed regions need neither.
+;
+; Fixed width rather than a growing region, also deliberately: a detached view
+; releases its region for the next attach to reuse in place, so a host opening
+; and closing an editor repeatedly reuses one region instead of appending a
+; fresh one every time and growing the array without bound.
+MAX-VIEWS: 4
+VIEW-FACE-CAP: 192
+; Facets a view's region can hold. A face stores only the facets it declares,
+; and the heaviest kinds declare three, so three per face is the ceiling and
+; an ordinary view uses a small fraction of it.
+VIEW-FACET-CAP: 576
+
+view-slot!: make c-struct! [
+    used: [i32!]
+    ; Faces placed so far in this view's region, 0 .. VIEW-FACE-CAP.
+    count: [i32!]
+    ; Facets placed so far in this view's facet region, 0 .. VIEW-FACET-CAP.
+    facet-count: [i32!]
+    ; Owned gui context for a context view; null for the legacy window view 0.
+    context: [c-pointer!]
+    ; Caller state handed back to every actor, so one registration can serve
+    ; several instances -- the handler tells them apart by this pointer rather
+    ; than by having been registered separately per view.
+    user: [c-pointer!]
+    ; 1 for a view that draws to its own child surface. Set before the spec is
+    ; parsed, because the surface does not exist yet at that point and
+    ; view-parse still has to know not to probe for native widgets.
+    is-context: [i32!]
+    ; The token handed to the backend as `user`, owned by this view.
+    token: [c-pointer!]
+    ; The face being dragged (region-relative slot, or -1), and where the drag
+    ; started. A knob reads its value from how far the pointer has moved since
+    ; the grab, not from where the pointer is, so both have to be remembered.
+    drag-face: [i32!]
+    drag-y: [i32!]
+    drag-value: [f64!]
+    ; Which of the four stage knobs of an envelope editor is being dragged,
+    ; or -1. The editor is one face driving four parameters, so the face slot
+    ; alone does not say what the pointer took hold of.
+    drag-stage: [i32!]
+    ; 1 while native OS widgets are in play. Window views only: the context API
+    ; has no native-widget entry points, so a context view is always custom.
+    native: [i32!]
+    ; 1 once the view has failed; it then renders nothing instead of exiting.
+    failed: [i32!]
+    frame-actor: [word!]
+]
+
+views-holder!: make map! [items: array! [view-slot!]]
+views-store: make [#flexible [array! [view-slot!] 4]] none
+; Filled to its real length before `views:` is made, for the same reason
+; faces-store is, and never grown afterward. See the comment above
+; faces-holder!.
+repeat i MAX-VIEWS [
+    append views-store make view-slot! [
+        used: 0
+        count: 0
+        facet-count: 0
+        context: none
+        user: none
+        is-context: 0
+        token: none
+        drag-face: -1
+        drag-y: 0
+        drag-value: 0.0
+        drag-stage: -1
+        native: 0
+        failed: 0
+        frame-actor: 'no-actor-sentinel
+    ]
+]
+views: make [#mutable views-holder!] make views-holder! [items: views-store]
+
+; --- facets -------------------------------------------------------------------
+; The per-kind properties a face may carry -- the parameter it drives, the
+; envelope it selects, its page, its look. They used to be fields of face!, so
+; every face carried every one, and "this face has none" had to be spelled with
+; a value (-1, or 0) that a reader could forget to test for. A facet is a record
+; that exists only when the face declared it, so a face with no envelope has no
+; envelope record and there is nothing to compare against a sentinel.
+;
+; Kinds are plain i32! constants, not an enum!, for the reason given by fk-*
+; above. Values are i32! whatever they mean; color2 is a u32! and is carried
+; across as its bit pattern.
+fc-param: 0
+fc-depth: 1
+fc-envelope: 2
+fc-page: 3
+fc-style: 4
+fc-font: 5
+fc-color2: 6
+
+facet!: make c-struct! [
+    kind: [i32!]
+    value: [i32!]
+]
+
+; What a facet lookup answers. A sum rather than an i32! with a sentinel, which
+; is the whole point of the exercise: a caller cannot read the value without
+; saying what to do when there is none.
+facet-result!: make sum! [
+    found [value: i32!]
+    absent
+]
+
+; One store for every view, each owning a fixed region of VIEW-FACET-CAP records
+; the way it owns a region of faces. Filled to its real length before the
+; holder is made and never grown, for the reason given above faces-holder!.
+facets-holder!: make map! [items: array! [facet!]]
+facets-store: make [#flexible [array! [facet!] 2304]] none
+repeat i 2304 [
+    append facets-store make facet! [
+        kind: -1
+        value: 0
+    ]
+]
+facets: make [#mutable facets-holder!] make facets-holder! [items: facets-store]
+
+; The view `view-build` is filling and `frame` is rendering. Module-level
+; because the parse paren-actions in view-build and the C-ABI frame callbacks
+; both need it and neither can take an extra argument.
+current-view: make [#mutable i32!] 0
+
+; The panel whose body is being parsed, as a region-relative slot, or -1 at
+; the top level. Module-level for the same reason current-view is: a parse
+; paren-action takes no arguments beyond what the grammar hands it.
+current-parent: make [#mutable i32!] -1
+
+; Ordinal handed to the next `page` in the spec. Module-level for the same
+; reason current-parent is: a parse paren action cannot carry state across
+; the recursion into a nested body, and pages are numbered across the whole
+; view rather than within one panel.
+page-ordinal: make [#mutable i32!] 0
+
+; --- actor registries --------------------------------------------------------
+; Registry entries own typed callable handles. Their backing vectors use the
+; compiler-generated element copy/drop callbacks, so captured handler
+; environments remain alive until the registry is reset or module cleanup
+; releases the vector.
+
+click-entry!: make c-struct! [
+    name: [word!]
+    clickfn: [fn-ptr! [return: [none!]]]
+]
+data-entry!: make c-struct! [
+    name: [word!]
+    datafn: [fn-ptr! [v [f64!] return: [none!]]]
+]
+text-entry!: make c-struct! [
+    name: [word!]
+    textfn: [fn-ptr! [t [string!] return: [none!]]]
+]
+draw-entry!: make c-struct! [
+    name: [word!]
+    drawfn: [fn-ptr! [
+        context [c-pointer!]
+        pos [pair!]
+        size [pair!]
+        label [string!]
+        data [f64!]
+        return: [none!]
+    ]]
+]
+frame-entry!: make c-struct! [
+    name: [word!]
+    framefn: [fn-ptr! [return: [none!]]]
+]
+
+; The three parameter actors. Every fn field here carries a name no other
+; c-struct! in this module uses: field-name resolution for a c-fn!/fn-ptr!
+; field is global by spelling, so two structs sharing one would make every
+; call through either resolve to whichever arity the parser saw last.
+edit-entry!: make c-struct! [
+    name: [word!]
+    editfn: [fn-ptr! [
+        id [u32!]
+        normalized [f64!]
+        phase [i32!]
+        return: [none!]
+    ]]
+]
+; One struct behind both parameter queries: they ask the same question shape
+; (given a parameter, what is its normalized value) and differ only in which
+; value they mean. Two structs would need two fn-field names, and c-fn field
+; resolution is global by spelling.
+query-entry!: make c-struct! [
+    name: [word!]
+    queryfn: [fn-ptr! [id [u32!] return: [f64!]]]
+]
+format-entry!: make c-struct! [
+    name: [word!]
+    formatfn: [fn-ptr! [id [u32!] normalized [f64!] return: [string!]]]
+]
+
+; The registries grow after module init -- every `actor*` call appends -- and
+; dispatch scans them, so dispatch reads each store itself. They deliberately
+; have no holder struct like faces-holder! below: a holder made over a store
+; keeps the vec it was made over, and a vector grown while shared is copied, so
+; a holder made before the first registration would stay empty for good and
+; every dispatch would find no actor. See the comment above faces-holder!.
+click-store: make [#flexible [array! [click-entry!] 16]] none
+data-store: make [#flexible [array! [data-entry!] 16]] none
+text-store: make [#flexible [array! [text-entry!] 16]] none
+draw-store: make [#flexible [array! [draw-entry!] 16]] none
+frame-store: make [#flexible [array! [frame-entry!] 4]] none
+edit-store: make [#flexible [array! [edit-entry!] 8]] none
+default-store: make [#flexible [array! [query-entry!] 8]] none
+value-store: make [#flexible [array! [query-entry!] 8]] none
+format-store: make [#flexible [array! [format-entry!] 8]] none
+
+current-frame-actor: make [#mutable word!] 'no-actor-sentinel
+
+
+sysexit: foreign <stdlib.h> [
+    c-exit: "exit" [i32! return: [none!]]
+    c-calloc: "calloc" [size! size! return: [c-pointer!]]
+    c-free: "free" [c-pointer! return: [void!]]
+]
+
+vid-fatal: func [
+    "Print a fatal dialect diagnostic and terminate the process."
+    msg [string!] "Message to print before exiting."
+    return: [none!]
+] [
+    print msg
+    sysexit/c-exit 1
+    return none
+]
+
+actor: func [
+    "Register a click handler (func [return: [none!]]) under a name for `on-click` specs."
+    name [word!] "Actor name, e.g. 'act-1."
+    handler [fn-ptr! [return: [none!]]] "Typed click handler."
+    return: [none!]
+] [
+    append click-store make click-entry! [name: name clickfn: handler]
+    return none
+]
+
+actor-data: func [
+    "Register a change handler (func [v [f64!]]) for slider `on-change` specs. `v` is the face's normalized 0.0..1.0 position; map it to engineering units on the application side."
+    name [word!] "Actor name."
+    handler [fn-ptr! [v [f64!] return: [none!]]] "Typed normalized-value handler."
+    return: [none!]
+] [
+    append data-store make data-entry! [name: name datafn: handler]
+    return none
+]
+
+actor-text: func [
+    "Register a change handler (func [t [string!]]) for field `on-change` specs."
+    name [word!] "Actor name."
+    handler [fn-ptr! [t [string!] return: [none!]]] "Typed text handler."
+    return: [none!]
+] [
+    append text-store make text-entry! [name: name textfn: handler]
+    return none
+]
+
+actor-draw: func [
+    "Register a custom draw handler for `on-draw` specs on any face kind. The handler receives the surface to draw on, then the face's geometry, label, and value, and is responsible for all of the face's rendering (it replaces the built-in per-kind chrome). The surface is null for the standalone window, whose faces draw through the window API; it is a live context in a context view, which is what the Draw dialect and gui/widget need."
+    name [word!] "Actor name."
+    handler [fn-ptr! [context [c-pointer!] pos [pair!] size [pair!] label [string!] data [f64!] return: [none!]]] "Typed draw handler."
+    return: [none!]
+] [
+    append draw-store make draw-entry! [name: name drawfn: handler]
+    return none
+]
+
+actor-frame: func [
+    "Register a per-frame handler (func [return: [none!]]) for view-window."
+    name [word!] "Actor name."
+    handler [fn-ptr! [return: [none!]]] "Typed frame handler."
+    return: [none!]
+] [
+    append frame-store make frame-entry! [name: name framefn: handler]
+    return none
+]
+
+actor-edit: func [
+    {Register the gesture handler for `on-edit` faces. It is called with the face's `param` id, the new normalized 0.0..1.0 value, and one of ph-begin / ph-change / ph-end. A host records an automation edit only between a begin and an end, so the handler should pass all three phases on rather than acting on the change alone.}
+    name [word!] "Actor name."
+    handler [fn-ptr! [id [u32!] normalized [f64!] phase [i32!] return: [none!]]] "Typed gesture handler."
+    return: [none!]
+] [
+    append edit-store make edit-entry! [name: name editfn: handler]
+    return none
+]
+
+actor-default: func [
+    {Register the handler answering what a double-click on an `on-default` face restores, as a normalized 0.0..1.0 value. It is a query, not a command: the dialect writes the answer into the face and plays the whole begin/change/end gesture around it, so the plug-in states its defaults once and does not repeat the reset sequence.}
+    name [word!] "Actor name."
+    handler [fn-ptr! [id [u32!] return: [f64!]]] "Typed default-value query."
+    return: [none!]
+] [
+    append default-store make query-entry! [name: name queryfn: handler]
+    return none
+]
+
+actor-value: func [
+    {Register the handler answering what a face's parameter currently reads, as a normalized 0.0..1.0 value. A parameter-bound face asks once per frame, so the control follows the engine rather than caching a copy of it: an automated parameter, a preset load, or a value the host wrote directly all move the knob, which a face holding its own state would not.}
+    name [word!] "Actor name."
+    handler [fn-ptr! [id [u32!] return: [f64!]]] "Typed value query."
+    return: [none!]
+] [
+    append value-store make query-entry! [name: name queryfn: handler]
+    return none
+]
+
+actor-format: func [
+    {Register the handler rendering a face's value as the line drawn under it. It receives the `param` id and the normalized value and returns owned text; how a value reads -- kHz, ms, per cent -- is the plug-in's business, so the dialect asks rather than deciding. gui/widget's widget-format-number does the snprintf part.}
+    name [word!] "Actor name."
+    handler [fn-ptr! [id [u32!] normalized [f64!] return: [string!]]] "Typed value formatter."
+    return: [none!]
+] [
+    append format-store make format-entry! [name: name formatfn: handler]
+    return none
+]
+
+; --- actor dispatch (linear scan by interned identity) -----------------------
+; Comparing `word!` values via `=` compares the interned per-module word_entry
+; identity directly and is correct here: every occurrence of the same
+; lit-word spelling in one compiled module dedupes to the same static entry.
+; Do NOT wrap a bare lit-word literal (or an already word!-typed binding) in
+; `as word!` -- that cast is for narrowing a *boxed* value! cell (e.g. a
+; PARSE capture), and applying it to an already-concrete word! value
+; reinterprets unrelated bytes, producing wrong comparisons.
+
+dispatch-click: func [
+    "Call the click actor registered under `name`, or diagnose if none is."
+    name [word!] "Requested actor name."
+    return: [none!]
+] [
+    repeat i (length? click-store) [
+        e: make click-entry! click-store/:i
+        if e/name = name [
+            e/clickfn
+            return none
+        ]
+    ]
+    vid-fatal "no click actor registered for the requested name"
+    return none
+]
+
+dispatch-data: func [
+    "Call the data actor registered under `name` with `v`, or diagnose."
+    name [word!] "Requested actor name."
+    v [f64!] "New normalized 0.0..1.0 value to pass to the handler."
+    return: [none!]
+] [
+    repeat i (length? data-store) [
+        e: make data-entry! data-store/:i
+        if e/name = name [
+            e/datafn v
+            return none
+        ]
+    ]
+    vid-fatal "no int actor registered for the requested name"
+    return none
+]
+
+dispatch-text: func [
+    "Call the text actor registered under `name` with `t`, or diagnose."
+    name [word!] "Requested actor name."
+    t [string!] "New text to pass to the handler."
+    return: [none!]
+] [
+    repeat i (length? text-store) [
+        e: make text-entry! text-store/:i
+        if e/name = name [
+            e/textfn t
+            return none
+        ]
+    ]
+    vid-fatal "no text actor registered for the requested name"
+    return none
+]
+
+dispatch-draw: func [
+    "Call the draw actor registered under `name` with the surface and the face's geometry, label, and value, or diagnose."
+    name [word!] "Requested actor name."
+    context [c-pointer!] "Surface to draw on; null for the standalone window."
+    pos [pair!] "Face origin."
+    size [pair!] "Face size."
+    label [string!] "Face label (empty for a bare canvas)."
+    data [f64!] "Face data facet (normalized slider position, or app-encoded state)."
+    return: [none!]
+] [
+    repeat i (length? draw-store) [
+        e: make draw-entry! draw-store/:i
+        if e/name = name [
+            e/drawfn context pos size label data
+            return none
+        ]
+    ]
+    vid-fatal "no draw actor registered for the requested name"
+    return none
+]
+
+dispatch-edit: func [
+    "Call the edit actor registered under `name` with one phase of a gesture, or diagnose."
+    name [word!] "Requested actor name."
+    id [u32!] "Host parameter id from the face's `param` facet."
+    normalized [f64!] "The face's new 0.0..1.0 value."
+    phase [i32!] "ph-begin, ph-change or ph-end."
+    return: [none!]
+] [
+    repeat i (length? edit-store) [
+        e: make edit-entry! edit-store/:i
+        if e/name = name [
+            e/editfn id normalized phase
+            return none
+        ]
+    ]
+    vid-fatal "no edit actor registered for the requested name"
+    return none
+]
+
+dispatch-default: func [
+    "Ask the default actor registered under `name` what `id` resets to, or diagnose."
+    name [word!] "Requested actor name."
+    id [u32!] "Host parameter id from the face's `param` facet."
+    return: [f64!] "Normalized 0.0..1.0 default."
+] [
+    repeat i (length? default-store) [
+        e: make query-entry! default-store/:i
+        if e/name = name [
+            return make f64! e/queryfn id
+        ]
+    ]
+    vid-fatal "no default actor registered for the requested name"
+    return 0.0
+]
+
+dispatch-value: func [
+    "Ask the value actor registered under `name` what `id` currently reads, or diagnose."
+    name [word!] "Requested actor name."
+    id [u32!] "Host parameter id from the face's `param` facet."
+    return: [f64!] "Normalized 0.0..1.0 value."
+] [
+    repeat i (length? value-store) [
+        e: make query-entry! value-store/:i
+        if e/name = name [
+            return make f64! e/queryfn id
+        ]
+    ]
+    vid-fatal "no value actor registered for the requested name"
+    return 0.0
+]
+
+dispatch-format: func [
+    "Ask the format actor registered under `name` to render a value, or diagnose."
+    name [word!] "Requested actor name."
+    id [u32!] "Host parameter id from the face's `param` facet."
+    normalized [f64!] "The face's current 0.0..1.0 value."
+    return: [string!] "Owned text to draw."
+] [
+    repeat i (length? format-store) [
+        e: make format-entry! format-store/:i
+        if e/name = name [
+            return make string! e/formatfn id normalized
+        ]
+    ]
+    vid-fatal "no format actor registered for the requested name"
+    return make string! ""
+]
+
+; Reports rather than terminates: this runs from the host's expose callback,
+; and vid-fatal would exit(), taking the whole plug-in host process down over a
+; missing actor. render-view marks the view failed instead.
+dispatch-frame: func [
+    "Call the frame actor registered under `name`. False when none matches."
+    name [word!] "Requested actor name."
+    return: [logic!] "True when an actor was found and ran."
+] [
+    repeat i (length? frame-store) [
+        e: make frame-entry! frame-store/:i
+        if e/name = name [
+            e/framefn
+            return true
+        ]
+    ]
+    return false
+]
+
+; --- view: parse a spec block into the face array ---------------------------
+; `no-actor` is the sentinel `on-click`/`on-change` value for a face that
+; names no handler -- `word!` fields have no null representation here, and
+; this spelling is never a legal actor name (dispatch never receives it).
+no-actor: 'no-actor-sentinel
+
+; --- view pool helpers --------------------------------------------------------
+
+; The pool and the face regions are filled to their full length when the module
+; initialises (faces-store and views-store above), not on first use, so nothing
+; here ever grows them: faces-holder! and views-holder! hold the vec they were
+; made over, and a growth after that would leave them looking at a stale copy.
+
+; Absolute index of a region-relative face slot. The one place the region
+; arithmetic is written; everything else goes through it, so a region can never
+; be addressed two different ways.
+view-face-index: func [
+    "Absolute faces-store index of slot `slot` in view `id`."
+    id [i32!] "View id."
+    slot [i32!] "Region-relative slot, 0-based."
+    return: [i32!] "0-based index into faces/items."
+] [
+    return (id * VIEW-FACE-CAP) + slot
+]
+
+view-count: func [
+    "Number of faces placed in a view's region."
+    id [i32!] "View id."
+    return: [i32!] "Face count."
+] [
+    return make i32! views/items/(id)/count
+]
+
+; A view that has failed reports it and renders nothing. It does NOT exit:
+; vid-fatal terminates the process, which inside a CLAP plug-in would take the
+; host down with it, so only the standalone window path may use it.
+view-fail: func [
+    "Mark a view failed and print why, without terminating the process."
+    id [i32!] "View id."
+    :msg [string!] "Diagnostic to print."
+    return: [none!]
+] [
+    print :msg
+    views/items/(id)/failed: 1
+    return none
+]
+
+view-alloc: func [
+    "Claim a free view slot, or -1 when the pool is exhausted."
+    return: [i32!] "View id, or -1."
+] [
+    found: make [#mutable i32!] -1
+    repeat i MAX-VIEWS [
+        if found < 0 [
+            in-use: make i32! views/items/(i)/used
+            if in-use = 0 [found: i]
+        ]
+    ]
+    if found < 0 [return -1]
+    views/items/(found)/used: 1
+    views/items/(found)/count: 0
+    views/items/(found)/facet-count: 0
+    views/items/(found)/native: 0
+    views/items/(found)/failed: 0
+    views/items/(found)/context: none
+    views/items/(found)/user: none
+    views/items/(found)/is-context: 0
+    views/items/(found)/token: none
+    views/items/(found)/drag-face: -1
+    views/items/(found)/frame-actor: no-actor
+    return found
+]
+
+view-release: func [
+    "Return a view slot to the pool. Its region is left for the next attach."
+    id [i32!] "View id."
+    return: [none!]
+] [
+    if any [id < 0 id >= MAX-VIEWS] [return none]
+    views/items/(id)/used: 0
+    views/items/(id)/count: 0
+    views/items/(id)/facet-count: 0
+    views/items/(id)/context: none
+    views/items/(id)/user: none
+    views/items/(id)/is-context: 0
+    views/items/(id)/token: none
+    views/items/(id)/frame-actor: no-actor
+    return none
+]
+
+view-user: func [
+    "The caller state registered for a view, or null."
+    id [i32!] "View id."
+    return: [c-pointer!] "Borrowed user pointer."
+] [
+    if any [id < 0 id >= MAX-VIEWS] [return as c-pointer! 0]
+    return views/items/(id)/user
+]
+
+view-current-user: func [
+    "The caller state of the view currently being rendered or dispatched. An actor uses this to tell which instance of a plug-in it belongs to, without every actor signature having to carry the pointer."
+    return: [c-pointer!] "Borrowed user pointer, or null."
+] [
+    return view-user current-view
+]
+
+; --- the drawing surface ------------------------------------------------------
+; A view draws either to the process-wide window or to its own child surface,
+; and the render loop must not care which. These are the whole of that
+; difference: the window and context primitives are otherwise identical, the
+; context ones simply taking the surface as a leading borrowed argument.
+;
+; Written as dispatch rather than as two render loops on purpose -- a second
+; copy of the loop is a second place for a face kind to be drawn, which is the
+; class of duplication this dialect exists to remove.
+
+view-context-of: func [
+    "The child surface a view draws to, or null when it draws to the window."
+    id [i32!] "View id."
+    return: [c-pointer!] "Borrowed context, or null."
+] [
+    if any [id < 0 id >= MAX-VIEWS] [return as c-pointer! 0]
+    return views/items/(id)/context
+]
+
+surface-begin-frame: func [
+    "Begin a frame on a view's surface."
+    id [i32!] "View id."
+    return: [none!]
+] [
+    ctx: view-context-of id
+    either none? ctx [gui-begin-frame] [gui-context-begin-frame :ctx]
+    return none
+]
+
+surface-end-frame: func [
+    "Finish a frame on a view's surface."
+    id [i32!] "View id."
+    return: [none!]
+] [
+    ctx: view-context-of id
+    either none? ctx [gui-end-frame] [gui-context-end-frame :ctx]
+    return none
+]
+
+surface-clear: func [
+    "Clear a view's surface."
+    id [i32!] "View id."
+    rgba [u32!] "Packed 0xRRGGBBAA fill colour."
+    return: [none!]
+] [
+    ctx: view-context-of id
+    either none? ctx [gui-clear rgba] [gui-context-clear :ctx rgba]
+    return none
+]
+
+surface-draw-rect: func [
+    "Fill a rectangle on a view's surface."
+    id [i32!] "View id."
+    x [i32!] "Left edge." y [i32!] "Top edge."
+    w [i32!] "Width." h [i32!] "Height."
+    rgba [u32!] "Packed 0xRRGGBBAA fill colour."
+    return: [none!]
+] [
+    ctx: view-context-of id
+    either none? ctx [
+        gui-draw-rect x y w h rgba
+    ] [
+        gui-context-draw-rect :ctx x y w h rgba
+    ]
+    return none
+]
+
+surface-draw-rect-gradient-v: func [
+    "Fill a rectangle with a vertical wash on a view's surface."
+    id [i32!] "View id."
+    x [i32!] "Left edge." y [i32!] "Top edge."
+    w [i32!] "Width." h [i32!] "Height."
+    top [u32!] "Colour at the top edge."
+    bottom [u32!] "Colour at the bottom edge."
+    return: [none!]
+] [
+    ctx: view-context-of id
+    either none? ctx [
+        ; The window API has no gradient entry point, so a window view gets
+        ; the top colour flat rather than nothing at all.
+        gui-draw-rect x y w h top
+    ] [
+        gui-context-draw-rect-gradient-v :ctx x y w h top bottom
+    ]
+    return none
+]
+
+surface-draw-text: func [
+    "Draw text on a view's surface."
+    id [i32!] "View id."
+    :text [string!] "Borrowed text."
+    x [i32!] "Left x." y [i32!] "Top y."
+    size [i32!] "Font size."
+    rgba [u32!] "Packed 0xRRGGBBAA text colour."
+    return: [none!]
+] [
+    ctx: view-context-of id
+    either none? ctx [
+        gui-draw-text :text x y size rgba
+    ] [
+        gui-context-draw-text :ctx :text x y size rgba
+    ]
+    return none
+]
+
+surface-text-centred: func [
+    {Draw a line of text centred on an x, on either surface kind. gui/widget
+     has the same helper, but it takes a child-surface context and a tab
+     strip has to look the same in a standalone window, so the measurement
+     goes through the same either the rest of this file uses.}
+    id [i32!] "View id."
+    :text [string!] "Borrowed line to draw."
+    centre-x [i32!] "The x the line is centred on."
+    y [i32!] "Top of the line."
+    size [i32!] "Font size."
+    rgba [u32!] "Packed 0xRRGGBBAA text colour."
+    return: [none!]
+] [
+    ctx: view-context-of id
+    width: either none? ctx
+        [gui-measure-text :text size]
+        [gui-context-measure-text :ctx :text size]
+    surface-draw-text id :text (centre-x - (width / 2)) y size rgba
+    return none
+]
+
+surface-mouse-pos: func [
+    "Pointer position in a view's surface."
+    id [i32!] "View id."
+    return: [pair!] "Pointer coordinates."
+] [
+    ctx: view-context-of id
+    either none? ctx [return gui-mouse-pos] [return gui-context-mouse-pos :ctx]
+]
+
+surface-mouse-pressed?: func [
+    "Whether a button went down on a view's surface this frame."
+    id [i32!] "View id."
+    button [i32!] "Button index."
+    return: [logic!]
+] [
+    ctx: view-context-of id
+    either none? ctx [
+        return gui-mouse-pressed? button
+    ] [
+        return gui-context-mouse-pressed? :ctx button
+    ]
+]
+
+surface-mouse-down?: func [
+    "Whether a button is held on a view's surface."
+    id [i32!] "View id."
+    button [i32!] "Button index."
+    return: [logic!]
+] [
+    ctx: view-context-of id
+    either none? ctx [
+        return gui-mouse-down? button
+    ] [
+        return gui-context-mouse-down? :ctx button
+    ]
+]
+
+; The gesture-shaped half of the pointer API. The window backend has no
+; released / double-click / modifier entry points, so a window view answers
+; false to all three: its knobs still turn (the drag ends when the button is no
+; longer down) but they report no gesture, which is exactly right -- a knob
+; needs a child surface to be drawn at all.
+surface-mouse-released?: func [
+    "Whether a button came up on a view's surface this frame."
+    id [i32!] "View id."
+    button [i32!] "Button index."
+    return: [logic!]
+] [
+    ctx: view-context-of id
+    if none? ctx [return false]
+    return gui-context-mouse-released? :ctx button
+]
+
+surface-mouse-double-clicked?: func [
+    "Whether a button double-clicked on a view's surface this frame."
+    id [i32!] "View id."
+    button [i32!] "Button index."
+    return: [logic!]
+] [
+    ctx: view-context-of id
+    if none? ctx [return false]
+    return gui-context-mouse-double-clicked? :ctx button
+]
+
+surface-shift-down?: func [
+    "Whether a shift key is held over a view's surface."
+    id [i32!] "View id."
+    return: [logic!]
+] [
+    ctx: view-context-of id
+    if none? ctx [return false]
+    return gui-context-shift-down? :ctx
+]
+
+; Keyboard, and the one place the two surfaces genuinely differ rather than
+; merely spelling a call differently. The backend's child-surface API is mouse
+; and drawing only -- there is no rgui_context_key_pressed or
+; rgui_context_char_pressed -- so a `field` face in a context view renders and
+; hit-tests but cannot receive text. view-context-attach says so at build time
+; rather than leaving a control that looks live and is not.
+surface-char-pressed: func [
+    "Next typed character on a view's surface, or 0 when there is none."
+    id [i32!] "View id."
+    return: [i32!] "Character code, or 0."
+] [
+    ctx: view-context-of id
+    if not none? ctx [return 0]
+    return gui-char-pressed
+]
+
+surface-key-pressed?: func [
+    "Whether a key went down on a view's surface this frame."
+    id [i32!] "View id."
+    key [i32!] "Key code."
+    return: [logic!]
+] [
+    ctx: view-context-of id
+    if not none? ctx [return false]
+    return gui-key-pressed? key
+]
+
+; Appends one face to the module-level array and advances the flow-layout
+; extent state. A plain paren action inside `parse` only accepts an
+; assignment-shaped expression (`set-word: expr`), not a bare call -- `view`
+; below calls this wrapped as `dummy: push-face ...` to satisfy that.
+push-face: func [
+    "Append a face! built from the current view accumulator state."
+    fkind [i32!] "Face kind constant (fk-*), including custom knobs and faders."
+    fname [word!] "Face name, or `no-actor` if unnamed."
+    fpos [pair!] "Flow-cursor position at the time this face was placed."
+    fsize [pair!] "Face size."
+    flabel [string!] "Face label / initial text."
+    fcolor [u32!] "Face color."
+    fhidden [i32!] "1 if hidden from rendering but active for hit-testing."
+    fon-click [word!] "on-click actor name, or `no-actor`."
+    fon-change [word!] "on-change actor name, or `no-actor`."
+    fon-draw [word!] "on-draw actor name, or `no-actor`."
+    return: [i32!] "Always 0; exists so the call can be used in a parse paren-action assignment."
+] [
+    id: make i32! current-view
+    used: view-count id
+    ; A region is fixed-width, so an overspilling spec is reported here rather
+    ; than silently writing over the next view's controls.
+    if used >= VIEW-FACE-CAP [
+        view-fail id "view spec exceeds VIEW-FACE-CAP faces"
+        return 0
+    ]
+    idx: view-face-index id used
+    faces/items/(idx)/kind: fkind
+    faces/items/(idx)/name: fname
+    faces/items/(idx)/pos: fpos
+    faces/items/(idx)/size: fsize
+    faces/items/(idx)/label: flabel
+    faces/items/(idx)/color: fcolor
+    faces/items/(idx)/data: 0.0
+    faces/items/(idx)/text: ""
+    faces/items/(idx)/hidden: fhidden
+    faces/items/(idx)/on-click: fon-click
+    faces/items/(idx)/on-change: fon-change
+    faces/items/(idx)/on-draw: fon-draw
+    faces/items/(idx)/on-edit: no-actor
+    faces/items/(idx)/on-default: no-actor
+    faces/items/(idx)/on-value: no-actor
+    faces/items/(idx)/on-format: no-actor
+    faces/items/(idx)/parent: current-parent
+    ; The face's facets are written by attach-facets straight after this call,
+    ; before anything else is placed, so they are contiguous from here.
+    faces/items/(idx)/facet-at: views/items/(id)/facet-count
+    faces/items/(idx)/facet-count: 0
+    views/items/(id)/count: used + 1
+    return 0
+]
+
+add-facet: func [
+    "Append one facet record to a face and to its view's facet region."
+    id [i32!] "View id."
+    idx [i32!] "Absolute faces-store index of the face that owns the facet."
+    fkind [i32!] "Facet kind constant (fc-*)."
+    fvalue [i32!] "The facet's value."
+    return: [none!] "No value."
+] [
+    placed: make i32! views/items/(id)/facet-count
+    ; Fixed-width, like the face region: report an overspill here rather than
+    ; write over the next view's facets.
+    if placed >= VIEW-FACET-CAP [
+        view-fail id "view spec exceeds VIEW-FACET-CAP facets"
+        return none
+    ]
+    rec: (id * VIEW-FACET-CAP) + placed
+    facets/items/(rec)/kind: fkind
+    facets/items/(rec)/value: fvalue
+    views/items/(id)/facet-count: placed + 1
+    faces/items/(idx)/facet-count: (make i32! faces/items/(idx)/facet-count) + 1
+    return none
+]
+
+attach-facets: func [
+    {Give the most recently placed face of the current view the facets it
+     declares. A facet is written only when its value says the face declared
+     it, so a face that declares none keeps an empty range.}
+    fparam [i32!] "Host parameter id, or -1 for none."
+    fdepth [i32!] "Envelope depth parameter id, or -1 for none."
+    fenvelope [i32!] "Base parameter of the envelope the face selects, or -1."
+    fpage [i32!] "Page ordinal for a `page` panel, or -1."
+    fstyle [i32!] "Custom widget style index, or 0 for the default look."
+    ffont [i32!] "Text point size, or 0 for the kind's default."
+    fcolor2 [u32!] "Far end of a vertical wash, or 0 for a flat fill."
+    return: [i32!] "Always 0; exists so the call can be used in a parse paren-action assignment."
+] [
+    id: make i32! current-view
+    used: view-count id
+    ; Nothing to attach to when push-face refused the face.
+    if used <= 0 [return 0]
+    idx: view-face-index id (used - 1)
+    if fparam >= 0 [add-facet id idx fc-param fparam]
+    if fdepth >= 0 [add-facet id idx fc-depth fdepth]
+    if fenvelope >= 0 [add-facet id idx fc-envelope fenvelope]
+    if fpage >= 0 [add-facet id idx fc-page fpage]
+    if fstyle <> 0 [add-facet id idx fc-style fstyle]
+    if ffont <> 0 [add-facet id idx fc-font ffont]
+    if fcolor2 <> (as u32! 0) [add-facet id idx fc-color2 (as i32! fcolor2)]
+    return 0
+]
+
+face-facet: func [
+    "Look up one facet of one face in a view."
+    id [i32!] "View id."
+    slot [i32!] "Region-relative slot of the face."
+    fc [i32!] "Facet kind constant (fc-*)."
+    return: [facet-result!] "The facet's value, or absent when the face never declared it."
+] [
+    idx: view-face-index id slot
+    start: make i32! faces/items/(idx)/facet-at
+    held: make i32! faces/items/(idx)/facet-count
+    base: (id * VIEW-FACET-CAP) + start
+    hit: make [#mutable logic!] false
+    got: make [#mutable i32!] 0
+    repeat j held [
+        rec: base + j
+        if all [(make i32! facets/items/(rec)/kind) = fc not hit] [
+            hit: true
+            got: make i32! facets/items/(rec)/value
+        ]
+    ]
+    return either hit [facet-result!/found [value: got]] [facet-result!/absent]
+]
+
+facet-or: func [
+    "A facet's value, or a fallback for a face that never declared it."
+    id [i32!] "View id."
+    slot [i32!] "Region-relative slot of the face."
+    fc [i32!] "Facet kind constant (fc-*)."
+    fallback [i32!] "What to answer when the facet is absent."
+    return: [i32!] "The facet's value, or `fallback`."
+] [
+    r: face-facet id slot fc
+    out: match r [
+        found [v] [v]
+        absent [] [fallback]
+    ]
+    return out
+]
+
+last-face-slot: func [
+    "Region-relative slot of the face most recently placed in the current view."
+    return: [i32!] "Slot index, or -1 when the view is empty."
+] [
+    return (view-count current-view) - 1
+]
+
+selected-page: func [
+    {The page ordinal the view's tab strip has selected, or -1 when the view
+     has no tabs. One strip per view: Mach's pages share a single row of tabs
+     and a second strip would need a way to say which pages it governs, which
+     is grammar nothing has asked for.}
+    id [i32!] "View id."
+    return: [i32!] "Selected page ordinal, or -1."
+] [
+    placed: view-count id
+    found: make [#mutable i32!] -1
+    repeat slot placed [
+        idx: view-face-index id slot
+        if all [
+            found < 0
+            (make i32! faces/items/(idx)/kind) = fk-tabs
+        ] [found: as i32! (make f64! faces/items/(idx)/data)]
+    ]
+    return found
+]
+
+panel-open?: func [
+    {True when every panel enclosing a face is unhidden. A face's OWN `hidden`
+     is deliberately not consulted here: on a face it means invisible but
+     still clickable, which is the legacy invisible-hit-region behaviour. On
+     a panel it means the group is not there at all -- neither drawn nor
+     hit-tested -- which is what a hidden page has to mean.}
+    id [i32!] "View id."
+    slot [i32!] "Region-relative slot of the face whose ancestry is in question."
+    return: [logic!] "False when any enclosing panel is hidden."
+] [
+    ; A parent is always placed before its children, so the chain strictly
+    ; decreases and terminates; the depth bound is belt and braces against a
+    ; malformed store rather than a real cycle.
+    start: view-face-index id slot
+    walk: make [#mutable i32!] faces/items/(start)/parent
+    repeat step 8 [
+        unused step
+        if walk < 0 [return true]
+        idx: view-face-index id walk
+        if (make i32! faces/items/(idx)/hidden) <> 0 [return false]
+        ; A page is a panel that is open only while the strip has it
+        ; selected. Expressed as a second reason for a panel to be closed
+        ; rather than as its own traversal, so a control on an unselected
+        ; page is invisible in exactly the way a control in a hidden panel
+        ; is -- and one rule keeps the draw pass and the hit-test pass
+        ; agreeing, which is the drift the whole slice exists to prevent.
+        ord: facet-or id walk fc-page -1
+        if ord >= 0 [
+            if ord <> (selected-page id) [return false]
+        ]
+        walk: make i32! faces/items/(idx)/parent
+    ]
+    return true
+]
+
+; --- tabs and envelopes -------------------------------------------------------
+
+page-count: func [
+    "How many `page` panels the view declares."
+    id [i32!] "View id."
+    return: [i32!] "Page count, 0 when the view has no pages."
+] [
+    placed: view-count id
+    total: make [#mutable i32!] 0
+    repeat slot placed [
+        idx: view-face-index id slot
+        if (facet-or id slot fc-page -1) >= 0 [total: total + 1]
+    ]
+    return total
+]
+
+page-caption: func [
+    "The caption of one page, which is the text on its tab."
+    id [i32!] "View id."
+    ordinal [i32!] "Page ordinal."
+    return: [string!] "Owned caption; empty when there is no such page."
+] [
+    placed: view-count id
+    found: make [#mutable string!] make string! ""
+    repeat slot placed [
+        idx: view-face-index id slot
+        if (facet-or id slot fc-page -1) = ordinal [
+            found: make string! faces/items/(idx)/label
+        ]
+    ]
+    return found
+]
+
+tab-cell-width: func [
+    {The width of one tab in a strip that occupies `width` in total.
+
+     A tab strip's face size is the WHOLE strip, like every other face's:
+     what a face draws and what it answers the mouse over are the same
+     rectangle. The cell is derived from it, so the two cannot drift. It used
+     to be the other way round -- the size was one cell and the strip spread
+     itself over five more -- and the face then hit-tested one sixth of what
+     it drew, which made every tab but the first inert.}
+    width [i32!] "The strip's full width."
+    pages [i32!] "How many tabs share it."
+    return: [i32!] "One tab's width; the whole strip when there is one tab."
+] [
+    if pages < 2 [return width]
+    return (width - (vid-default-gap/x * (pages - 1))) / pages
+]
+
+tab-strip-ordinal: func [
+    {Which tab of a strip a point lands on, or -1 for none. The point is
+     assumed to be inside the face; callers hit-test the face itself first,
+     the same as any other kind.}
+    id [i32!] "View id."
+    f [face!] "The tab strip face."
+    px [i32!] "Point x, window pixels."
+    return: [i32!] "Tab ordinal, or -1 when the point is on no tab."
+] [
+    pages: page-count id
+    if pages < 1 [return -1]
+    cell: tab-cell-width f/size/x pages
+    if cell < 1 [return -1]
+    pitch: cell + vid-default-gap/x
+    landed: (px - f/pos/x) / pitch
+    if landed < 0 [return -1]
+    if landed >= pages [return -1]
+    ; The gap between two tabs is nobody's tab: a click there must not select
+    ; the one on its left. `within` runs 0..pitch-1 and the cell is 0..cell-1,
+    ; so the bound is strict.
+    within: (px - f/pos/x) - (landed * pitch)
+    if within >= cell [return -1]
+    return landed
+]
+
+env-stages: func [
+    {Read one envelope preview's four stages back out of the model. The
+     stages are `param` and the three ids after it: an envelope's ADSR is
+     consecutive in every schema this dialect has met, and the engine's own
+     reader already relies on it. Values come back normalized, which is what
+     the curve is drawn against -- so a stage reads as the fraction of its
+     own range that it is set to, and a plug-in whose stages share one range
+     gets a plot in real time for free.}
+    id [i32!] "View id."
+    slot [i32!] "Region-relative slot of the env-preview or env-editor face."
+    return: [envelope-shape!] "The four stages, normalized."
+] [
+    idx: view-face-index id slot
+    ; Copied out rather than read field by field: a stored word! reaches an
+    ; actor dispatch through a face! copy everywhere else in this file, and
+    ; picking one straight off the store lowers as a map access (P1704).
+    fv: make face! faces/items/(idx)
+    base: facet-or id slot fc-envelope -1
+    if any [base < 0 fv/on-value = no-actor] [
+        return make envelope-shape! [attack: 0.0 decay: 0.0 sustain: 0.0 release: 0.0]
+    ]
+    a: dispatch-value fv/on-value (as u32! base)
+    d: dispatch-value fv/on-value (as u32! (base + 1))
+    s: dispatch-value fv/on-value (as u32! (base + 2))
+    r: dispatch-value fv/on-value (as u32! (base + 3))
+    return make envelope-shape! [attack: a decay: d sustain: s release: r]
+]
+
+selected-envelope-face: func [
+    {The slot of the face whose envelope an env-editor is showing -- a
+     preview of that envelope, or the knob that scales it. Selection is a
+     face slot rather than an ordinal because those faces live inside page
+     panels while the editor does not: an ordinal would mean something
+     different on every page. When the selected face is on a page that is no
+     longer up, the first open one takes over, so switching pages cannot
+     leave the editor showing a control the reader cannot see.}
+    id [i32!] "View id."
+    editor-slot [i32!] "Region-relative slot of the env-editor face."
+    return: [i32!] "Slot of an open envelope-carrying face, or -1 when the view has none."
+] [
+    idx: view-face-index id editor-slot
+    want: as i32! (make f64! faces/items/(idx)/data)
+    placed: view-count id
+    first-open: make [#mutable i32!] -1
+    want-open: make [#mutable i32!] -1
+    repeat slot placed [
+        probe-idx: view-face-index id slot
+        if all [
+            (facet-or id slot fc-envelope -1) >= 0
+            panel-open? id slot
+        ] [
+            ; The carrier's OWN slot. This read `slot - 1` and so returned
+            ; the face placed before the preview: on a page of consecutive
+            ; previews the editor showed the previous envelope (clicking FM
+            ; gave Amplitude, title and stages alike), and on Mach's Global
+            ; page, where the face before the sole preview is the Filter
+            ; Morph knob, it drove params 8..11 instead of 9..12 -- Filter
+            ; Morph and Filter Attack shifted into one another.
+            if first-open < 0 [first-open: slot]
+            if slot = want [want-open: slot]
+        ]
+    ]
+    if want-open >= 0 [return want-open]
+    return first-open
+]
+
+; The actor names are written by a second call rather than four more
+; arguments to push-face. Sixteen positional arguments is a shape where a
+; transposed pair still typechecks, and the split falls where the dialect
+; already splits: push-face places a face, bind-face says which actors drive it.
+; Which host parameter it drives is a facet, written by attach-facets.
+bind-face: func [
+    "Bind the most recently placed face in the current view to its actors."
+    fon-edit [word!] "on-edit actor name, or `no-actor`."
+    fon-default [word!] "on-default actor name, or `no-actor`."
+    fon-value [word!] "on-value actor name, or `no-actor`."
+    fon-format [word!] "on-format actor name, or `no-actor`."
+    return: [i32!] "Always 0; exists so the call can be used in a parse paren-action assignment."
+] [
+    id: make i32! current-view
+    used: view-count id
+    ; Nothing to bind when push-face refused the face (an overspilt region).
+    if used <= 0 [return 0]
+    idx: view-face-index id (used - 1)
+    faces/items/(idx)/on-edit: fon-edit
+    faces/items/(idx)/on-default: fon-default
+    faces/items/(idx)/on-value: fon-value
+    faces/items/(idx)/on-format: fon-format
+    return 0
+]
+
+; --- render/hit-test loop -----------------------------------------------------
+
+; Index of the currently-focused field face, or -1 if none. Module-level
+; because both the frame callback (mouse focus changes) and the per-keystroke
+; text input need to agree on it across frames.
+focused: make [#mutable i32!] -1
+
+truncate-last: func [
+    "Return a copy of `s` with its last character removed (or `s` if empty)."
+    s [string!] "Source text."
+    return: [string!] "`s` minus its final character."
+] [
+    n: length? s
+    if n <= 0 [return s]
+    buf: make [#flexible [string! 64]] none
+    repeat i (n - 1) [append buf s/:i]
+    return freeze buf
+]
+
+knob-centre: func [
+    "Centre of a knob face."
+    f [face!] "The face."
+    return: [fpair!] "Centre in pixels."
+] [
+    return fxy (as f64! (f/pos/x + (f/size/x / 2))) (as f64! (f/pos/y + (f/size/y / 2)))
+]
+
+knob-radius: func [
+    "Body radius of a knob face: half its shorter side, so a non-square face still yields a round knob."
+    f [face!] "The face."
+    return: [f64!] "Radius in pixels."
+] [
+    short: either f/size/x < f/size/y [f/size/x] [f/size/y]
+    return (as f64! short) / 2.0
+]
+
+hit?: func [
+    "True if mouse position m falls within face f's rectangle."
+    f [face!] "Face to hit-test."
+    m [pair!] "Mouse position in window pixels."
+    return: [logic!]
+] [
+    return all [
+        m/x >= f/pos/x m/x < (f/pos/x + f/size/x)
+        m/y >= f/pos/y m/y < (f/pos/y + f/size/y)
+    ]
+]
+
+face-rect: func [
+    "Return a face's rectangular bounds as floating-point geometry."
+    f [face!] "Face to resolve."
+    return: [rect!] "Face bounds in view pixels."
+] [
+    return rect-of (as f64! f/pos/x) (as f64! f/pos/y)
+        (as f64! f/size/x) (as f64! f/size/y)
+]
+
+clamp-normalized: func [
+    "Clamp a parameter-control value into the normalized range."
+    value [f64!] "Candidate normalized value."
+    return: [f64!] "Value in 0.0..1.0."
+] [
+    clamped: make [#mutable f64!] value
+    if clamped < 0.0 [clamped: 0.0]
+    if clamped > 1.0 [clamped: 1.0]
+    return clamped
+]
+
+parameter-control-press: func [
+    "Begin a relative parameter gesture or perform a complete reset gesture."
+    id [i32!] "View id."
+    slot [i32!] "Region-relative face slot."
+    index [i32!] "Absolute face-store index."
+    f [face!] "Parameter-bound knob or fader."
+    mouse-y [i32!] "Pointer y at contact."
+    double-clicked [logic!] "True when contact is a double-click reset."
+    return: [none!] "No value."
+] [
+    fpar: facet-or id slot fc-param -1
+    bound: all [f/on-edit <> no-actor fpar >= 0]
+    pid: as u32! fpar
+    either double-clicked [
+        reset-to: make [#mutable f64!] f/data
+        if all [f/on-default <> no-actor fpar >= 0] [
+            reset-to: dispatch-default f/on-default pid
+        ]
+        reset-to: clamp-normalized reset-to
+        faces/items/(index)/data: reset-to
+        ; Reset is self-contained and must not leave a drag armed.
+        views/items/(id)/drag-face: -1
+        if bound [
+            dispatch-edit f/on-edit pid reset-to ph-begin
+            dispatch-edit f/on-edit pid reset-to ph-change
+            dispatch-edit f/on-edit pid reset-to ph-end
+        ]
+        if f/on-change <> no-actor [dispatch-data f/on-change reset-to]
+    ] [
+        views/items/(id)/drag-face: slot
+        views/items/(id)/drag-y: mouse-y
+        views/items/(id)/drag-value: f/data
+        if bound [dispatch-edit f/on-edit pid f/data ph-begin]
+    ]
+    return none
+]
+
+parameter-control-drag: func [
+    "Continue or end the shared relative gesture for a knob or fader."
+    id [i32!] "View id."
+    slot [i32!] "Region-relative face slot."
+    index [i32!] "Absolute face-store index."
+    f [face!] "Parameter-bound knob or fader."
+    mouse-y [i32!] "Current pointer y."
+    down [logic!] "True while the primary pointer is held."
+    released [logic!] "True on the release frame."
+    fine [logic!] "True for ten-times-finer travel."
+    return: [none!] "No value."
+] [
+    fpar: facet-or id slot fc-param -1
+    bound: all [f/on-edit <> no-actor fpar >= 0]
+    pid: as u32! fpar
+    held: make i32! views/items/(id)/drag-face
+    if all [down held = slot] [
+        origin-y: make i32! views/items/(id)/drag-y
+        origin-v: make f64! views/items/(id)/drag-value
+        travel: either fine
+            [parameter-travel * parameter-fine] [parameter-travel]
+        moved: (as f64! (origin-y - mouse-y)) / travel
+        turned: clamp-normalized (origin-v + moved)
+        faces/items/(index)/data: turned
+        if bound [dispatch-edit f/on-edit pid turned ph-change]
+        if f/on-change <> no-actor [dispatch-data f/on-change turned]
+    ]
+    if all [released held = slot] [
+        if bound [
+            dispatch-edit f/on-edit pid
+                (make f64! faces/items/(index)/data) ph-end
+        ]
+    ]
+    return none
+]
+
+; Returns the effective size a native control face will occupy: the backend's
+; natural size (never smaller than the OS minimum, larger requests honored) in
+; native mode, otherwise the face's requested size unchanged.
+resolve-native-size: func [
+    "Resolve the effective size of a control face in native mode."
+    fkind [i32!] "VID face kind."
+    fsize [pair!] "Requested size (0,0 = unspecified)."
+    flabel [string!] "Face label (affects button width)."
+    return: [pair!] "Effective size."
+] [
+    res: make [#mutable pair!] fsize
+    if native-mode <> 1 [return res]
+    nkind: control-native-kind fkind
+    if nkind < 0 [return res]
+    sup: either nkind = 0 [native-supported-button]
+          [either nkind = 1 [native-supported-slider] [native-supported-field]]
+    if sup = 0 [return res]
+    return gui-native-natural-size nkind flabel fsize/x fsize/y
+]
+
+; Drains native-widget events (queued by the backend from signal handlers) into
+; the Recoil face model and dispatches the corresponding VID actors. Runs on the
+; frame thread so a handler can never rebuild/close the view mid-callback.
+drain-native-events: func [
+    "Apply pending native clicks/values/text to faces and dispatch actors."
+    return: [none!]
+] [
+    while [true] [
+        idx: make [#mutable i32!] 0
+        got: gui-native-take-click (addr-of idx)
+        if not got [break]
+        if all [idx >= 0 idx < (view-count 0)] [
+            fidx: view-face-index 0 idx
+            f: make face! faces/items/(fidx)
+            if f/on-click <> no-actor [dispatch-click f/on-click]
+        ]
+    ]
+    while [true] [
+        idx: make [#mutable i32!] 0
+        val: make [#mutable f64!] 0.0
+        got: gui-native-take-change (addr-of idx) (addr-of val)
+        if not got [break]
+        if all [idx >= 0 idx < (view-count 0)] [
+            fidx: view-face-index 0 idx
+            faces/items/(fidx)/data: val
+            f: make face! faces/items/(fidx)
+            if f/on-change <> no-actor [dispatch-data f/on-change val]
+        ]
+    ]
+    while [true] [
+        idx: make [#mutable i32!] 0
+        t: gui-native-take-text (addr-of idx)
+        if idx < 0 [break]
+        if idx < (view-count 0) [
+            fidx: view-face-index 0 idx
+            faces/items/(fidx)/text: t
+            f: make face! faces/items/(fidx)
+            if f/on-change <> no-actor [dispatch-text f/on-change t]
+        ]
+    ]
+    return none
+]
+
+; Reports each native control face to the backend (create-or-update). Runs after
+; drain so drained values are pushed; the backend skips pushing text/value equal
+; to what the widget already holds, which avoids fighting a focused field.
+reconcile-native: func [
+    "Reconcile native control widgets against the filtered Recoil face state."
+    return: [none!]
+] [
+    gui-native-begin
+    placed: view-count 0
+    repeat i placed [
+        f: make face! faces/items/(view-face-index 0 i)
+        nkind: control-native-kind f/kind
+        if nkind >= 0 [
+            sup: either nkind = 0 [native-supported-button]
+                  [either nkind = 1 [native-supported-slider] [native-supported-field]]
+            ; Same ancestry rule as the drawn path: a native widget inside
+            ; a hidden panel is not reconciled, so it is not created. Without
+            ; this an OS control on a hidden page would keep sitting on top
+            ; of the window, since a native widget is not something the draw
+            ; pass can decline to paint.
+            if all [sup <> 0 panel-open? 0 i] [
+                gui-native-face i nkind f/label f/pos/x f/pos/y f/size/x f/size/y f/data f/text
+            ]
+        ]
+    ]
+    gui-native-end
+    return none
+]
+
+; Draws and hit-tests one view. Reads/writes that view's region of
+; `faces-store` in place; every surface call goes through the dispatch helpers
+; above, so the same loop serves the standalone window and a plug-in editor's
+; child surface.
+render-view: func [
+    "Draw and hit-test one view for a frame."
+    id [i32!] "View id."
+    return: [none!]
+] [
+    ; A view that overspilled its region or failed to attach draws nothing,
+    ; rather than rendering a half-built spec.
+    if (make i32! views/items/(id)/failed) <> 0 [return none]
+
+    ; A context view whose surface is not live yet draws nothing. The backend
+    ; fires this callback DURING gui-context-attach -- on realize, before the
+    ; call has returned a handle for us to store -- so the first frame of
+    ; every plug-in editor arrives with `context` still null.
+    ;
+    ; Without this the surface-* helpers below decide window-versus-context by
+    ; `none? ctx`, which conflates "this is the standalone window view" with
+    ; "this context view is not ready", and quietly send the whole frame to
+    ; the global window API. There is no window in a plug-in host, so that is
+    ; an immediate segfault on open -- which is exactly what it was. Every
+    ; hand-written editor this dialect replaced opened with the same guard;
+    ; VID dropped it when it took the frame callback over.
+    if all [
+        (make i32! views/items/(id)/is-context) <> 0
+        none? (view-context-of id)
+    ] [return none]
+
+    if current-frame-actor <> no-actor [
+        if not dispatch-frame current-frame-actor [
+            view-fail id "render-view: no frame actor registered for the requested name"
+        ]
+    ]
+
+    surface-begin-frame id
+    surface-clear id (32.32.32.255)
+    mpos: surface-mouse-pos id
+    pressed: surface-mouse-pressed? id 0
+    down: surface-mouse-down? id 0
+    released: surface-mouse-released? id 0
+    dbl: surface-mouse-double-clicked? id 0
+    shift: surface-shift-down? id
+    white: 255.255.255.255
+    ; The region's live face count, captured before the loop: `repeat`'s bound
+    ; is spliced into the generated C `for` condition and re-evaluated every
+    ; iteration, so a bound that can change mid-loop must be frozen first.
+    placed: view-count id
+    repeat slot placed [
+        i: view-face-index id slot
+        ; A parameter-bound face reads its value from the model before it is
+        ; drawn, rather than holding a copy the drag is the only thing that
+        ; updates. A plug-in's parameters move for reasons the editor never
+        ; sees -- automation, a preset load, the host writing one directly --
+        ; and a control that cached its own state would sit still through all
+        ; of them. Refreshed before the face is copied out below, so the draw
+        ; and the gesture in this frame both see the same value.
+        fpar: facet-or id slot fc-param -1
+        fsty: facet-or id slot fc-style 0
+        if all [
+            faces/items/:i/on-value <> no-actor
+            fpar >= 0
+        ] [
+            faces/items/:i/data: dispatch-value
+                faces/items/:i/on-value (as u32! fpar)
+        ]
+        f: make face! faces/items/:i
+        is-native: face-native? f
+        ; A face inside a hidden panel is not there at all -- it neither
+        ; draws nor hit-tests. That is what makes a hidden panel a group
+        ; rather than a rectangle, and it is what a page needs: the controls
+        ; of the page you are not looking at must not answer the mouse.
+        ; Checked here, once, so the draw pass and the event pass below can
+        ; never disagree about which faces exist this frame.
+        open: panel-open? id slot
+
+        ; Native control faces are rendered, hit-tested, and edited by the OS
+        ; widget; only the custom-drawn faces go through the portable path.
+        if all [not is-native open] [
+
+            ; --- Draw. A custom on-draw (on ANY kind) fully replaces the built-in
+            ; per-kind chrome -- this is what lets a button, slider, etc. own its
+            ; appearance instead of forcing custom looks onto a separate canvas.
+            either f/on-draw <> no-actor [
+                if f/hidden = 0 [
+                    dispatch-draw f/on-draw (view-context-of id) f/pos f/size f/label f/data
+                ]
+            ] [
+                if f/hidden = 0 [
+                    ; `colour` is an override, not a default: a face that
+                    ; names none keeps the look its kind always had, so the
+                    ; facet could be wired without restyling every existing
+                    ; view. 0 is the sentinel because a fully transparent
+                    ; colour draws nothing anyway.
+                    if f/kind = fk-button [
+                        fill: either f/color = 0 [200.200.200.255] [f/color]
+                        surface-draw-rect id f/pos/x f/pos/y f/size/x f/size/y fill
+                        surface-draw-text id f/label (f/pos/x + 8) (f/pos/y + 4) 16 white
+                    ]
+                    if f/kind = fk-text [
+                        ink: either f/color = 0 [white] [f/color]
+                        pt: either (facet-or id slot fc-font 0) = 0 [16] [facet-or id slot fc-font 0]
+                        ; The declared label is the default; set-face-text
+                        ; overrides it. A caption nothing ever sets keeps
+                        ; behaving exactly as it did.
+                        shown-text: either (length? f/text) > 0 [f/text] [f/label]
+                        surface-draw-text id shown-text f/pos/x f/pos/y pt ink
+                    ]
+                    if f/kind = fk-panel [
+                        ; A panel is a rectangle and a scope. With no colour
+                        ; it is only the scope, which is what a bare grouping
+                        ; panel wants; with one it is also the section
+                        ; background, the wash or the one-pixel rule that
+                        ; would otherwise be an imperative draw call.
+                        if f/color <> 0 [
+                            fcol2: as u32! (facet-or id slot fc-color2 0)
+                            either fcol2 = (as u32! 0) [
+                                surface-draw-rect id f/pos/x f/pos/y f/size/x f/size/y f/color
+                            ] [
+                                surface-draw-rect-gradient-v id
+                                    f/pos/x f/pos/y f/size/x f/size/y f/color fcol2
+                            ]
+                        ]
+                    ]
+                    ; A tab strip: one cell per declared page, laid out from
+                    ; the face's own corner at its own size. The pitch is the
+                    ; cell plus the dialect's standard gap rather than a
+                    ; facet of its own -- a strip whose tabs are spaced some
+                    ; other way is a thing nothing has asked for, and Mach's
+                    ; 116-wide tabs with an 8 gap are exactly this.
+                    if f/kind = fk-tabs [
+                        pages: page-count id
+                        chosen: as i32! f/data
+                        cell: tab-cell-width f/size/x pages
+                        pitch: cell + vid-default-gap/x
+                        repeat p pages [
+                            ord: p
+                            left: f/pos/x + (ord * pitch)
+                            on: ord = chosen
+                            fill: either on
+                                [either f/color = 0 [widget-colour 'accent] [f/color]]
+                                [widget-colour 'wash-top]
+                            surface-draw-rect id left f/pos/y cell f/size/y fill
+                            ; The selected tab's caption reads against the
+                            ; accent, the rest against the wash, which is the
+                            ; only thing distinguishing them once the strip
+                            ; is drawn.
+                            ink2: either on [widget-colour 'panel] [widget-colour 'muted]
+                            cap: page-caption id ord
+                            surface-text-centred id :cap
+                                (left + (cell / 2)) (f/pos/y + (f/size/y / 2) - 7)
+                                12 ink2
+                        ]
+                    ]
+                    ; An envelope preview: a small plot of one envelope, and
+                    ; the control that picks which envelope the shared editor
+                    ; is editing. Its four stages are read back out of the
+                    ; model every frame like any other bound face.
+                    if f/kind = fk-env-preview [
+                        pctx: view-context-of id
+                        if not none? pctx [
+                            shown-here: make [#mutable envelope-shape!]
+                                env-stages id slot
+                            plot: rect-of
+                                (as f64! (f/pos/x + 6)) (as f64! (f/pos/y + 6))
+                                (as f64! (f/size/x - 12)) (as f64! (f/size/y - 12))
+                            ink3: either f/color = 0 [widget-colour 'muted] [f/color]
+                            widget-envelope-curve :pctx (addr-of shown-here)
+                                plot 1.0 ink3 2.0
+                            if (length? f/label) > 0 [
+                                caption2: f/label
+                                surface-text-centred id :caption2
+                                    (f/pos/x + (f/size/x / 2))
+                                    (f/pos/y + f/size/y + 6) 11 (widget-colour 'ink)
+                            ]
+                        ]
+                    ]
+                    ; The shared editor: one large plot with a knob per stage,
+                    ; showing whichever preview is selected.
+                    if f/kind = fk-env-editor [
+                        ectx: view-context-of id
+                        ; Not `pick`: that is the series accessor, and a
+                        ; local of that name lowers the reads around it into
+                        ; map-picks (P1704) rather than being rejected.
+                        showing: selected-envelope-face id slot
+                        if all [not none? ectx showing >= 0] [
+                            estyle: make [#mutable knob-style!] knob-style-default
+                            if fsty = ks-mach [estyle: knob-style-mach]
+                            if fsty = ks-loos [estyle: knob-style-loos]
+                            if fsty = ks-kapralova [estyle: knob-style-kapralova]
+                            if fsty = ks-kapralova-choice [estyle: knob-style-kapralova-choice]
+                            eshape: make [#mutable envelope-shape!] env-stages id showing
+                            ; The title is the selected preview's caption, so
+                            ; the panel says which envelope it is editing
+                            ; without the block repeating the name.
+                            pidx: view-face-index id showing
+                            etitle: make string! faces/items/(pidx)/label
+                            widget-envelope-editor :ectx (addr-of estyle)
+                                (addr-of eshape)
+                                (rect-of (as f64! f/pos/x) (as f64! f/pos/y)
+                                         (as f64! f/size/x) (as f64! f/size/y))
+                                :etitle 1.0
+                        ]
+                    ]
+                    if f/kind = fk-slider [
+                        surface-draw-rect id f/pos/x f/pos/y f/size/x f/size/y (80.80.80.255)
+                        knob-x: f/pos/x + (as i32! (f/data * as f64! f/size/x))
+                        surface-draw-rect id knob-x f/pos/y 8 f/size/y (220.220.60.255)
+                    ]
+                    if f/kind = fk-field [
+                        box-color: make [#mutable u32!] (60.60.60.255)
+                        if i = focused [box-color: 90.90.60.255]
+                        surface-draw-rect id f/pos/x f/pos/y f/size/x f/size/y box-color
+                        surface-draw-text id f/text f/pos/x f/pos/y 16 white
+                    ]
+                    if f/kind = fk-fader [
+                        fctx: view-context-of id
+                        if not none? fctx [
+                            fader-style: make [#mutable fader-style!]
+                                fader-style-default
+                            if fsty = ks-loos [fader-style: fader-style-loos]
+                            fader-caption: f/label
+                            fader-readout: make [#mutable string!] ""
+                            if all [f/on-format <> no-actor fpar >= 0] [
+                                fader-readout: dispatch-format f/on-format
+                                    (as u32! fpar) f/data
+                            ]
+                            widget-fader :fctx (addr-of fader-style)
+                                (face-rect f) f/data :fader-caption :fader-readout
+                        ]
+                    ]
+                    if f/kind = fk-knob [
+                        ; Drawn by gui/widget, not here. There are already four
+                        ; hand-written knobs in this tree; this must not be a
+                        ; fifth. A knob needs the path contract, which only a
+                        ; child surface has, so a window view draws none.
+                        kctx: view-context-of id
+                        if not none? kctx [
+                            kstyle: make [#mutable knob-style!] knob-style-default
+                            if fsty = ks-mach [kstyle: knob-style-mach]
+                            if fsty = ks-loos [kstyle: knob-style-loos]
+                            if fsty = ks-kapralova [kstyle: knob-style-kapralova]
+                            if fsty = ks-kapralova-choice [kstyle: knob-style-kapralova-choice]
+                            centre: knob-centre f
+                            r: knob-radius f
+                            widget-knob :kctx (addr-of kstyle) centre r f/data
+                            ; The caption is the face's label and the readout is
+                            ; whatever on-format returns, drawn here rather than
+                            ; by the caller: a knob whose two lines are placed
+                            ; at the call site is a knob that sits differently
+                            ; in every panel that uses it.
+                            ; Where the two lines sit comes from the style,
+                            ; not from constants here: a 22-pixel knob in a
+                            ; six-wide grid prints its value INSIDE the body
+                            ; (a negative readout drop) and wraps its name
+                            ; beneath, while a 52-pixel one with a row to
+                            ; itself puts both below on one line each.
+                            base-y: centre/y + r
+                            kenv: facet-or id slot fc-envelope -1
+                            ; A knob that carries an envelope prints neither
+                            ; its name nor its value. Its label still names
+                            ; the envelope -- the shared editor titles itself
+                            ; from it -- but on the panel the knob is the
+                            ; small amount control beside the level it scales,
+                            ; and repeating that level's caption under it
+                            ; would label the pair twice and say nothing.
+                            if all [(length? f/label) > 0 kenv < 0] [
+                                caption: f/label
+                                widget-text-wrapped :kctx :caption
+                                    (as i32! centre/x)
+                                    (as i32! (base-y + kstyle/caption-drop))
+                                    (as i32! kstyle/caption-wrap)
+                                    kstyle/caption-size kstyle/caption
+                            ]
+                            ; A knob that carries an envelope draws that
+                            ; envelope inside its own body, which is what makes
+                            ; it worth being twice the size of a level knob:
+                            ; the control that scales an envelope shows the
+                            ; envelope it scales. The curve is clipped to an
+                            ; inset box so it never reaches the arc, its
+                            ; amplitude follows the DEPTH the knob is turned to
+                            ; -- zero depth draws no curve at all, which is the
+                            ; honest picture of an envelope that does nothing
+                            ; -- and a negative depth hangs it below the
+                            ; baseline instead of above.
+                            if all [kenv >= 0 f/on-default <> no-actor] [
+                                kshape: make [#mutable envelope-shape!]
+                                    env-stages id slot
+                                ; Depth as a signed fraction of its own travel,
+                                ; measured from the parameter's DEFAULT rather
+                                ; than from the middle of its range: a bipolar
+                                ; depth defaulting to zero reads -1..1, and a
+                                ; unipolar one defaulting to zero reads 0..1,
+                                ; without the dialect having to be told which
+                                ; kind it was handed.
+                                kzero: dispatch-default f/on-default (as u32! fpar)
+                                kspan: either f/data >= kzero
+                                    [1.0 - kzero] [kzero]
+                                kamt: either kspan > 0.0
+                                    [(f/data - kzero) / kspan] [0.0]
+                                kmag: either kamt < 0.0 [0.0 - kamt] [kamt]
+                                ; The aperture: inside the arc on both axes.
+                                khalf-w: (as f64! r) * 0.62
+                                khalf-h: (as f64! r) * 0.55
+                                ; The baseline slides half as fast as the
+                                ; depth, so a fully positive envelope sits low
+                                ; in the aperture and a fully negative one
+                                ; sits high, leaving room for the curve.
+                                kbase: (as f64! centre/y)
+                                    + (khalf-h * kamt * 0.5)
+                                kamp: khalf-h * kmag
+                                if kamp > 0.0 [
+                                    ; A negative depth mirrors around the
+                                    ; baseline. Passing the far edge as the
+                                    ; origin and a negative height does that
+                                    ; without a transform: the geometry puts
+                                    ; the peak at the origin edge and the
+                                    ; envelope's own baseline at the far one.
+                                    ktop: either kamt < 0.0
+                                        [kbase + kamp] [kbase - kamp]
+                                    kh: either kamt < 0.0 [0.0 - kamp] [kamp]
+                                    widget-envelope-curve :kctx
+                                        (addr-of kshape)
+                                        (rect-of
+                                            ((as f64! centre/x) - khalf-w)
+                                            ktop (khalf-w * 2.0) kh)
+                                        1.0 kstyle/accent 1.5
+                                ]
+                                ; The baseline is drawn whatever the depth, and
+                                ; that is the whole of what a knob at zero
+                                ; shows. It was inside the amplitude guard, so
+                                ; a knob sitting at its default drew nothing at
+                                ; all and read as a control with no envelope
+                                ; behind it rather than as an envelope turned
+                                ; off. The line is where the curve will grow
+                                ; from, and which side of it the curve takes is
+                                ; the sign of the depth.
+                                surface-draw-rect id
+                                    (as i32! ((as f64! centre/x) - khalf-w))
+                                    (as i32! kbase)
+                                    (as i32! (khalf-w * 2.0)) 1
+                                    kstyle/accent
+                            ]
+                            ; on-format, like on-default, is asked about a
+                            ; parameter; an unbound face has none to ask about.
+                            if all [
+                                f/on-format <> no-actor
+                                fpar >= 0
+                                kenv < 0
+                            ] [
+                                shown: dispatch-format f/on-format (as u32! fpar) f/data
+                                widget-text-centred :kctx :shown
+                                    (as i32! centre/x)
+                                    (as i32! (base-y + kstyle/readout-drop))
+                                    kstyle/readout-size kstyle/readout
+                            ]
+                        ]
+                    ]
+                    ; A canvas with no on-draw renders nothing.
+                ]
+            ]
+
+            ; --- Events. Click dispatch is uniform across all kinds: any face
+            ; carrying an on-click responds, whether it draws itself or not (a
+            ; drawn face is no longer deaf). Hidden faces still hit-test, preserving
+            ; the legacy invisible-hit-region behavior.
+            if all [pressed hit? f mpos] [
+                if f/on-click <> no-actor [dispatch-click f/on-click]
+            ]
+
+            ; A click in the tab strip selects a page. The strip owns the
+            ; selection rather than the pages, so panel-open? has one place
+            ; to ask and the draw pass and the hit-test pass cannot end up
+            ; with different ideas of which page is up.
+            if f/kind = fk-tabs [
+                ; A plain hit? like every other kind: the face's rectangle is
+                ; the whole strip, so it covers exactly what it draws.
+                if all [pressed hit? f mpos] [
+                    landed: tab-strip-ordinal id f mpos/x
+                    if landed >= 0 [
+                        faces/items/:i/data: as f64! landed
+                        if f/on-change <> no-actor [
+                            dispatch-data f/on-change (as f64! landed)
+                        ]
+                    ]
+                ]
+            ]
+
+            ; A click on an envelope-carrying face points every env-editor in
+            ; the view at it. The editor holds the selection, so the face needs
+            ; to know nothing about which editor is showing it -- and because
+            ; the test is `envelope`, not the kind, a knob that scales an
+            ; envelope selects it exactly as a preview of it does. A knob also
+            ; goes on to start its own drag: reaching for the depth and getting
+            ; the envelope it belongs to is the point, not a collision.
+            senv: facet-or id slot fc-envelope -1
+            if senv >= 0 [
+                if all [pressed hit? f mpos] [
+                    seats: view-count id
+                    repeat other seats [
+                        oidx: view-face-index id other
+                        if (make i32! faces/items/(oidx)/kind) = fk-env-editor [
+                            faces/items/(oidx)/data: as f64! slot
+                        ]
+                    ]
+                    if f/on-change <> no-actor [
+                        dispatch-data f/on-change (as f64! slot)
+                    ]
+                ]
+            ]
+
+            ; The envelope editor's four stage knobs. One face driving four
+            ; parameters, so the gesture remembers which knob as well as
+            ; which face -- but the phases and the arithmetic are the knob's,
+            ; deliberately: an envelope stage that dragged differently from
+            ; every other control would be a surprise, not a feature.
+            if f/kind = fk-env-editor [
+                lit: selected-envelope-face id slot
+                if lit >= 0 [
+                    lidx: view-face-index id lit
+                    lf: make face! faces/items/(lidx)
+                    ebase: facet-or id lit fc-envelope -1
+                    ebound: all [lf/on-edit <> no-actor ebase >= 0]
+                    epanel2: rect-of (as f64! f/pos/x) (as f64! f/pos/y)
+                        (as f64! f/size/x) (as f64! f/size/y)
+                    if pressed [
+                        grabbed: widget-envelope-editor-hit
+                            (fxy (as f64! mpos/x) (as f64! mpos/y)) epanel2
+                        if grabbed >= 0 [
+                            stage-now: dispatch-value lf/on-value
+                                (as u32! (ebase + grabbed))
+                            views/items/(id)/drag-face: slot
+                            views/items/(id)/drag-stage: grabbed
+                            views/items/(id)/drag-y: mpos/y
+                            views/items/(id)/drag-value: stage-now
+                            if ebound [
+                                dispatch-edit lf/on-edit
+                                    (as u32! (ebase + grabbed)) stage-now ph-begin
+                            ]
+                        ]
+                    ]
+                    eheld: make i32! views/items/(id)/drag-face
+                    estage: make i32! views/items/(id)/drag-stage
+                    if all [down eheld = slot estage >= 0] [
+                        eorigin-y: make i32! views/items/(id)/drag-y
+                        eorigin-v: make f64! views/items/(id)/drag-value
+                        etravel: either shift
+                            [parameter-travel * parameter-fine] [parameter-travel]
+                        emoved: (as f64! (eorigin-y - mpos/y)) / etravel
+                        eturned: make [#mutable f64!] (eorigin-v + emoved)
+                        if eturned < 0.0 [eturned: 0.0]
+                        if eturned > 1.0 [eturned: 1.0]
+                        if ebound [
+                            dispatch-edit lf/on-edit
+                                (as u32! (ebase + estage)) eturned ph-change
+                        ]
+                    ]
+                    if all [released eheld = slot estage >= 0] [
+                        efinal: dispatch-value lf/on-value (as u32! (ebase + estage))
+                        if ebound [
+                            dispatch-edit lf/on-edit
+                                (as u32! (ebase + estage)) efinal ph-end
+                        ]
+                    ]
+                ]
+            ]
+
+            ; Slider drag updates value and fires on-change.
+            if f/kind = fk-slider [
+                if all [down hit? f mpos] [
+                    raw: (as f64! (mpos/x - f/pos/x)) / (as f64! f/size/x)
+                    ; Drag is the only clamping site: a dragged slider cannot leave
+                    ; 0.0..1.0. set-face-data stays unclamped so a custom-drawn face
+                    ; can carry application-encoded state in the same facet, which
+                    ; is what Rebol/Red's polymorphic `data` allows.
+                    clamped: make [#mutable f64!] raw
+                    if clamped < 0.0 [clamped: 0.0]
+                    if clamped > 1.0 [clamped: 1.0]
+                    faces/items/:i/data: clamped
+                    if f/on-change <> no-actor [dispatch-data f/on-change clamped]
+                ]
+            ]
+
+            ; Knobs and faders share one relative vertical gesture. Only their
+            ; hit geometry differs: the knob is round, the fader's whole face
+            ; is grabbable. Contact never maps position to value, so neither
+            ; jumps under the pointer.
+            if any [f/kind = fk-knob f/kind = fk-fader] [
+                pointer: fxy (as f64! mpos/x) (as f64! mpos/y)
+                control-hit: either f/kind = fk-knob [
+                    widget-knob-hit? pointer (knob-centre f) (knob-radius f)
+                ] [
+                    widget-fader-hit? pointer (face-rect f)
+                ]
+                if all [pressed control-hit] [
+                    parameter-control-press id slot i f mpos/y dbl
+                ]
+                parameter-control-drag id slot i f mpos/y down released shift
+            ]
+
+            ; Field focus + text input.
+            if f/kind = fk-field [
+                if all [pressed hit? f mpos] [focused: i]
+                if all [i = focused] [
+                    ch: surface-char-pressed id
+                    if ch <> 0 [
+                        faces/items/:i/text: rejoin [f/text as char! ch]
+                        if f/on-change <> no-actor [dispatch-text f/on-change faces/items/:i/text]
+                    ]
+                    if surface-key-pressed? id gui-key-backspace [
+                        if (length? f/text) > 0 [
+                            faces/items/:i/text: truncate-last f/text
+                            if f/on-change <> no-actor [dispatch-text f/on-change faces/items/:i/text]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+    ]
+
+    if not down [
+        views/items/(id)/drag-face: -1
+        views/items/(id)/drag-stage: -1
+    ]
+
+    ; Native widgets: drain queued events (updates faces + dispatches actors),
+    ; then reconcile the widgets against the filtered face state. No-op when the
+    ; view opts out or the backend advertises no support. Context views never
+    ; take this path -- the child-surface API has no native-widget entry points,
+    ; and a plug-in editor must draw into its own surface rather than hand the
+    ; host's window a set of OS controls.
+    if all [native-mode <> 0 none? (view-context-of id)] [
+        drain-native-events
+        reconcile-native
+    ]
+    surface-end-frame id
+    return none
+]
+
+; The standalone window is view 0.
+frame: func [
+    "Per-frame draw + hit-test callback for the standalone window view."
+    return: [none!]
+] [
+    current-view: 0
+    render-view 0
+    return none
+]
+
+frame-cb: callback frame [return: [none!]]
+
+; A context view's frame callback is handed the token allocated by
+; view-context-attach, not the caller's own state: the backend gives one
+; pointer back and it has to identify which view is being drawn. The caller's
+; state is reached through view-user, so one actor registration can serve
+; several instances.
+view-token!: make c-struct! [
+    id: [i32!]
+]
+
+frame-context: func [
+    "Per-frame draw + hit-test callback for a context view."
+    :token [c-pointer!] "Borrowed view token allocated at attach."
+    return: [none!]
+] [
+    if none? token [return none]
+    t: make view-token! as view-token! token
+    current-view: t/id
+    render-view t/id
+    return none
+]
+
+; Empties one view's face region. Called at the top of a build so repeated
+; attach/detach cycles (CLAP host open/close) don't stack duplicate faces on
+; top of the previous view's. A region is fixed-width and addressed by offset,
+; so emptying it is a counter reset -- nothing is removed, and the old body's
+; shrinking-array hazard is gone with it.
+reset-view-faces: func [
+    "Empty one view's face and facet regions."
+    id [i32!] "View id."
+    return: [none!]
+] [
+    views/items/(id)/count: 0
+    views/items/(id)/facet-count: 0
+    focused: -1
+    return none
+]
+
+view-parse-body: func [
+    {Parse one spec block into the current view's face region. Called on the
+     whole spec, and again on each `panel` body -- Recoil's PARSE has no
+     `into`, but a nested block can be captured as a value cell and re-parsed,
+     which is the same thing done explicitly.}
+    spec [block!] "The spec block, or one panel's body."
+    origin [pair!] "Where this level's coordinates start, absolute."
+    parent [i32!] "Region-relative slot of the enclosing panel, or -1."
+    return: [i32!] "Always 0; the caller uses it in a paren-action assignment."
+] [
+    cursor: make [#mutable pair!] make pair! [
+        x: (origin/x + vid-default-gap/x) y: (origin/y + vid-default-gap/y)
+    ]
+    guide: make [#mutable pair!] cursor
+    direction: make [#mutable i32!] 0
+    line-extent: make [#mutable i32!] 0
+    ; Grid placement. A grid states a column count and a cell pitch once and
+    ; hands each following face the next cell CENTRE, which is what a knob
+    ; wants: the tables real editors keep are centres, and a grid of boxes
+    ; would leave every row to be halved by hand again.
+    grid-on: make [#mutable i32!] 0
+    grid-cols: make [#mutable i32!] 1
+    grid-pitch: make [#mutable pair!] 0x0
+    grid-origin: make [#mutable pair!] origin
+    grid-cell: make [#mutable i32!] 0
+    fkind: make [#mutable i32!] fk-button
+    flabel: make [#mutable string!] ""
+    fsize: make [#mutable pair!] 0x0
+    fcolor: make [#mutable u32!] 0
+    fhidden: make [#mutable i32!] 0
+    fon-click: make [#mutable word!] no-actor
+    fon-change: make [#mutable word!] no-actor
+    fon-draw: make [#mutable word!] no-actor
+    fstyle: make [#mutable i32!] ks-default
+    fradius: make [#mutable i32!] 0
+    fcentre: make [#mutable pair!] 0x0
+    fcentred: make [#mutable i32!] 0
+    fparam: make [#mutable i32!] -1
+    fdepth: make [#mutable i32!] -1
+    fenvelope: make [#mutable i32!] -1
+    fon-edit: make [#mutable word!] no-actor
+    fon-default: make [#mutable word!] no-actor
+    fon-value: make [#mutable word!] no-actor
+    fon-format: make [#mutable word!] no-actor
+    fname: make [#mutable word!] no-actor
+    ffont: make [#mutable i32!] 0
+    fcolor2: make [#mutable u32!] 0
+    pcolor: make [#mutable u32!] 0
+    pcolor2: make [#mutable u32!] 0
+    phidden: make [#mutable i32!] 0
+    pdraw: make [#mutable word!] no-actor
+    pbody: make [#mutable i32!] 0
+    fspot: make [#mutable pair!] 0x0
+    atpair: make [#mutable pair!] 0x0
+    panelpair: make [#mutable pair!] 0x0
+    panelspot: make [#mutable pair!] 0x0
+    fplaced: make [#mutable i32!] 0
+    ; What a face costs the flow cursor, which is NOT always its size. A knob
+    ; prints its caption and its readout below its body, and a text face has no
+    ; size at all until a backend measures it. Both are counted here and
+    ; nowhere else: the face keeps the size it renders and hit-tests with, so
+    ; adding this moves nothing in a layout that places its own faces.
+    fadvance: make [#mutable pair!] 0x0
+    fband: make [#mutable i32!] 0
+    fring: make [#mutable i32!] 0
+    fbelow: make [#mutable i32!] 0
+    fstyle-probe: make [#mutable knob-style!] knob-style-default
+    dummy: make [#mutable i32!] 0
+
+    ok: parse spec [
+        any [
+            'across (direction: 1)
+            | 'below (direction: 0)
+            | 'return
+              (cursor: either direction = 1
+                  [make pair! [x: guide/x y: (guide/y + line-extent + vid-default-gap/y)]]
+                  [make pair! [x: (guide/x + line-extent + vid-default-gap/x) y: guide/y]])
+              (guide: cursor)
+              (line-extent: 0)
+              (grid-on: 0)
+            | 'at set poscap pair!
+              ; Bound to a typed local before it is indexed: `(as pair! X)/x`
+              ; on a parse `set` target drops the cast and emits a raw
+              ; `X.x`, which does not compile because X is a value cell.
+              (atpair: as pair! poscap)
+              (cursor: make pair! [
+                  x: (origin/x + atpair/x)
+                  y: (origin/y + atpair/y)
+              ])
+              (guide: cursor)
+              (line-extent: 0)
+              (grid-on: 0)
+            ; A grid starts wherever the cursor is, so `at 110x190 grid 4 180x225`
+            ; reads as "twelve cells from here". A later `at` ends it.
+            | 'grid set colscap i32! set pitchcap pair!
+              (grid-cols: either (as i32! colscap) < 1 [1] [as i32! colscap])
+              (grid-pitch: as pair! pitchcap)
+              (grid-origin: cursor)
+              (grid-cell: 0)
+              (grid-on: 1)
+            ; A page is a panel that the tab strip opens and closes. It takes
+            ; no geometry of its own: every page of a tabbed editor occupies
+            ; the same area, and a page that wants a background declares a
+            ; panel inside itself like anything else. Its caption is the tab's.
+            | 'page set pagecap string! set pagebody block!
+              (current-parent: parent)
+              (dummy: push-face fk-panel no-actor origin 0x0
+                  (as string! pagecap) 0 0
+                  no-actor no-actor no-actor)
+              (dummy: bind-face no-actor no-actor no-actor no-actor)
+              (dummy: attach-facets -1 -1 -1 page-ordinal 0 0 0)
+              (page-ordinal: page-ordinal + 1)
+              (dummy: view-parse-body (as block! pagebody) origin last-face-slot)
+              (current-parent: parent)
+            ; A panel is a face and a scope: it holds its own background and
+            ; its body's coordinates start at its corner, and hiding it takes
+            ; the whole group with it.
+            | 'panel set panelpos pair! set panelsize pair!
+              (pcolor: 0)
+              (pcolor2: 0)
+              (phidden: 0)
+              (pdraw: no-actor)
+              (pbody: 0)
+              any [
+                  'colour set pcap word! (pcolor: widget-colour (as word! pcap))
+                  | 'gradient set gcap1 word! set gcap2 word!
+                    (pcolor: widget-colour (as word! gcap1))
+                    (pcolor2: widget-colour (as word! gcap2))
+                  | 'hidden (phidden: 1)
+                  | 'on-draw set pdcap word! (pdraw: as word! pdcap)
+              ]
+              opt [set panelbody block! (pbody: 1)]
+              (current-parent: parent)
+              (panelpair: as pair! panelpos)
+              (panelspot: make pair! [
+                  x: (origin/x + panelpair/x)
+                  y: (origin/y + panelpair/y)
+              ])
+              (dummy: push-face fk-panel no-actor panelspot
+                  (as pair! panelsize) "" pcolor phidden
+                  no-actor no-actor pdraw)
+              (dummy: bind-face no-actor no-actor no-actor no-actor)
+              (dummy: attach-facets -1 -1 -1 -1 0 0 pcolor2)
+              ; A panel with no body is a bare rectangle -- a section rule, a
+              ; divider, a wash. Requiring an empty block for those would put
+              ; `[]` on every one of them.
+              (dummy: either pbody = 1
+                  [view-parse-body (as block! panelbody) panelspot last-face-slot]
+                  [0])
+              (current-parent: parent)
+            | 'custom (native-mode: 0)
+            | 'native (native-mode: 1)
+            | (fkind: fk-button)
+              (flabel: "")
+              (fsize: 0x0)
+              (fcolor: 0)
+              (fcolor2: 0)
+              (ffont: 0)
+              (fhidden: 0)
+              (fon-click: no-actor)
+              (fon-change: no-actor)
+              (fon-draw: no-actor)
+              (fstyle: ks-default)
+              (fradius: 0)
+              (fcentre: 0x0)
+              (fcentred: 0)
+              (fparam: -1)
+              (fdepth: -1)
+              (fenvelope: -1)
+              (fon-edit: no-actor)
+              (fon-default: no-actor)
+              (fon-value: no-actor)
+              (fon-format: no-actor)
+              (fname: no-actor)
+              opt [set namecap set-word! (fname: as word! (as set-word! namecap))]
+              [
+                  'button (fkind: fk-button)
+                  | 'text (fkind: fk-text)
+                  | 'slider (fkind: fk-slider)
+                  | 'field (fkind: fk-field)
+                  | 'canvas (fkind: fk-canvas)
+                  | 'knob (fkind: fk-knob)
+                  | 'fader (fkind: fk-fader)
+                  | 'tabs (fkind: fk-tabs)
+                  | 'env-preview (fkind: fk-env-preview)
+                  | 'env-editor (fkind: fk-env-editor)
+              ]
+              any [
+                  set labelcap string! (flabel: as string! labelcap)
+                  | set sizecap pair! (fsize: as pair! sizecap)
+                  | 'hidden (fhidden: 1)
+                  | 'on-click set clickcap word! (fon-click: as word! clickcap)
+                  | 'on-change set changecap word! (fon-change: as word! changecap)
+                  | 'on-draw set drawcap word! (fon-draw: as word! drawcap)
+                  | 'style set stylecap word!
+                    (fstyle: either (as word! stylecap) = 'mach [ks-mach]
+                        [either (as word! stylecap) = 'loos [ks-loos]
+                            [either (as word! stylecap) = 'kapralova [ks-kapralova]
+                                [either (as word! stylecap) = 'kapralova-choice
+                                    [ks-kapralova-choice] [ks-default]]]])
+                  | 'colour set colourcap word! (fcolor: widget-colour (as word! colourcap))
+                  | 'font set fontcap i32! (ffont: as i32! fontcap)
+                  | 'radius set radiuscap i32! (fradius: as i32! radiuscap)
+                  | 'centre set centrecap pair! (fcentre: as pair! centrecap)
+                    (fcentred: 1)
+                  | 'param set paramcap i32! (fparam: as i32! paramcap)
+                  | 'depth set depthcap i32! (fdepth: as i32! depthcap)
+                  | 'envelope set envcap i32! (fenvelope: as i32! envcap)
+                  | 'on-edit set editcap word! (fon-edit: as word! editcap)
+                  | 'on-default set defaultcap word! (fon-default: as word! defaultcap)
+                  | 'on-value set valuecap word! (fon-value: as word! valuecap)
+                  | 'on-format set formatcap word! (fon-format: as word! formatcap)
+              ]
+              ; An envelope preview selects the stages it draws, so the
+              ; block never writes `envelope` beside a preview's `param`: the
+              ; two would be the same number, and a second place to write a
+              ; number is a second place to get it wrong.
+              (fenvelope: either all [fkind = fk-env-preview fenvelope < 0]
+                  [fparam] [fenvelope])
+              (fsize: resolve-native-size fkind fsize flabel)
+              ; A knob is round: `radius 50` says so once instead of leaving a
+              ; reader to halve a 100x100 box and hope it was square.
+              (fsize: either fradius > 0
+                  [make pair! [x: (fradius * 2) y: (fradius * 2)]]
+                  [fsize])
+              ; Three ways to be placed, in falling priority: on a stated
+              ; point, in the next grid cell, or at the flow cursor.
+              (fcentre: either fcentred = 1
+                  [make pair! [x: (origin/x + fcentre/x) y: (origin/y + fcentre/y)]]
+                  [make pair! [
+                      x: (grid-origin/x + ((grid-cell % grid-cols) * grid-pitch/x))
+                      y: (grid-origin/y + ((grid-cell / grid-cols) * grid-pitch/y))
+                  ]])
+              (fplaced: either fcentred = 1 [1] [grid-on])
+              ; A knob that draws a caption pays for the band it draws it in.
+              ; One that carries an envelope draws neither line, and pays for
+              ; neither.
+              (fband: 0)
+              (fring: 0)
+              (if fkind = fk-knob [
+                  fstyle-probe: either fstyle = ks-mach [knob-style-mach]
+                      [either fstyle = ks-loos [knob-style-loos]
+                          [either fstyle = ks-kapralova [knob-style-kapralova]
+                              [either fstyle = ks-kapralova-choice
+                                  [knob-style-kapralova-choice] [knob-style-default]]]]
+                  fring: widget-knob-ring-overspill (addr-of fstyle-probe)
+                  fband: widget-knob-label-band (addr-of fstyle-probe)
+              ])
+              ; A knob carrying an envelope draws neither its name nor its
+              ; value, and one with no label draws no name; neither reserves
+              ; the band. Written as two more conditions at this level rather
+              ; than as an `if` inside the one above: an assignment nested two
+              ; `if`s deep inside a parse paren does not take effect, which
+              ; cost an afternoon to find and is worth not stepping on twice.
+              (if fenvelope >= 0 [fband: make i32! 0])
+              (if (length? flabel) = 0 [fband: make i32! 0])
+              (fbelow: either fband > fring [fband] [fring])
+              ; A face placed by hand is placed exactly where it was asked
+              ; for. One placed by flow is offset by its ring, so `at` and the
+              ; cursor address the box a knob PAINTS rather than the body box
+              ; inside it -- an author who had to leave room for the ring by
+              ; hand would be doing the arithmetic this dialect exists to do.
+              (fspot: either fplaced = 1
+                  [make pair! [x: (fcentre/x - (fsize/x / 2)) y: (fcentre/y - (fsize/y / 2))]]
+                  [make pair! [x: (cursor/x + fring) y: (cursor/y + fring)]])
+              (grid-cell: either all [fcentred = 0 grid-on = 1] [grid-cell + 1] [grid-cell])
+              (current-parent: parent)
+              (dummy: push-face fkind fname fspot fsize flabel fcolor fhidden fon-click fon-change fon-draw)
+              (dummy: bind-face fon-edit fon-default fon-value fon-format)
+              (dummy: attach-facets fparam fdepth fenvelope -1 fstyle ffont fcolor2)
+              ; A face that named its own position, whether by `centre` or by
+              ; sitting in a grid cell, neither reads the flow cursor nor
+              ; advances it. Mixing the two would make a row's spacing depend
+              ; on how many absolutely-placed faces happened to precede it.
+              ; A text face is sized by whatever draws it, which in a context
+              ; view is nothing until render time -- so it would advance the
+              ; cursor by nought and every line of a stacked caption would land
+              ; on the one before it. Its font is the height it will occupy.
+              (fadvance: either all [fkind = fk-text fsize/x = 0 fsize/y = 0]
+                  [make pair! [
+                      x: ((length? flabel) * (either ffont > 0 [ffont] [14]) * 3 / 5)
+                      y: ((either ffont > 0 [ffont] [14]) + 4)
+                  ]]
+                  [make pair! [x: (fsize/x + fring + fring) y: (fsize/y + fring + fbelow)]])
+              (line-extent: either fplaced = 1 [line-extent]
+                  [either direction = 1
+                      [either fadvance/y > line-extent [fadvance/y] [line-extent]]
+                      [either fadvance/x > line-extent [fadvance/x] [line-extent]]])
+              (cursor: either fplaced = 1 [cursor]
+                  [either direction = 1
+                      [make pair! [x: (cursor/x + fadvance/x + vid-default-gap/x) y: cursor/y]]
+                      [make pair! [x: cursor/x y: (cursor/y + fadvance/y + vid-default-gap/y)]]])
+        ]
+    ]
+    if not ok [vid-fatal "malformed view spec"]
+    return 0
+]
+
+view-parse: func [
+    "Parse a VID spec block into the current view's face region."
+    spec [block!] {The view spec, e.g. [at 8x8 across button "OK" 80x24 vol: slider 200x20 return field 200x24]. Flow defaults to `below`; `across`/`below` persistently select a direction, `return` starts the next row/column, and `at` resets the cursor and return guide without changing direction. A leading set-word names a face for face-data/set-face-data/face-text. `param <i32!>` binds a knob or fader to a host parameter and, with `on-edit`, makes it report a shared relative begin/change/end gesture; `on-default` names the query answering what a double-click restores, `on-value` the query the face reads its value from each frame, and `on-format` the one rendering its readout. `fader <label> <size>` is a custom rectangular control whose whole face grabs; `radius <i32!>` sizes a round control. `style loos` selects the drafting treatment separately from `style mach` and the default. `centre <pair!>` places a face on a point and `grid <cols> <pitch>` hands each following face the next cell centre, neither of which reads or advances the flow cursor. `panel <pos> <size> [ ... ]` is a face and a scope: its body's coordinates start at its corner, and hiding it takes the group with it. `hidden` suppresses built-in rendering while preserving hit-testing. `custom` opts the view out of native widgets (the portable backend-identical look); native is the default on capable backends.}
+    return: [none!]
+] [
+    reset-view-faces current-view
+    ctx-view: make i32! views/items/(current-view)/is-context
+    native-mode: either ctx-view = 1 [0] [1]
+    native-supported-button: either all [native-mode = 1 gui-native-supported? 0] [1] [0]
+    native-supported-slider: either all [native-mode = 1 gui-native-supported? 1] [1] [0]
+    native-supported-field: either all [native-mode = 1 gui-native-supported? 2] [1] [0]
+    current-parent: -1
+    page-ordinal: 0
+    dummy: view-parse-body spec 0x0 -1
+    unused dummy
+    return none
+]
+
+; The standalone window always occupies view 0: there is one window per
+; process, so pinning it to a fixed id lets the legacy entry points and the
+; query API agree on which faces they mean without threading an id through.
+view-claim-window: func [
+    "Make view 0 current and ready to build."
+    return: [none!]
+] [
+    views/items/(0)/used: 1
+    views/items/(0)/is-context: 0
+    views/items/(0)/context: none
+    views/items/(0)/failed: 0
+    current-view: 0
+    return none
+]
+
+view-build: func [
+    "Parse a VID spec block and (re)build the standalone window's faces."
+    spec [#quoted block!] "The view spec -- see view-parse for the dialect."
+    return: [none!]
+] [
+    view-claim-window
+    view-parse spec
+    return none
+]
+
+view: func [
+    "Parse a VID spec, open a standalone window, and run the render loop until closed."
+    spec [#quoted block!] "The view spec -- see view-parse for the dialect."
+    return: [none!]
+] [
+    view-build spec
+    current-frame-actor: no-actor
+    opened: gui-open-window 640 480 "VID"
+    if not opened [vid-fatal "view: window failed to open"]
+    gui-set-target-fps 60
+    gui-run-loop frame-cb
+    gui-close-window
+    return none
+]
+
+view-window: func [
+    "Parse a VID spec, open a standalone window with pair! size, and run the render loop until closed."
+    spec [#quoted block!] "The view spec -- see view-build for the dialect."
+    :title [string!] "Borrowed window title."
+    size [pair!] "Window size in pixels."
+    fps [i32!] "Target frames per second."
+    on-frame-name [word!] "Per-frame actor name, or no-actor."
+    return: [none!]
+] [
+    view-build spec
+    current-frame-actor: on-frame-name
+    opened: gui-open-window size/x size/y :title
+    if not opened [vid-fatal "view-window: window failed to open"]
+    gui-set-target-fps fps
+    gui-run-loop frame-cb
+    gui-close-window
+    current-frame-actor: no-actor
+    return none
+]
+
+view-attach: func [
+    "Parse a VID spec and embed it as a child view in a host-owned parent. The host must drive redraws by calling gui-tick (e.g. from a timer). Uses the process-wide window surface; for a plug-in editor, which may be instantiated more than once, use view-context-attach instead."
+    spec [#quoted block!] "The view spec -- see view-parse for the dialect."
+    parent [c-pointer!] "Host-owned native parent view/window handle."
+    w [i32!] "Child view width in pixels."
+    h [i32!] "Child view height in pixels."
+    return: [logic!] "True on success, false if embedding failed."
+] [
+    view-build spec
+    current-frame-actor: no-actor
+    gui-set-frame frame-cb
+    return gui-attach parent w h
+]
+
+; --- context views ------------------------------------------------------------
+; What a plug-in editor attaches through. Unlike view-attach this claims its own
+; view from the pool and its own child surface, so two instances of the same
+; plug-in in one host own separate faces instead of overwriting each other's.
+
+view-context-attach: func [
+    "Parse a VID spec and render it into a host-owned parent as its own child surface. The host drives redraws by calling view-context-tick."
+    spec [#quoted block!] "The view spec -- see view-parse for the dialect."
+    :parent [c-pointer!] "Borrowed host-owned native parent handle."
+    w [i32!] "Child surface width in pixels."
+    h [i32!] "Child surface height in pixels."
+    :user [c-pointer!] "Borrowed caller state, handed back to this view's actors so one registration can serve several instances."
+    return: [c-pointer!] "Owned opaque context, or null if the view could not be created."
+] [
+    id: view-alloc
+    if id < 0 [
+        print "view-context-attach: view pool exhausted"
+        return as c-pointer! 0
+    ]
+    ; The backend hands one pointer back to the frame callback, and it has to
+    ; say which view is being drawn -- so the token is ours and the caller's
+    ; own state is reached separately, through view-user.
+    token: sysexit/c-calloc (as size! 1) (as size! 8)
+    if none? token [
+        view-release id
+        return as c-pointer! 0
+    ]
+    t: make [#mutable view-token!] as view-token! token
+    t/id: id
+    views/items/(id)/token: token
+    views/items/(id)/user: user
+    views/items/(id)/is-context: 1
+    current-view: id
+    ; A context view takes no on-frame actor -- the host drives redraws through
+    ; view-context-tick. Clear the global so this view cannot inherit the actor
+    ; a standalone view left behind earlier in the same process.
+    current-frame-actor: no-actor
+
+    view-parse spec
+
+    ; A field cannot receive text here: the backend's child-surface API is mouse
+    ; and drawing only. Said once, at build time, rather than leaving a control
+    ; that looks live and silently is not.
+    placed: view-count id
+    repeat slot placed [
+        i: view-face-index id slot
+        f: make face! faces/items/:i
+        if f/kind = fk-field [
+            print "view-context-attach: a field face cannot receive text in a context view (no child-surface keyboard API)"
+        ]
+    ]
+
+    ctx: gui-context-attach :parent w h :frame-context :token
+    if not none? ctx [
+        if not gui-path-supported? :ctx [
+            drawn: make [#mutable i32!] 0
+            repeat slot placed [
+                i: view-face-index id slot
+                f: make face! faces/items/:i
+                if f/on-draw <> no-actor [drawn: 1]
+            ]
+            ; Said once, here, rather than left to look like a handler bug: the
+            ; Draw dialect lowers onto the path contract, which only the pugl
+            ; backend implements. A handler drawing through the plain shape API
+            ; is unaffected, which is why the handler still runs.
+            if drawn = 1 [
+                print "view-context-attach: this backend has no path support, so on-draw handlers written in the Draw dialect will paint nothing"
+            ]
+        ]
+    ]
+    if none? ctx [
+        sysexit/c-free token
+        view-release id
+        return as c-pointer! 0
+    ]
+    views/items/(id)/context: ctx
+    return ctx
+]
+
+view-context-detach: func [
+    "Tear down a context view created with view-context-attach and release its pool slot."
+    context [c-pointer!] "Owned context returned by view-context-attach."
+    return: [none!]
+] [
+    if none? context [return none]
+    found: make [#mutable i32!] -1
+    repeat i MAX-VIEWS [
+        if found < 0 [
+            if (views/items/(i)/context) = context [found: i]
+        ]
+    ]
+    gui-context-detach context
+    if found >= 0 [
+        ; A dynamic struct-element read carries no inferred type (T4100).
+        tok: make c-pointer! views/items/(found)/token
+        if not none? tok [sysexit/c-free tok]
+        view-release found
+    ]
+    return none
+]
+
+view-select: func [
+    {Make the view that owns `context` the current one, so the query and
+     mutation API -- set-face-text, face-data, view-current-user -- talks to
+     its faces and not to some other view's.
+
+     current-view is otherwise only set while a frame is being drawn, which is
+     no use to a message that arrives from the host between frames. Two
+     instances of one plug-in in a project would write each other's captions,
+     and the symptom would be the wrong preset name in the window you were not
+     looking at.
+
+     Setting it here is safe because nothing owns it for long: the frame
+     callback re-derives it from the backend's own token on every frame.}
+    context [c-pointer!] "Live context from view-context-attach."
+    return: [logic!] "True when some view owns that context."
+] [
+    if none? context [return false]
+    found: make [#mutable i32!] -1
+    repeat i MAX-VIEWS [
+        if found < 0 [
+            if (views/items/(i)/context) = context [found: i]
+        ]
+    ]
+    if found < 0 [return false]
+    current-view: found
+    return true
+]
+
+view-context-tick: func [
+    "Render one host-driven frame of a context view."
+    :context [c-pointer!] "Borrowed live context from view-context-attach."
+    return: [none!]
+] [
+    gui-context-tick :context
+    return none
+]
+
+view-detach: func [
+    "Tear down an embedded view created with view-attach."
+    return: [none!]
+] [
+    gui-detach
+    return none
+]
+
+; --- query API (linear scan by interned identity) ---------------------------
+
+face-data: func [
+    "Read the current f64! data facet of the face registered under `name`."
+    name [word!] "Face name to query."
+    return: [f64!] "The face's current normalized value; 0.0 if not found."
+] [
+    id: make i32! current-view
+    placed: view-count id
+    repeat slot placed [
+        i: view-face-index id slot
+        f: make face! faces/items/:i
+        if f/name = name [return f/data]
+    ]
+    vid-fatal "face-data: no such face"
+    return 0.0
+]
+
+set-face-data: func [
+    "Set the f64! data facet of the face registered under `name`. Deliberately unclamped: a slider drag confines itself to 0.0..1.0, but a custom-drawn face may use the facet for application-encoded state."
+    name [word!] "Face name to update."
+    v [f64!] "New value; normalized 0.0..1.0 for slider-like faces."
+    return: [none!]
+] [
+    id: make i32! current-view
+    placed: view-count id
+    repeat slot placed [
+        i: view-face-index id slot
+        f: make face! faces/items/:i
+        if f/name = name [
+            faces/items/:i/data: v
+            return none
+        ]
+    ]
+    vid-fatal "set-face-data: no such face"
+    return none
+]
+
+view-hit-parameter: func [
+    {The host parameter a click at this point would drive, or -1. Uses the
+     same rules the render loop's event pass uses -- a knob is round, a face
+     inside a closed panel is not there -- so a layout can be interrogated
+     without a window.
+
+     This exists because a layout is arithmetic, and arithmetic is exactly
+     what a substring assertion over emitted C cannot check. Clicking the
+     centre of every control a block declares and requiring the right
+     parameter back is the one test that catches a grid pitch being wrong, a
+     panel origin not being added in, or a face store being read off by one.
+     Reads the CURRENT view, so call it after the build that made it.}
+    px [i32!] "Point x, in view pixels."
+    py [i32!] "Point y, in view pixels."
+    return: [i32!] "Parameter id of the topmost face hit, or -1."
+] [
+    id: make i32! current-view
+    placed: view-count id
+    ; Not `make pair! [x: x y: y]`: a field's initialiser is evaluated inside
+    ; the new value, so `x: x` reads the field being defined rather than the
+    ; argument. Distinct names make the trap unreachable.
+    at-point: make pair! [x: px y: py]
+    found: make [#mutable i32!] -1
+    repeat slot placed [
+        idx: view-face-index id slot
+        fv: make face! faces/items/(idx)
+        fpar: facet-or id slot fc-param -1
+        if all [fpar >= 0 panel-open? id slot] [
+            ; Later faces sit on top, so the last hit wins -- the same order
+            ; the event pass resolves overlaps in.
+            either fv/kind = fk-knob [
+                ; Bound to locals first: a struct-returning call used directly
+                ; as an argument lowers to `ir-struct-get in expression
+                ; position`, which codegen has no rule for (C5012).
+                probe-at: fxy (as f64! px) (as f64! py)
+                kc: knob-centre fv
+                kr: knob-radius fv
+                if widget-knob-hit? probe-at kc kr [found: fpar]
+            ] [
+                either fv/kind = fk-fader [
+                    probe-at: fxy (as f64! px) (as f64! py)
+                    if widget-fader-hit? probe-at (face-rect fv) [found: fpar]
+                ] [
+                    if hit? fv at-point [found: fpar]
+                ]
+            ]
+        ]
+    ]
+    return found
+]
+
+view-envelope-base: func [
+    {The first parameter id of the envelope the view's editor is showing, or
+     -1 when there is no editor or nothing open that carries an envelope.
+
+     Exists so a headless check can see which envelope the editor is pointed
+     at. Nothing could, before: the selection lookup returned the slot BEFORE
+     the preview for as long as it had existed, and the only visible
+     consequence was an editor quietly driving its neighbour's parameters.}
+    return: [i32!] "Base parameter id, or -1."
+] [
+    id: make i32! current-view
+    placed: view-count id
+    found: make [#mutable i32!] -1
+    repeat slot placed [
+        idx: view-face-index id slot
+        if all [
+            (make i32! faces/items/(idx)/kind) = fk-env-editor
+            panel-open? id slot
+        ] [
+            lit: selected-envelope-face id slot
+            if lit >= 0 [
+                found: facet-or id lit fc-envelope -1
+            ]
+        ]
+    ]
+    return found
+]
+
+view-hit-page: func [
+    {The tab ordinal at a point in the view just built, or -1 when no tab is
+     there.
+
+     The query counterpart of view-hit-parameter, and the only way a headless
+     check can prove a strip is clickable across its whole width. It could
+     not, before: a tab face's size is one tab, so every hit test against the
+     face rectangle silently covered the first tab alone, and no test in the
+     tree could see it because none could ask where a tab was.}
+    px [i32!] "Point x, window pixels."
+    py [i32!] "Point y, window pixels."
+    return: [i32!] "Tab ordinal, or -1."
+] [
+    id: make i32! current-view
+    placed: view-count id
+    ; Distinct field names: a field initialiser is evaluated inside the new
+    ; value, so `x: x` would read the field being defined, not the argument.
+    at-point: make pair! [x: px y: py]
+    found: make [#mutable i32!] -1
+    repeat slot placed [
+        idx: view-face-index id slot
+        fv: make face! faces/items/(idx)
+        if all [fv/kind = fk-tabs panel-open? id slot hit? fv at-point] [
+            landed: tab-strip-ordinal id fv px
+            ; Later faces sit on top, so the last hit wins -- the order the
+            ; event pass resolves overlaps in.
+            if landed >= 0 [found: landed]
+        ]
+    ]
+    return found
+]
+
+view-parameter-tally: func [
+    {How many faces of the view just built drive one host parameter. The
+     dialect answers this rather than the caller counting for itself,
+     because which parameters a face covers is the dialect's own rule: a
+     knob drives one, an envelope preview drives its four consecutive
+     stages, and either may additionally drive a `depth`.
+
+     It exists for the drift guard a literally-declared editor needs. A
+     layout derived from the schema cannot disagree with it; a declared one
+     can, and the failure is silent -- a parameter with no control is simply
+     unreachable, and one claimed twice gets two controls that fight. Asking
+     for a tally of exactly one, for every id the engine admits to, turns
+     both into a loud failure at attach.
+
+     Reads the CURRENT view, so call it straight after the attach that built
+     it.}
+    param [i32!] "Host parameter id to count."
+    return: [i32!] "Number of faces driving it; 1 is the healthy answer."
+] [
+    id: make i32! current-view
+    placed: view-count id
+    seen: make [#mutable i32!] 0
+    repeat slot placed [
+        idx: view-face-index id slot
+        fv: make face! faces/items/(idx)
+        ; An env-editor is skipped: it drives whatever the preview it is
+        ; showing drives, so counting it would double every stage.
+        if fv/kind <> fk-env-editor [
+            ; The four stages belong to whichever face SELECTS the envelope,
+            ; which is a preview of it or the knob that scales it. Keying this
+            ; on `envelope` rather than on the kind is what keeps the tally
+            ; right when an envelope moves out of a preview and into a knob:
+            ; the stages move with it and nothing else has to be told.
+            env: facet-or id slot fc-envelope -1
+            if env >= 0 [
+                if all [param >= env param <= (env + 3)] [
+                    seen: seen + 1
+                ]
+            ]
+            ; The face's own parameter, unless that IS the envelope base --
+            ; which it is for a preview, and never is for a knob, whose param
+            ; is the depth.
+            base: facet-or id slot fc-param -1
+            if all [base >= 0 base <> env param = base] [
+                seen: seen + 1
+            ]
+            ; Guarded on being a real id. A face that declares no depth
+            ; answers -1, so an unguarded compare makes a query for -1 match
+            ; all of them -- and a query for -1 is what an off-by-one caller
+            ; asks. Counting the sentinel is never right.
+            depth: facet-or id slot fc-depth -1
+            if all [depth >= 0 depth = param] [seen: seen + 1]
+        ]
+    ]
+    return seen
+]
+
+set-face-text: func [
+    {Set the text a face shows. The counterpart face-text always had and
+     set-face-data always implied: a caption that changes -- the name of the
+     loaded preset, a status line -- is otherwise only reachable by giving
+     the face an on-draw handler and drawing the string by hand, which is the
+     imperative escape hatch this dialect exists to close.}
+    name [word!] "Face name to update."
+    v [string!] "New text."
+    return: [none!]
+] [
+    id: make i32! current-view
+    placed: view-count id
+    repeat slot placed [
+        i: view-face-index id slot
+        f: make face! faces/items/:i
+        if f/name = name [
+            faces/items/:i/text: v
+            return none
+        ]
+    ]
+    vid-fatal "set-face-text: no such face"
+    return none
+]
+
+set-face-draw: func [
+    "Repoint the on-draw actor of the face registered under `name`, swapping its appearance at runtime (pass no-actor to clear back to built-in chrome)."
+    name [word!] "Face name to update."
+    actor-name [word!] "New on-draw actor name, or no-actor to clear."
+    return: [none!]
+] [
+    id: make i32! current-view
+    placed: view-count id
+    repeat slot placed [
+        i: view-face-index id slot
+        f: make face! faces/items/:i
+        if f/name = name [
+            faces/items/:i/on-draw: actor-name
+            return none
+        ]
+    ]
+    vid-fatal "set-face-draw: no such face"
+    return none
+]
+
+face-text: func [
+    "Read the current text of the face registered under `name`."
+    name [word!] "Face name to query."
+    return: [string!] "The face's current text; empty if not found."
+] [
+    id: make i32! current-view
+    placed: view-count id
+    repeat slot placed [
+        i: view-face-index id slot
+        f: make face! faces/items/:i
+        if f/name = name [return f/text]
+    ]
+    vid-fatal "face-text: no such face"
+    return ""
+]

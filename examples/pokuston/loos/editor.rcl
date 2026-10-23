@@ -1,0 +1,489 @@
+Recoil [
+    Title: "Loos plug-in editor, declared in VID"
+    Description: {
+        The Loos editor, ported from the four parallel `vector!`s and the
+        positional caption `if`-chain it replaces. Those five tables had to
+        agree index for index -- parameter, centre x, centre y, radius and
+        caption -- and nothing checked that they did. A knob's caption
+        followed where it sat rather than what it drove, so inserting a
+        control at the head of the top row shifted every caption below it.
+
+        The block says the layout instead. Five unequal rooms form an
+        architectural section: six drafting dials follow oscillator, filter,
+        and LFO signal roles, while four vertical faders sit beside the live
+        ADSR contour. Each control names its caption and parameter on the same
+        line, so the two can no longer disagree.
+
+        What is left here is Loos' half of a control and nothing else: what a
+        value means, how it reads, and what it resets to. The sweep angles,
+        the grab radius, the drag arithmetic, shift-for-fine,
+        double-click-to-default and the begin/change/end sequence the host
+        needs all belong to the dialect now.
+    }
+    Type: module
+    Module: examples/pokuston/loos/editor
+    Ffi: [c-string]
+    Imports: [
+        gui/vid [
+            actor actor-draw actor-edit actor-default actor-value actor-format
+            view-context-attach view-context-detach view-context-tick
+            view-select view-current-user set-face-text
+        ]
+        gui/widget [
+            envelope-shape! widget-envelope-curve widget-format-number
+            LOOS-OXBLOOD
+        ]
+        std/geometry [rect-of]
+        examples/pokuston/loos/editor-size [LOOS-EDITOR-WIDTH LOOS-EDITOR-HEIGHT]
+        examples/pokuston/loos/editor-params [Param!]
+    ]
+    Exports: [
+        loos-editor-create loos-editor-destroy
+        loos-editor-attach loos-editor-detach loos-editor-tick
+        loos-editor-preset-changed
+    ]
+]
+
+loos: foreign <loos.h> [
+    get-parameter: "loos_get_parameter" [c-pointer! u32! return: [f64!]]
+    set-parameter: "loos_set_parameter" [c-pointer! u32! f64! return: [logic!]]
+    to-normalized: "loos_parameter_to_normalized" [u32! f64! return: [f64!]]
+    from-normalized: "loos_parameter_from_normalized" [u32! f64! return: [f64!]]
+    ; The engine has stated every default since core.rcl:614 and the editor
+    ; kept a second copy of the list anyway -- the copy a double-click
+    ; actually wrote. Asking is the only way the two cannot drift.
+    parameter-default: "loos_parameter_default" [u32! return: [f64!]]
+]
+
+loos-host: foreign <loos-editor.h> [
+    ; These use e/user, the host-format context, rather than e/core. The core
+    ; owns sound parameters but knows nothing about CLAP's preset mailbox or
+    ; VST3's program parameter.
+    preset-count: "loos_editor_preset_count" [c-pointer! return: [u32!]]
+    current-preset: "loos_editor_current_preset" [c-pointer! return: [i32!]]
+    preset-name: "loos_editor_preset_name" [c-pointer! u32! return: [c-string!]]
+    load-preset: "loos_editor_load_preset" [c-pointer! u32! return: [logic!]]
+]
+
+editor-libc: foreign <stdlib.h> [
+    calloc: "calloc" [size! size! return: [c-pointer!]]
+    free: "free" [c-pointer! return: [void!]]
+]
+
+
+; The public parameter ids in loos.h's order, so the variants take the
+; numbering the ABI already fixed. A closed named family, so an enum! rather
+; than a run of bare integer constants.
+loos-editor!: make c-struct! [
+    core: [c-pointer!]
+    edit: [c-fn! [c-pointer! u32! f64! i32!] return: [none!]]
+    user: [c-pointer!]
+    context: [c-pointer!]
+]
+
+; The actor registries are module-global and append, so a host opening a
+; second instance must not register a second copy of the same handlers. One
+; registration serves every instance: the handlers reach their own editor
+; through view-current-user rather than through having been registered per
+; view.
+actors-ready: make [#mutable i32!] 0
+
+; --- the plug-in's half of a control ----------------------------------------
+
+editor-of: func [
+    "The editor whose view is being rendered, or null outside a frame."
+    return: [c-pointer!] "Borrowed loos-editor!, or null."
+] [
+    return view-current-user
+]
+
+on-value-of: func [
+    "What a parameter currently reads, normalized."
+    id [u32!] "Public parameter id."
+    return: [f64!] "Normalized 0.0..1.0."
+] [
+    raw: editor-of
+    if none? raw [return 0.0]
+    e: make [#mutable loos-editor!] as loos-editor! raw
+    return make f64! loos/to-normalized id
+        (make f64! loos/get-parameter e/core id)
+]
+
+on-default-of: func [
+    "What a double-click restores, normalized."
+    id [u32!] "Public parameter id."
+    return: [f64!] "Normalized 0.0..1.0."
+] [
+    return make f64! loos/to-normalized id
+        (make f64! loos/parameter-default id)
+]
+
+on-edited: func [
+    {One phase of a gesture. VID owns the drag and the phase ordering; what
+     is left here is writing the engine and telling the host, which is the
+     only part that is Loos'.}
+    id [u32!] "Public parameter id."
+    normalized [f64!] "New value in 0.0..1.0."
+    phase [i32!] "ph-begin, ph-change or ph-end."
+    return: [none!] "No value."
+] [
+    raw: editor-of
+    if none? raw [return none]
+    e: make [#mutable loos-editor!] as loos-editor! raw
+    value: make f64! loos/from-normalized id normalized
+    accepted: loos/set-parameter e/core id value
+    unused accepted
+    e/edit e/user id value phase
+    return none
+]
+
+on-shown: func [
+    "Render one parameter's value the way its unit reads best."
+    id [u32!] "Public parameter id."
+    normalized [f64!] "Normalized 0.0..1.0."
+    return: [string!] "Owned text."
+] [
+    value: make f64! loos/from-normalized id normalized
+    p: as i32! id
+    if p = Param!/cutoff [
+        if value >= 1000.0 [return widget-format-number (value / 1000.0) "%.2f kHz"]
+        return widget-format-number value "%.0f Hz"
+    ]
+    if p = Param!/resonance [return widget-format-number value "%.2f"]
+    if p = Param!/lfo-rate [return widget-format-number value "%.2f Hz"]
+    ; Nought is the triangle and a hundred the sawtooth, which is what the ear
+    ; hears the control doing. The underlying half-to-one is the rising
+    ; fraction of the cycle and would read as a control that only moves
+    ; through half its range.
+    if p = Param!/morph [
+        return widget-format-number ((value - 0.5) * 200.0) "%.0f%%"
+    ]
+    ; Signed, and in octaves, because that is the unit the control is defined
+    ; in: plus two means the voice opens two octaves at full articulation and
+    ; minus two means it closes by the same amount.
+    if p = Param!/env-amount [return widget-format-number value "%+.2f oct"]
+    if any [
+        p = Param!/lfo-cutoff-depth
+        p = Param!/sustain
+    ] [return widget-format-number (value * 100.0) "%.0f%%"]
+    ; Everything else is a time, and Loos keeps times in seconds.
+    return widget-format-number (value * 1000.0) "%.0f ms"
+]
+
+on-envelope-draw: func [
+    "Draw Loos' live ADSR contour without making the plot a parameter face."
+    context [c-pointer!] "Borrowed drawing surface."
+    pos [pair!] "Canvas origin in editor pixels."
+    size [pair!] "Canvas size in pixels."
+    label [string!] "Unused canvas label."
+    data [f64!] "Unused canvas data facet."
+    return: [none!] "No value."
+] [
+    unused label
+    unused data
+    if none? context [return none]
+    raw: editor-of
+    if none? raw [return none]
+    e: make [#mutable loos-editor!] as loos-editor! raw
+    attack: make f64! loos/get-parameter e/core (as u32! Param!/attack)
+    decay: make f64! loos/get-parameter e/core (as u32! Param!/decay)
+    sustain: make f64! loos/get-parameter e/core (as u32! Param!/sustain)
+    release: make f64! loos/get-parameter e/core (as u32! Param!/release)
+    shape: make [#mutable envelope-shape!] make envelope-shape! [
+        attack: attack decay: decay sustain: sustain release: release
+    ]
+    plot: rect-of (as f64! (pos/x + 4)) (as f64! (pos/y + 4))
+        (as f64! (size/x - 8)) (as f64! (size/y - 8))
+    widget-envelope-curve :context (addr-of shape) plot 5.0 LOOS-OXBLOOD 2.0
+    return none
+]
+
+; --- presets -----------------------------------------------------------------
+
+show-preset-name: func [
+    {Write the committed factory preset name, or "Init" for an edited patch.
+
+     Loads are committed by the host format, so the button shows the index it
+     requested at once and the host later pushes the committed index.}
+    index [i32!] "Factory-bank index, or -1 for a non-factory state."
+    return: [none!] "No value."
+] [
+    if index < 0 [
+        set-face-text 'preset "Init"
+        return none
+    ]
+    raw: editor-of
+    if none? raw [return none]
+    e: make [#mutable loos-editor!] as loos-editor! raw
+    set-face-text 'preset
+        (make string! loos-host/preset-name e/user (as u32! index))
+    return none
+]
+
+preset-step: func [
+    "Move through the factory bank by one preset, wrapping at both ends."
+    delta [i32!] "-1 for previous, 1 for next."
+    return: [none!] "No value."
+] [
+    raw: editor-of
+    if none? raw [return none]
+    e: make [#mutable loos-editor!] as loos-editor! raw
+    total: as i32! loos-host/preset-count e/user
+    if total <= 0 [return none]
+    current: loos-host/current-preset e/user
+    next-index: ((current + delta) + total) % total
+    accepted: loos-host/load-preset e/user (as u32! next-index)
+    if accepted [show-preset-name next-index]
+    return none
+]
+
+on-preset-prev: func [
+    "Load the factory preset before the current one."
+    return: [none!] "No value."
+] [
+    preset-step -1
+    return none
+]
+
+on-preset-next: func [
+    "Load the factory preset after the current one."
+    return: [none!] "No value."
+] [
+    preset-step 1
+    return none
+]
+
+register-actors: func [
+    "Register the handlers once for the whole module."
+    return: [none!] "No value."
+] [
+    if actors-ready = 1 [return none]
+    actor-edit 'edited :on-edited
+    actor-default 'defaulted :on-default-of
+    actor-value 'reads :on-value-of
+    actor-format 'shown :on-shown
+    actor-draw 'envelope-contour :on-envelope-draw
+    actor 'preset-prev :on-preset-prev
+    actor 'preset-next :on-preset-next
+    actors-ready: 1
+    return none
+]
+
+; --- entry points shared by the host-format shells --------------------------
+
+loos-editor-create: func [
+    "Allocate an editor bound to one Loos core and the host's edit callback."
+    #export
+    :core [c-pointer!] "Borrowed Loos instance."
+    ; A c-fn! in a func header names its parameters and carries return: inside
+    ; the block; the same type as a struct FIELD is spelled positionally with
+    ; return: outside it, as in loos-editor! above.
+    edit [c-fn! [
+        user [c-pointer!] parameter [u32!] value [f64!] phase [i32!]
+        return: [none!]
+    ]] "Host edit-gesture callback."
+    :user [c-pointer!] "Borrowed callback state."
+    return: [c-pointer!] "Owned editor, or null."
+] [
+    if none? core [return as c-pointer! 0]
+    raw: editor-libc/calloc (as size! 1) (as size! size-of loos-editor!)
+    if none? raw [return as c-pointer! 0]
+    e: make [#mutable loos-editor!] as loos-editor! raw
+    e/core: core
+    e/edit: edit
+    e/user: user
+    e/context: as c-pointer! 0
+    return raw
+]
+
+loos-editor-detach: func [
+    "Tear the child surface down, leaving the editor reusable."
+    #export
+    :editor [c-pointer!] "Borrowed editor."
+    return: [none!] "No value."
+] [
+    if none? editor [return none]
+    e: make [#mutable loos-editor!] as loos-editor! :editor
+    if none? e/context [return none]
+    view-context-detach e/context
+    e/context: as c-pointer! 0
+    return none
+]
+
+loos-editor-destroy: func [
+    "Release an editor, detaching first if it is still attached."
+    #export
+    :editor [c-pointer!] "Owned editor; null is accepted."
+    return: [none!] "No value."
+] [
+    if none? editor [return none]
+    loos-editor-detach :editor
+    editor-libc/free :editor
+    return none
+]
+
+loos-editor-attach: func [
+    {Declare the five-room drawing sheet and render it into a host parent.
+     Controls flow within each room; the section and routes own the absolute
+     coordinates.}
+    #export
+    :editor [c-pointer!] "Borrowed editor."
+    :native-parent [c-pointer!] "Borrowed native parent handle."
+    width [i32!] "Requested width." height [i32!] "Requested height."
+    return: [logic!] "True when the surface was created."
+] [
+    if none? editor [return false]
+    if none? native-parent [return false]
+    e: make [#mutable loos-editor!] as loos-editor! :editor
+    if not none? e/context [return false]
+    ; The size is fixed: the layout below is in absolute pixels, so a host
+    ; asking for another size would get a mislaid editor rather than a scaled
+    ; one. Refusing is the honest answer until the layout is relative.
+    if width <> LOOS-EDITOR-WIDTH [return false]
+    if height <> LOOS-EDITOR-HEIGHT [return false]
+    register-actors
+
+    e/context: view-context-attach [
+        panel 0x0 760x576 colour loos-board [
+            panel 12x12 736x552 colour loos-paper
+            panel 24x78 712x1 colour loos-construction
+
+            at 32x24 text "POKUSTON" font 12 colour loos-muted
+            at 32x40 text "LOOS" font 30 colour loos-ink
+            at 214x24 button "<" 24x26 colour loos-oxblood on-click 'preset-prev
+            at 394x24 button ">" 24x26 colour loos-oxblood on-click 'preset-next
+            at 252x31 preset: text "" font 12 colour loos-oxblood
+            at 504x35 text "POLYPHONIC 4-VOICE SYNTH" font 10 colour loos-muted
+
+            ; Five unequal rooms make a section rather than a control panel.
+            ; Their contents flow from one cursor per row; only the rooms and
+            ; the modulation routes own coordinates.
+            panel 24x126 152x164 colour loos-room [
+                panel 0x0 152x2 colour loos-ink
+                panel 0x0 2x164 colour loos-ink
+                panel 0x162 152x2 colour loos-ink
+                panel 150x0 2x164 colour loos-ink
+                panel 12x30 128x1 colour loos-construction
+                at 12x9 text "OSCILLATOR" font 10 colour loos-ink
+                at 12x20 text "ALWAYS + OCTAVE BELOW" font 8 colour loos-muted
+                at 35x42 across
+                knob "SHAPE" radius 34 style loos param (as i32! Param!/morph)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            ]
+            panel 196x96 332x210 colour loos-room [
+                panel 0x0 332x2 colour loos-ink
+                panel 0x0 2x210 colour loos-ink
+                panel 0x208 332x2 colour loos-ink
+                panel 330x0 2x210 colour loos-ink
+                panel 12x34 308x1 colour loos-construction
+                at 12x10 text "FILTER" font 10 colour loos-ink
+                at 76x10 text "ONE PER VOICE" font 9 colour loos-muted
+                at 14x48 across
+                knob "CUTOFF" radius 34 style loos param (as i32! Param!/cutoff)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                knob "RESONANCE" radius 34 style loos param (as i32! Param!/resonance)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                knob "ENV AMOUNT" radius 34 style loos param (as i32! Param!/env-amount)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            ]
+            panel 548x126 188x164 colour loos-room [
+                panel 0x0 188x2 colour loos-ink
+                panel 0x0 2x164 colour loos-ink
+                panel 0x162 188x2 colour loos-ink
+                panel 186x0 2x164 colour loos-ink
+                panel 12x30 164x1 colour loos-construction
+                at 12x9 text "AMPLIFIER" font 10 colour loos-ink
+                at 20x55 below
+                text "VELOCITY" font 13 colour loos-ink
+                text "x ENVELOPE" font 13 colour loos-oxblood
+                text "NO CONTROL OF ITS OWN" font 9 colour loos-muted
+            ]
+
+            ; The straight charcoal path is audio: oscillator, filter, gain.
+            panel 176x207 20x2 colour loos-ink
+            panel 528x207 20x2 colour loos-ink
+
+            panel 24x330 220x174 colour loos-room [
+                panel 0x0 220x2 colour loos-ink
+                panel 0x0 2x174 colour loos-ink
+                panel 0x172 220x2 colour loos-ink
+                panel 218x0 2x174 colour loos-ink
+                panel 12x31 196x1 colour loos-construction
+                at 12x9 text "LFO" font 10 colour loos-ink
+                at 20x43 across
+                knob "RATE" radius 30 style loos param (as i32! Param!/lfo-rate)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                knob "CUTOFF DEPTH" radius 30 style loos
+                    param (as i32! Param!/lfo-cutoff-depth)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            ]
+            panel 264x326 472x194 colour loos-room [
+                panel 0x0 472x2 colour loos-ink
+                panel 0x0 2x194 colour loos-ink
+                panel 0x192 472x2 colour loos-ink
+                panel 470x0 2x194 colour loos-ink
+                panel 12x34 448x1 colour loos-construction
+                at 12x9 text "ENVELOPE" font 10 colour loos-ink
+                at 84x9 text "ONE CONTOUR / FILTER + GAIN" font 9 colour loos-oxblood
+                at 16x48 canvas 148x82 on-draw 'envelope-contour
+                at 180x43 across
+                fader "ATTACK" 56x132 style loos param (as i32! Param!/attack)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                fader "DECAY" 56x132 style loos param (as i32! Param!/decay)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                fader "SUSTAIN" 56x132 style loos param (as i32! Param!/sustain)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+                fader "RELEASE" 56x132 style loos param (as i32! Param!/release)
+                    on-edit 'edited on-default 'defaulted on-value 'reads on-format 'shown
+            ]
+
+            ; Oxblood is modulation: the LFO reaches cutoff, and the one ADSR
+            ; rises into both the filter and amplifier rooms.
+            panel 104x306 2x24 colour loos-oxblood
+            panel 104x310 148x2 colour loos-oxblood
+            panel 250x306 2x6 colour loos-oxblood
+            at 112x313 text "TO CUTOFF" font 8 colour loos-oxblood
+            panel 320x306 2x20 colour loos-oxblood
+            at 328x310 text "TO FILTER" font 8 colour loos-oxblood
+            panel 646x290 2x36 colour loos-oxblood
+            at 654x310 text "TO GAIN" font 8 colour loos-oxblood
+
+            at 190x542 text "VERTICAL DRAG   SHIFT: FINE   DOUBLE-CLICK: RESET"
+                font 10 colour loos-muted
+        ]
+
+    ] :native-parent width height :editor
+
+    if none? e/context [return false]
+    show-preset-name (loos-host/current-preset e/user)
+    return true
+]
+
+loos-editor-preset-changed: func [
+    {Push a host preset change into this editor's caption. Selecting the view
+     first keeps multiple open Loos instances from updating one another.}
+    #export
+    :editor [c-pointer!] "Borrowed editor."
+    index [i32!] "Committed factory-bank index, or -1."
+    return: [none!] "No value."
+] [
+    if none? editor [return none]
+    e: make [#mutable loos-editor!] as loos-editor! editor
+    if none? e/context [return none]
+    if not view-select e/context [return none]
+    show-preset-name index
+    return none
+]
+
+loos-editor-tick: func [
+    "Pump the host-driven frame."
+    #export
+    :editor [c-pointer!] "Borrowed editor."
+    return: [none!] "No value."
+] [
+    if none? editor [return none]
+    e: make [#mutable loos-editor!] as loos-editor! :editor
+    if none? e/context [return none]
+    view-context-tick e/context
+    return none
+]

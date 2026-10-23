@@ -1,0 +1,530 @@
+Recoil [
+    Title: "brom/dsp/filter exercise"
+    Description: {
+        Checks each filter's defining properties rather than replaying stored
+        numbers: it passes DC, rejects Nyquist, stays bounded under resonance,
+        clears on reset, and cannot be poisoned by a NaN.
+
+        The four from Mach are additionally A/B'd against the Rust reference
+        sample by sample, which is a stronger check than anything here. What
+        this adds is coverage that survives the reference going away -- these
+        assertions say what the filters are FOR, which a difference against
+        another implementation never does.
+
+        Loos' render gate already proves the extraction was bit-exact, but that
+        is a property of Loos. This gives the filter coverage of its own, so a
+        later change to brom/dsp/filter fails here rather than only surfacing as
+        a moved hash in an unrelated plug-in.
+    }
+    Type: module
+    Module: recoil-brom/test/filter-test
+    Imports: [
+        brom/dsp/filter [
+            brom-ladder! brom-ladder-reset brom-ladder-tick
+            brom-juno! brom-juno-reset brom-juno-tick
+            brom-svf! brom-svf-reset brom-svf-tick
+            brom-2pole! brom-2pole-reset brom-2pole-tick
+            brom-multimode! brom-multimode-reset brom-multimode-tick
+            brom-one-pole-g
+        ]
+        brom/dsp/utils [brom-abs-f64]
+    ]
+    Exports: []
+]
+
+; sqrt(-1) rather than a literal 0.0/0.0: the compiler constant-folds the latter
+; and rejects it as a division by zero (T4150), and a runtime zero divide is
+; auto-checked too, so a foreign call is the honest way to obtain a NaN.
+math-ffi: foreign <math.h> [
+    sqrt: "sqrt" [f64! return: [f64!]]
+    sin: "sin" [f64! return: [f64!]]
+]
+
+SAMPLE-RATE: 48000.0
+; Well inside the ladder's valid range, so the coefficient derivation is honest.
+TEST-CUTOFF: 2000.0
+
+check: func [
+    "Record one assertion as a PASS or FAIL line."
+    ok? [logic!] "Whether the assertion held."
+    return: [none!] "No value; the marker is written to stdout."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+near?: func [
+    "Whether two values agree to within a tolerance."
+    a [f64!] "First value."
+    b [f64!] "Second value."
+    tolerance [f64!] "Largest accepted absolute difference."
+    return: [logic!] "True when the values are close enough."
+] [
+    return (brom-abs-f64 (a - b)) <= tolerance
+]
+
+settle: func [
+    "Run a constant input through a filter and return the final output."
+    :filter [c-pointer!] "Borrowed brom-ladder!."
+    level [f64!] "Constant input level."
+    cutoff [f64!] "Cutoff in Hz."
+    resonance [f64!] "Resonance."
+    samples [i32!] "Samples to run."
+    return: [f64!] "Output of the last sample."
+] [
+    last-output: make [#mutable f64!] 0.0
+    repeat i samples [
+        last-output: brom-ladder-tick :filter level cutoff resonance SAMPLE-RATE
+    ]
+    return last-output
+]
+
+alternate: func [
+    "Run a full-scale Nyquist square through a filter and return the final output."
+    :filter [c-pointer!] "Borrowed brom-ladder!."
+    cutoff [f64!] "Cutoff in Hz."
+    resonance [f64!] "Resonance."
+    samples [i32!] "Samples to run."
+    return: [f64!] "Output of the last sample."
+] [
+    last-output: make [#mutable f64!] 0.0
+    repeat i samples [
+        sample: either (i % 2) = 0 [1.0] [-1.0]
+        last-output: brom-ladder-tick :filter sample cutoff resonance SAMPLE-RATE
+    ]
+    return last-output
+]
+
+ladder: make [#mutable brom-ladder!] []
+handle: addr-of ladder
+
+; --- reset leaves no history ------------------------------------------------
+brom-ladder-reset :handle
+check (ladder/y1 = 0.0)
+check (ladder/y4 = 0.0)
+check (ladder/oldx = 0.0)
+check (near? (brom-ladder-tick :handle 0.0 TEST-CUTOFF 0.0 SAMPLE-RATE) 0.0 0.0)
+
+; --- a low-pass passes DC ---------------------------------------------------
+; Substantially, but not at unity: the four one-poles alone would settle at
+; exactly the input level, and the cubic saturation on the last stage pulls that
+; down. A held 1.0 arrives at about 0.711. Asserted as a band rather than that
+; constant so a deliberate coefficient change is not reported as a failure --
+; what matters is that DC gets through and that the saturation is doing
+; something.
+brom-ladder-reset :handle
+dc: make f64! settle :handle 1.0 TEST-CUTOFF 0.0 4800
+check (dc > 0.5)
+check (dc < 1.0)
+
+; --- and rejects Nyquist ----------------------------------------------------
+; Four poles at 2 kHz put the sample-rate/2 alternation far down the skirt. The
+; comparison is against the DC result above, so this tests the *slope*, not an
+; absolute number that would drift with any coefficient change.
+brom-ladder-reset :handle
+nyquist: make f64! alternate :handle TEST-CUTOFF 0.0 4800
+check ((brom-abs-f64 nyquist) < (dc * 0.01))
+
+; --- resonance stays bounded ------------------------------------------------
+; The cubic saturation is what makes this true; without it the feedback path
+; diverges. Full resonance and a sustained input is the worst case.
+brom-ladder-reset :handle
+loud: make f64! settle :handle 1.0 TEST-CUTOFF 1.0 48000
+check ((brom-abs-f64 loud) <= 4.0)
+check (loud = loud)
+
+; --- reset really clears ----------------------------------------------------
+; The same input after a reset must give the same answer as it did from silence,
+; or some history survived.
+brom-ladder-reset :handle
+first-pass: make f64! settle :handle 0.5 TEST-CUTOFF 0.3 512
+brom-ladder-reset :handle
+second-pass: make f64! settle :handle 0.5 TEST-CUTOFF 0.3 512
+check (first-pass = second-pass)
+
+; --- a NaN cannot poison the feedback path ----------------------------------
+; brom-sanitize-f64 catches it at the input; without that the NaN would live in
+; y1..y4 forever and silence the voice permanently.
+brom-ladder-reset :handle
+nan: make f64! math-ffi/sqrt -1.0
+brom-ladder-tick :handle nan TEST-CUTOFF 0.5 SAMPLE-RATE
+recovered: make f64! settle :handle 1.0 TEST-CUTOFF 0.0 4800
+check (recovered = recovered)
+; Not merely finite -- the *same* steady state a clean filter reaches. A guard
+; that only stopped the NaN from spreading could still leave the history skewed.
+check (near? recovered dc 0.000001)
+
+print "PASS"
+
+; ===========================================================================
+; The four filters from Mach
+; ===========================================================================
+
+MACH-RATE: 44100.0
+
+juno: make c-pointer! unsafe/malloc (as i32! size-of brom-juno!)
+svf: make c-pointer! unsafe/malloc (as i32! size-of brom-svf!)
+two-pole: make c-pointer! unsafe/malloc (as i32! size-of brom-2pole!)
+multimode: make c-pointer! unsafe/malloc (as i32! size-of brom-multimode!)
+
+; --- each settles to a steady DC gain ---------------------------------------
+; A low-pass fed a constant must reach a constant. The bands differ because the
+; topologies differ: the SVF family is normalised to unity, while the Juno's
+; four one-poles have a gain the Rust's own test only pins to 0.85..1.15.
+
+brom-juno-reset :juno
+juno-dc: make [#mutable f64!] 0.0
+repeat i 4000 [juno-dc: brom-juno-tick :juno 1.0 1000.0 0.0 MACH-RATE]
+check juno-dc > 0.85
+check juno-dc < 1.15
+
+brom-svf-reset :svf
+svf-dc: make [#mutable f64!] 0.0
+repeat i 4000 [svf-dc: brom-svf-tick :svf 1.0 1000.0 0.0 MACH-RATE]
+check (near? svf-dc 1.0 0.05)
+
+brom-multimode-reset :multimode
+; Morph zero is the low-pass, so this is the same assertion as the SVF's.
+mm-dc: make [#mutable f64!] 0.0
+repeat i 4000 [mm-dc: brom-multimode-tick :multimode 1.0 1000.0 0.0 0.0 MACH-RATE]
+check (near? mm-dc 1.0 0.05)
+
+; A high-pass fed DC must settle to nothing, which is the same statement read
+; the other way and catches a morph that is silently stuck at zero.
+brom-multimode-reset :multimode
+mm-hp: make [#mutable f64!] 0.0
+repeat i 4000 [mm-hp: brom-multimode-tick :multimode 1.0 1000.0 0.0 1.0 MACH-RATE]
+check (near? mm-hp 0.0 0.05)
+
+; --- and attenuates well above cutoff ---------------------------------------
+; Alternating +1/-1 is Nyquist, the highest frequency the rate can carry. Any
+; low-pass worth the name must reject it almost entirely.
+
+brom-juno-reset :juno
+juno-nyquist: make [#mutable f64!] 0.0
+repeat i 2000 [
+    juno-nyquist: brom-juno-tick :juno (either (i % 2) = 0 [1.0] [-1.0]) 200.0 0.0 MACH-RATE
+]
+check (brom-abs-f64 juno-nyquist) < 0.05
+
+brom-svf-reset :svf
+svf-nyquist: make [#mutable f64!] 0.0
+repeat i 2000 [
+    svf-nyquist: brom-svf-tick :svf (either (i % 2) = 0 [1.0] [-1.0]) 200.0 0.0 MACH-RATE
+]
+check (brom-abs-f64 svf-nyquist) < 0.05
+
+; --- all four stay bounded at high resonance --------------------------------
+; The condition every one of these has a saturation or a clamp for. Fed a
+; sustained signal at nearly full resonance for a second of audio, none may
+; run away or turn into a NaN.
+
+brom-juno-reset :juno
+brom-svf-reset :svf
+brom-2pole-reset :two-pole
+brom-multimode-reset :multimode
+bounded: make [#mutable logic!] true
+repeat i 44100 [
+    drive: either (i % 2) = 0 [0.8] [-0.8]
+    a: brom-juno-tick :juno drive 2000.0 0.95 MACH-RATE
+    b: brom-svf-tick :svf drive 2000.0 0.95 MACH-RATE
+    c: brom-2pole-tick :two-pole drive 2000.0 0.99 MACH-RATE
+    d: brom-multimode-tick :multimode drive 2000.0 0.98 0.5 MACH-RATE
+    if a <> a [bounded: false]
+    if b <> b [bounded: false]
+    if c <> c [bounded: false]
+    if d <> d [bounded: false]
+    if (brom-abs-f64 a) > 100.0 [bounded: false]
+    if (brom-abs-f64 b) > 100.0 [bounded: false]
+    if (brom-abs-f64 c) > 100.0 [bounded: false]
+    if (brom-abs-f64 d) > 100.0 [bounded: false]
+]
+check bounded
+
+; --- the two-pole ramps into self-oscillation instead of jumping ------------
+; The reference stepped from 0.11 to 410 across one hundredth of the resonance
+; knob, because its damping jumped straight through zero with nothing bounding
+; the integrator states. This asserts the shape that replaced it: monotonic in
+; resonance, continuous across the knee, and bounded at the top.
+
+two-pole-peak: func [
+    "Peak output of the two-pole over a second of full-scale alternating input."
+    resonance [f64!] "Resonance to test."
+    return: [f64!] "Largest absolute output seen."
+] [
+    brom-2pole-reset :two-pole
+    peak: make [#mutable f64!] 0.0
+    repeat i 44100 [
+        value: brom-2pole-tick :two-pole
+            (either (i % 2) = 0 [0.8] [-0.8]) 2000.0 resonance MACH-RATE
+        if (brom-abs-f64 value) > peak [peak: brom-abs-f64 value]
+    ]
+    return peak
+]
+
+; Continuous where the saturation begins: below the knee the filter is exactly
+; what the reference computes, and stepping past it must not show.
+below-knee: two-pole-peak 0.9499999
+at-knee: two-pole-peak 0.95
+above-knee: two-pole-peak 0.9500001
+; Not exact equality: these resonances differ in the seventh decimal, so their
+; damping does too, and the outputs are entitled to differ by about as much.
+; What is being asserted is that nothing STEPS here -- the 1.4% jump an
+; unblended saturation produced would fail this by three orders of magnitude.
+check (near? below-knee at-knee 0.00001)
+check (near? at-knee above-knee 0.00001)
+
+; Rising all the way up, with no step anywhere near the size of the one this
+; replaced.
+climbing: make [#mutable logic!] true
+previous-peak: make [#mutable f64!] 0.0
+repeat step 21 [
+    resonance: 0.9 + ((as f64! step) * 0.005)
+    peak: two-pole-peak resonance
+    if peak < previous-peak [climbing: false]
+    previous-peak: peak
+]
+check climbing
+
+; Bounded at maximum. The reference reached 410 times the input here.
+check (two-pole-peak 1.0) < 1.0
+
+; --- reset clears the history -----------------------------------------------
+; After a reset a silent input must give silence. A filter that keeps any of
+; its state would ring on into the next note.
+
+brom-juno-reset :juno
+brom-svf-reset :svf
+brom-2pole-reset :two-pole
+brom-multimode-reset :multimode
+check (near? (brom-juno-tick :juno 0.0 1000.0 0.0 MACH-RATE) 0.0 0.0)
+check (near? (brom-svf-tick :svf 0.0 1000.0 0.0 MACH-RATE) 0.0 0.0)
+check (near? (brom-2pole-tick :two-pole 0.0 1000.0 0.0 MACH-RATE) 0.0 0.0)
+check (near? (brom-multimode-tick :multimode 0.0 1000.0 0.0 0.5 MACH-RATE) 0.0 0.0)
+
+; --- an absurd cutoff is bounded, not obeyed --------------------------------
+; Cutoff arrives already modulated by an envelope and an LFO, so it can land
+; anywhere. Every tick bounds it before deriving a coefficient; without that the
+; fast tangent would be past its pole and the filter would inverse itself.
+
+brom-juno-reset :juno
+brom-svf-reset :svf
+brom-2pole-reset :two-pole
+brom-multimode-reset :multimode
+extreme: make [#mutable logic!] true
+repeat i 200 [
+    a: brom-juno-tick :juno 0.5 500000.0 0.5 MACH-RATE
+    b: brom-svf-tick :svf 0.5 500000.0 0.5 MACH-RATE
+    c: brom-2pole-tick :two-pole 0.5 500000.0 0.5 MACH-RATE
+    d: brom-multimode-tick :multimode 0.5 -1000.0 0.5 0.5 MACH-RATE
+    if a <> a [extreme: false]
+    if b <> b [extreme: false]
+    if c <> c [extreme: false]
+    if d <> d [extreme: false]
+]
+check extreme
+
+; --- morph reaches all three responses --------------------------------------
+; Each response is identified by what it does to the two extremes of the
+; spectrum, which is the only thing that actually distinguishes them.
+;
+; Testing this on DC alone does not work, and looked like it did: a band-pass
+; and a high-pass both reject DC, so their outputs agree at zero and an
+; assertion that they differ fails against a filter that is perfectly correct.
+; Nyquist is where they part company.
+
+nyquist-response: func [
+    "Settled response of the morphing filter to alternating full-scale input."
+    morph [f64!] "Blend to test."
+    return: [f64!] "Magnitude of the settled output."
+] [
+    brom-multimode-reset :multimode
+    settled: make [#mutable f64!] 0.0
+    repeat i 2000 [
+        settled: brom-multimode-tick :multimode
+            (either (i % 2) = 0 [1.0] [-1.0]) 1000.0 0.3 morph MACH-RATE
+    ]
+    return brom-abs-f64 settled
+]
+
+; Each response is pinned by what it does at BOTH ends, which is what makes
+; the three mutually exclusive: the low-pass is the one that passes DC and
+; rejects Nyquist, the high-pass the reverse, and the band-pass the only one
+; that rejects both. Nothing else can satisfy all three lines.
+;
+; Measuring the band-pass at Nyquist and expecting something in between does
+; not work -- with cutoff four octaves below, it is down about as far as the
+; low-pass is, and the two read as equal.
+check (nyquist-response 0.0) < 0.05
+check (nyquist-response 1.0) > 0.9
+check (nyquist-response 0.5) < 0.05
+
+; --- the coefficient cache is invisible in the output -----------------------
+; Recomputing only when cutoff moves a hundredth of a hertz is a speed
+; decision. Reaching a cutoff by sweeping to it must give the same steady state
+; as starting there, or the cache has become audible.
+
+brom-svf-reset :svf
+repeat i 2000 [
+    swept: 500.0 + (1500.0 * (as f64! i) / 1999.0)
+    brom-svf-tick :svf 1.0 swept 0.0 MACH-RATE
+]
+after-sweep: make [#mutable f64!] 0.0
+repeat i 2000 [after-sweep: brom-svf-tick :svf 1.0 2000.0 0.0 MACH-RATE]
+
+brom-svf-reset :svf
+direct: make [#mutable f64!] 0.0
+repeat i 2000 [direct: brom-svf-tick :svf 1.0 2000.0 0.0 MACH-RATE]
+check (near? after-sweep direct 0.0001)
+
+; --- a ringdown ends, instead of decaying forever ---------------------------
+; Every one of these is an IIR, so a tail approaches zero without ever arriving
+; there. Left alone it crosses into the denormal range and stays there for
+; thousands of samples: slow, per the reasoning on BROM-DENORMAL-THRESHOLD, and
+; small enough by then that scaling it into a host's float buffer produces a
+; subnormal sample. clap-validator rejects exactly that, and did -- Mach failed
+; param-fuzz-bounds on the Juno, which alone among the five guarded nothing.
+;
+; The assertion is on the filter reaching EXACTLY zero, not on it being small.
+; Small is what an unguarded filter already is; arriving is the property that
+; distinguishes a flushed tail from one still ticking below audibility. Twenty
+; thousand silent samples is under half a second and far beyond any of these
+; decays; before the flush the Juno needed roughly twenty-five thousand just to
+; run f64 out of exponent.
+RINGDOWN-EXCITE: 64
+RINGDOWN-SAMPLES: 20000
+
+brom-ladder-reset :handle
+repeat i RINGDOWN-EXCITE [brom-ladder-tick :handle 1.0 TEST-CUTOFF 0.0 SAMPLE-RATE]
+ladder-tail: make [#mutable f64!] 1.0
+repeat i RINGDOWN-SAMPLES [
+    ladder-tail: brom-ladder-tick :handle 0.0 TEST-CUTOFF 0.0 SAMPLE-RATE
+]
+check (ladder-tail = 0.0)
+
+brom-juno-reset :juno
+repeat i RINGDOWN-EXCITE [brom-juno-tick :juno 1.0 TEST-CUTOFF 0.0 SAMPLE-RATE]
+juno-tail: make [#mutable f64!] 1.0
+repeat i RINGDOWN-SAMPLES [
+    juno-tail: brom-juno-tick :juno 0.0 TEST-CUTOFF 0.0 SAMPLE-RATE
+]
+check (juno-tail = 0.0)
+
+brom-svf-reset :svf
+repeat i RINGDOWN-EXCITE [brom-svf-tick :svf 1.0 TEST-CUTOFF 0.0 SAMPLE-RATE]
+svf-tail: make [#mutable f64!] 1.0
+repeat i RINGDOWN-SAMPLES [
+    svf-tail: brom-svf-tick :svf 0.0 TEST-CUTOFF 0.0 SAMPLE-RATE
+]
+check (svf-tail = 0.0)
+
+brom-2pole-reset :two-pole
+repeat i RINGDOWN-EXCITE [brom-2pole-tick :two-pole 1.0 TEST-CUTOFF 0.0 SAMPLE-RATE]
+two-pole-tail: make [#mutable f64!] 1.0
+repeat i RINGDOWN-SAMPLES [
+    two-pole-tail: brom-2pole-tick :two-pole 0.0 TEST-CUTOFF 0.0 SAMPLE-RATE
+]
+check (two-pole-tail = 0.0)
+
+brom-multimode-reset :multimode
+repeat i RINGDOWN-EXCITE [
+    brom-multimode-tick :multimode 1.0 TEST-CUTOFF 0.0 0.0 SAMPLE-RATE
+]
+multimode-tail: make [#mutable f64!] 1.0
+repeat i RINGDOWN-SAMPLES [
+    multimode-tail: brom-multimode-tick :multimode 0.0 TEST-CUTOFF 0.0 0.0 SAMPLE-RATE
+]
+check (multimode-tail = 0.0)
+
+; --- the one-pole coefficient is exact where it matters most ----------------
+; g = 1 - exp(-2*pi*fc/fs) is dominated by cancellation at a low cutoff: the
+; answer is what is left after subtracting two numbers that agree to four
+; figures. An approximate exp therefore does not give an approximate g. The
+; previous derivation used brom-fast-exp, which returns 0.971 for exp(0), so g
+; could never fall below 0.0295 whatever cutoff it was handed.
+;
+; Pinned from both sides: for a small argument g must agree with its own limit
+; 2*pi*fc/fs, and it must stay inside nought to one and rise with cutoff.
+JUNO-RATE: 176400.0
+TWO-PI: 6.283185307179586
+
+tiny-g: brom-one-pole-g 20.0 JUNO-RATE
+tiny-limit: TWO-PI * 20.0 / JUNO-RATE
+check (near? tiny-g tiny-limit (tiny-limit * 0.001))
+check (tiny-g > 0.0)
+check (tiny-g < (brom-one-pole-g 2000.0 JUNO-RATE))
+check ((brom-one-pole-g 2000.0 JUNO-RATE) < (brom-one-pole-g 18000.0 JUNO-RATE))
+check ((brom-one-pole-g 18000.0 JUNO-RATE) < 1.0)
+
+; --- the Juno's response depends only on the ratio of tone to cutoff ---------
+; Four one-poles have no absolute frequency of their own: doubling both cutoff
+; and tone must leave the output where it was. That is the cheapest statement of
+; "the cutoff control works", and it needs no reference number to compare to.
+;
+; It is also exactly what fails when g is wrong at the bottom. With the old
+; derivation a cutoff of 100 Hz and one of 500 Hz were nearly the same filter,
+; so the two measurements below came out 36 dB apart instead of equal.
+juno-response: func [
+    "Peak steady output of a unit sine at `tone` through a Juno set to `cutoff`."
+    :filter [c-pointer!] "Borrowed brom-juno!."
+    cutoff [f64!] "Requested cutoff in Hz."
+    tone [f64!] "Probe tone in Hz."
+    return: [f64!] "Peak output amplitude once the filter has settled."
+] [
+    brom-juno-reset :filter
+    peak: make [#mutable f64!] 0.0
+    repeat i 120000 [
+        out: brom-juno-tick :filter
+            (math-ffi/sin (TWO-PI * tone * (as f64! i) / JUNO-RATE))
+            cutoff 0.0 JUNO-RATE
+        if i > 100000 [
+            magnitude: brom-abs-f64 out
+            if magnitude > peak [peak: magnitude]
+        ]
+    ]
+    return peak
+]
+
+low-pair: juno-response :juno 100.0 200.0
+high-pair: juno-response :juno 1000.0 2000.0
+check (near? low-pair high-pair (high-pair * 0.02))
+
+; And the control must actually discriminate down there: an octave-and-a-bit of
+; cutoff has to move a fixed tone by a lot, not by the 1.35 dB it used to.
+near-cutoff: juno-response :juno 500.0 1000.0
+far-cutoff: juno-response :juno 100.0 1000.0
+check (far-cutoff < (near-cutoff * 0.01))
+
+; --- resonance is capped, as the signature says it is -----------------------
+; The cap is at 0.95 and Mach's own parameter stops at 0.9, so nothing it can
+; ask for reaches this. It is asserted anyway because brom is shared: the
+; previous code computed the bound and then fed the raw argument to the
+; feedback path, which no caller could see until one asked for more.
+brom-juno-reset :juno
+over-cap: make [#mutable f64!] 0.0
+repeat i 120000 [
+    out: brom-juno-tick :juno
+        (math-ffi/sin (TWO-PI * 1000.0 * (as f64! i) / JUNO-RATE))
+        1000.0 5.0 JUNO-RATE
+    if i > 100000 [
+        magnitude: brom-abs-f64 out
+        if magnitude > over-cap [over-cap: magnitude]
+    ]
+]
+brom-juno-reset :juno
+at-limit: make [#mutable f64!] 0.0
+repeat i 120000 [
+    out: brom-juno-tick :juno
+        (math-ffi/sin (TWO-PI * 1000.0 * (as f64! i) / JUNO-RATE))
+        1000.0 0.95 JUNO-RATE
+    if i > 100000 [
+        magnitude: brom-abs-f64 out
+        if magnitude > at-limit [at-limit: magnitude]
+    ]
+]
+check (near? over-cap at-limit (at-limit * 0.000001))
+
+unsafe/free :juno
+unsafe/free :svf
+unsafe/free :two-pole
+unsafe/free :multimode

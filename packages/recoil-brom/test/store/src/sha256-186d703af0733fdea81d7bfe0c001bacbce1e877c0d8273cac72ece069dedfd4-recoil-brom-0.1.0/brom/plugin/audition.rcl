@@ -1,0 +1,592 @@
+Recoil [
+    Title: "Brom offline preset audition"
+    Description: {
+        Applies one preset file to any Brom engine and renders a fixed score to
+        a stereo WAV, driven entirely by the engine descriptor -- the same
+        contract preset.rcl relies on, so every instrument that has a
+        descriptor gets an audition for free. It is the render step of the
+        preset-prompt tool: a model writes preset text, this plays it.
+
+        The score is ten seconds at 48 kHz: an eight-note phrase from C3 every
+        0.5 s, then an A minor chord held from 4 s to 8 s and released.
+
+        The answer goes to stdout as one Rebol block, Brom-Audition [...]:
+        identity, preset directory, every parameter with its applied value,
+        range and default, and ten measurements of the render (level, attack,
+        ring, sustain, release tail, spectral centroid, harmonicity,
+        flatness, motion, width). The measuring happens here, on the samples
+        the engine produced, so nothing downstream needs to read the WAV.
+    }
+    Type: module
+    Module: brom/plugin/audition
+    Ffi: [c-string]
+    Imports: [
+        std/io [get-env]
+        brom/plugin/engine [engine! param-info! brom-select-voice]
+        brom/plugin/preset [
+            preset-load preset-apply preset-name-of preset-slug-of preset-name-slug preset-cstr-string
+            preset-dir preset-factory-count preset-factory-text
+        ]
+    ]
+    Exports: [
+        brom-audition-main
+        ; The analysis, for renders of other scores.
+        audition-signal! audition-fft-view! audition-rms audition-db
+        audition-power audition-centroid
+    ]
+]
+
+audition-port: foreign "runtime" [
+    open-file:  ["port_open_file"  [c-string! c-string!] return: [port!]]
+    write-file: ["port_file_write" [c-pointer! i32! i32! :port!] return: [i32!]]
+    close-port: ["port_close"      [port!] return: [i32!]]
+]
+
+AUDITION-RATE: 48000.0
+AUDITION-BLOCK: 256
+; 10 s of 256-frame blocks; notes every 94 blocks (0.501 s).
+AUDITION-BLOCKS: 1876
+AUDITION-NOTE-BLOCKS: 94
+AUDITION-CHORD-ON: 752
+AUDITION-CHORD-OFF: 1502
+
+audition-header!: make c-struct! [bytes: [c-array! [u8! 44]]]
+audition-pcm!: make c-struct! [bytes: [c-array! [u8! 1024]]]
+audition-view!: make c-struct! [samples: [c-array! [f64! 256]]]
+
+audition-math: foreign <math.h> [
+    fabs: "fabs" [f64! return: [f64!]]
+    sqrt: "sqrt" [f64! return: [f64!]]
+    log: "log" [f64! return: [f64!]]
+    log10: "log10" [f64! return: [f64!]]
+    log2: "log2" [f64! return: [f64!]]
+    exp: "exp" [f64! return: [f64!]]
+    cos: "cos" [f64! return: [f64!]]
+    sin: "sin" [f64! return: [f64!]]
+]
+
+; The whole render, mid or side, as one heap buffer. A view type only: nothing
+; of it is ever constructed, it is cast onto malloc'd storage.
+AUDITION-FRAMES: make i32! 480256
+; Sized for longer renders too: the showcase in examples/pokuston/audition
+; measures a 22.5 s piece with these same functions.
+audition-signal!: make c-struct! [samples: [c-array! [f64! 1200000]]]
+
+; FFT scratch, real and imaginary halves, sized for the largest transform.
+AUDITION-FFT-MAX: 65536
+audition-fft-view!: make c-struct! [values: [c-array! [f64! 65536]]]
+
+AUDITION-PI: make f64! 3.141592653589793
+; Score landmarks in frames, typed so function bodies can do arithmetic on them.
+AUDITION-NOTE-FRAMES: make i32! 24064
+AUDITION-CHORD-ON-FRAME: make i32! 192512
+AUDITION-CHORD-OFF-FRAME: make i32! 384512
+AUDITION-SECOND: make i32! 48000
+
+audition-u32: func [:raw [c-pointer!] offset [i32!] value [u32!] bytes [i32!] return: [none!]] [
+    header: make [#mutable audition-header!] as audition-header! raw
+    repeat i bytes [
+        pos: offset + i
+        header/bytes/:pos: as u8! ((value >> (as u32! (i * 8))) & (as u32! 255))
+    ]
+    return none
+]
+
+audition-header: func [:raw [c-pointer!] frames [u32!] return: [none!]] [
+    data-bytes: frames * (as u32! 4)
+    audition-u32 :raw 0 (as u32! 1179011410) 4
+    audition-u32 :raw 4 (data-bytes + (as u32! 36)) 4
+    audition-u32 :raw 8 (as u32! 1163280727) 4
+    audition-u32 :raw 12 (as u32! 544501094) 4
+    audition-u32 :raw 16 (as u32! 16) 4
+    audition-u32 :raw 20 (as u32! 1) 2
+    audition-u32 :raw 22 (as u32! 2) 2
+    audition-u32 :raw 24 (as u32! 48000) 4
+    audition-u32 :raw 28 (as u32! 192000) 4
+    audition-u32 :raw 32 (as u32! 4) 2
+    audition-u32 :raw 34 (as u32! 16) 2
+    audition-u32 :raw 36 (as u32! 1635017060) 4
+    audition-u32 :raw 40 data-bytes 4
+    return none
+]
+
+audition-encode: func [
+    "Write one block as 16-bit stereo PCM and keep its mid and side for analysis."
+    :left [c-pointer!] "Borrowed left samples."
+    :right [c-pointer!] "Borrowed right samples."
+    :pcm [c-pointer!] "Borrowed PCM byte buffer."
+    frames [i32!] "Frames in the block."
+    :mid [c-pointer!] "Borrowed whole-render mid buffer."
+    :side [c-pointer!] "Borrowed whole-render side buffer."
+    offset [i32!] "Frame index of the block's first frame."
+    return: [f64!] "Largest absolute sample in the block."
+] [
+    l: make [#mutable audition-view!] as audition-view! left
+    r: make [#mutable audition-view!] as audition-view! right
+    buffer: make [#mutable audition-pcm!] as audition-pcm! pcm
+    m: make [#mutable audition-signal!] as audition-signal! mid
+    d: make [#mutable audition-signal!] as audition-signal! side
+    peak: make [#mutable f64!] 0.0
+    repeat frame frames [
+        lv: make f64! l/samples/:frame
+        rv: make f64! r/samples/:frame
+        at-frame: offset + frame
+        m/samples/:at-frame: (lv + rv) * 0.5
+        d/samples/:at-frame: (lv - rv) * 0.5
+        if (audition-math/fabs lv) > peak [peak: audition-math/fabs lv]
+        if (audition-math/fabs rv) > peak [peak: audition-math/fabs rv]
+        repeat channel 2 [
+            sample: make [#mutable f64!] either channel = 0 [make f64! l/samples/:frame] [make f64! r/samples/:frame]
+            if sample > 1.0 [sample: 1.0]
+            if sample < -1.0 [sample: -1.0]
+            word: as u32! (as i32! (sample * 32767.0))
+            low: (frame * 4) + (channel * 2)
+            high: low + 1
+            buffer/bytes/:low: as u8! (word & (as u32! 255))
+            buffer/bytes/:high: as u8! ((word >> (as u32! 8)) & (as u32! 255))
+        ]
+    ]
+    return peak
+]
+
+audition-note-on: func [
+    "Start a note through whichever voice contract the engine declares."
+    :engine [engine!] :core [c-pointer!] note-id [i32!] key [i32!] velocity [f64!]
+    return: [i32!] "Slot used, or the note id for core-owned voices."
+] [
+    if engine/core-owned-voices [
+        engine/note-event-fn :core true note-id 0 key velocity
+        return note-id
+    ]
+    slot: make [#mutable i32!] -1
+    either engine/custom-voice-slot [
+        slot: make i32! engine/voice-slot-fn :core note-id key
+    ] [
+        slot: brom-select-voice :engine :core
+    ]
+    if slot >= 0 [engine/note-on-fn :core slot key velocity]
+    return slot
+]
+
+audition-note-off: func [
+    :engine [engine!] :core [c-pointer!] handle [i32!] key [i32!]
+    return: [none!]
+] [
+    if handle < 0 [return none]
+    either engine/core-owned-voices [
+        engine/note-event-fn :core false handle 0 key 0.0
+    ] [
+        engine/note-off-fn :core handle
+    ]
+    return none
+]
+
+
+; --- analysis -----------------------------------------------------------------
+;
+; Ten numbers a model can compare with what a description asks for. Windows are
+; fixed by the score: the first phrase note (C3, 0 to 0.5 s), the held chord
+; (4 s to 8 s) and the release tail (8 s to 9 s).
+
+audition-rms: func [
+    "Root mean square of a span of one buffer."
+    :signal [c-pointer!] "Borrowed mid or side buffer."
+    start [i32!] "First frame."
+    count [i32!] "Frames in the span."
+    return: [f64!] "RMS level, linear."
+] [
+    s: make [#mutable audition-signal!] as audition-signal! signal
+    sum: make [#mutable f64!] 0.0
+    repeat i count [
+        at-frame: start + i
+        v: make f64! s/samples/:at-frame
+        sum: sum + (v * v)
+    ]
+    return audition-math/sqrt ((sum / (as f64! count)) + 0.00000000000000000001)
+]
+
+audition-db: func [
+    "Linear level to dB, floored at -90 so silence reads as very quiet."
+    level [f64!] "Linear level."
+    return: [f64!] "Level in dB, -90 or above."
+] [
+    if level < 0.0000000001 [return -90.0]
+    value: 20.0 * audition-math/log10 level
+    if value < -90.0 [return -90.0]
+    return value
+]
+
+audition-fft: func [
+    "In-place radix-2 complex FFT."
+    :re-raw [c-pointer!] "Borrowed real parts."
+    :im-raw [c-pointer!] "Borrowed imaginary parts."
+    n [i32!] "Transform size, a power of two."
+    return: [none!] "No value."
+] [
+    re: make [#mutable audition-fft-view!] as audition-fft-view! re-raw
+    im: make [#mutable audition-fft-view!] as audition-fft-view! im-raw
+    ; Bit-reversal permutation by counting, without bit operators.
+    j: make [#mutable i32!] 0
+    repeat i n [
+        if i < j [
+            tr: make f64! re/values/:i
+            ti: make f64! im/values/:i
+            re/values/:i: make f64! re/values/:j
+            im/values/:i: make f64! im/values/:j
+            re/values/:j: tr
+            im/values/:j: ti
+        ]
+        m: make [#mutable i32!] n / 2
+        while [all [m >= 1 j >= m]] [
+            j: j - m
+            m: m / 2
+        ]
+        j: j + m
+    ]
+    span: make [#mutable i32!] 2
+    while [span <= n] [
+        half: span / 2
+        angle: (0.0 - 2.0 * AUDITION-PI) / (as f64! span)
+        step-re: audition-math/cos angle
+        step-im: audition-math/sin angle
+        base: make [#mutable i32!] 0
+        while [base < n] [
+            w-re: make [#mutable f64!] 1.0
+            w-im: make [#mutable f64!] 0.0
+            repeat k half [
+                a: base + k
+                b: a + half
+                b-re: make f64! re/values/:b
+                b-im: make f64! im/values/:b
+                a-re: make f64! re/values/:a
+                a-im: make f64! im/values/:a
+                t-re: (w-re * b-re) - (w-im * b-im)
+                t-im: (w-re * b-im) + (w-im * b-re)
+                re/values/:b: a-re - t-re
+                im/values/:b: a-im - t-im
+                re/values/:a: a-re + t-re
+                im/values/:a: a-im + t-im
+                next-re: (w-re * step-re) - (w-im * step-im)
+                w-im: (w-re * step-im) + (w-im * step-re)
+                w-re: next-re
+            ]
+            base: base + span
+        ]
+        span: span * 2
+    ]
+    return none
+]
+
+audition-power: func [
+    "Load a Hann-windowed span into the FFT buffers, transform, and leave power per bin in the real half."
+    :signal [c-pointer!] "Borrowed mid buffer."
+    start [i32!] "First frame of the span."
+    count [i32!] "Frames in the span; at most n are used."
+    n [i32!] "Transform size, a power of two."
+    :re-raw [c-pointer!] "Borrowed real scratch; holds power on return."
+    :im-raw [c-pointer!] "Borrowed imaginary scratch."
+    return: [none!] "No value."
+] [
+    s: make [#mutable audition-signal!] as audition-signal! signal
+    re: make [#mutable audition-fft-view!] as audition-fft-view! re-raw
+    im: make [#mutable audition-fft-view!] as audition-fft-view! im-raw
+    used: either count < n [count] [n]
+    repeat i n [
+        im/values/:i: 0.0
+        either i < used [
+            at-frame: start + i
+            window: 0.5 - (0.5 * audition-math/cos ((2.0 * AUDITION-PI * (as f64! i)) / (as f64! (used - 1))))
+            re/values/:i: window * (make f64! s/samples/:at-frame)
+        ] [
+            re/values/:i: 0.0
+        ]
+    ]
+    audition-fft :re-raw :im-raw n
+    repeat i n [
+        a: make f64! re/values/:i
+        b: make f64! im/values/:i
+        re/values/:i: (a * a) + (b * b)
+    ]
+    return none
+]
+
+audition-centroid: func [
+    "Spectral centroid of a power spectrum, weighting bins by magnitude."
+    :power-raw [c-pointer!] "Borrowed power per bin."
+    n [i32!] "Transform size."
+    return: [f64!] "Centroid in Hz."
+] [
+    p: make [#mutable audition-fft-view!] as audition-fft-view! power-raw
+    weighted: make [#mutable f64!] 0.0
+    total: make [#mutable f64!] 0.0
+    repeat k (n / 2) [
+        magnitude: audition-math/sqrt (make f64! p/values/:k)
+        hz: (as f64! k) * AUDITION-RATE / (as f64! n)
+        weighted: weighted + (hz * magnitude)
+        total: total + magnitude
+    ]
+    return weighted / (total + 0.00000000000000000001)
+]
+
+audition-flatness: func [
+    "Spectral flatness between 100 Hz and 8 kHz: 0 is tonal, 1 is white noise."
+    :power-raw [c-pointer!] "Borrowed power per bin."
+    n [i32!] "Transform size."
+    return: [f64!] "Flatness, 0 to 1."
+] [
+    p: make [#mutable audition-fft-view!] as audition-fft-view! power-raw
+    log-sum: make [#mutable f64!] 0.0
+    sum: make [#mutable f64!] 0.0
+    bins: make [#mutable i32!] 0
+    repeat k (n / 2) [
+        hz: (as f64! k) * AUDITION-RATE / (as f64! n)
+        if all [hz > 100.0 hz < 8000.0] [
+            v: (make f64! p/values/:k) + 0.00000000000000000001
+            log-sum: log-sum + audition-math/log v
+            sum: sum + v
+            bins: bins + 1
+        ]
+    ]
+    if bins = 0 [return 0.0]
+    mean: sum / (as f64! bins)
+    return (audition-math/exp (log-sum / (as f64! bins))) / mean
+]
+
+audition-harmonicity: func [
+    "Share of 60 Hz-6 kHz power within 30 cents of a harmonic of f0."
+    :power-raw [c-pointer!] "Borrowed power per bin."
+    n [i32!] "Transform size."
+    f0 [f64!] "Fundamental in Hz."
+    return: [f64!] "Share, 0 to 1."
+] [
+    p: make [#mutable audition-fft-view!] as audition-fft-view! power-raw
+    near: make [#mutable f64!] 0.0
+    total: make [#mutable f64!] 0.0
+    repeat k (n / 2) [
+        hz: (as f64! k) * AUDITION-RATE / (as f64! n)
+        if all [hz > 60.0 hz < 6000.0] [
+            v: make f64! p/values/:k
+            total: total + v
+            partial: as f64! (as i32! ((hz / f0) + 0.5))
+            if partial >= 1.0 [
+                cents: 1200.0 * audition-math/log2 (hz / (partial * f0))
+                if (audition-math/fabs cents) < 30.0 [near: near + v]
+            ]
+        ]
+    ]
+    return near / (total + 0.00000000000000000001)
+]
+
+audition-attack-ms: func [
+    "Time for the first note's 2 ms RMS envelope to reach 90% of its peak."
+    :mid [c-pointer!] "Borrowed mid buffer."
+    return: [f64!] "Attack in milliseconds."
+] [
+    window: 96
+    windows: AUDITION-NOTE-FRAMES / window
+    peak: make [#mutable f64!] 0.0
+    repeat w windows [
+        level: audition-rms :mid (w * window) window
+        if level > peak [peak: level]
+    ]
+    repeat w windows [
+        level: audition-rms :mid (w * window) window
+        if level >= (0.9 * peak) [return (as f64! w) * 2.0]
+    ]
+    return 0.0
+]
+
+audition-motion-db: func [
+    "Level wobble of the late held chord: spread of its 50 ms envelope in dB."
+    :mid [c-pointer!] "Borrowed mid buffer."
+    return: [f64!] "Standard deviation in dB."
+] [
+    window: 2400
+    start: AUDITION-CHORD-ON-FRAME + ((AUDITION-CHORD-OFF-FRAME - AUDITION-CHORD-ON-FRAME) / 2)
+    windows: (AUDITION-CHORD-OFF-FRAME - start) / window
+    sum: make [#mutable f64!] 0.0
+    squares: make [#mutable f64!] 0.0
+    repeat w windows [
+        level: audition-db (audition-rms :mid (start + (w * window)) window)
+        sum: sum + level
+        squares: squares + (level * level)
+    ]
+    mean: sum / (as f64! windows)
+    variance: (squares / (as f64! windows)) - (mean * mean)
+    if variance <= 0.0 [return 0.0]
+    return audition-math/sqrt variance
+]
+
+
+audition-print-measurements: func [
+    "Measure a finished render and print the measurements block."
+    :mid [c-pointer!] "Borrowed mid buffer."
+    :side [c-pointer!] "Borrowed side buffer."
+    peak [f64!] "Largest absolute sample of the render."
+    return: [none!] "No value."
+] [
+    re-raw: make c-pointer! unsafe/malloc (as i32! size-of audition-fft-view!)
+    im-raw: make c-pointer! unsafe/malloc (as i32! size-of audition-fft-view!)
+    half-second: AUDITION-SECOND / 2
+
+    first-start: audition-db (audition-rms :mid 0 (AUDITION-SECOND / 10))
+    first-late: audition-db (audition-rms :mid 16800 (AUDITION-NOTE-FRAMES - 16800))
+    chord-start: audition-db (audition-rms :mid AUDITION-CHORD-ON-FRAME half-second)
+    chord-late: audition-db (audition-rms :mid (AUDITION-CHORD-OFF-FRAME - AUDITION-SECOND) AUDITION-SECOND)
+    pre-release: audition-db (audition-rms :mid (AUDITION-CHORD-OFF-FRAME - half-second) half-second)
+    tail: audition-db (audition-rms :mid (AUDITION-CHORD-OFF-FRAME + half-second) half-second)
+    sustain: chord-late - chord-start
+
+    audition-power :mid AUDITION-CHORD-ON-FRAME (2 * AUDITION-SECOND) 65536 :re-raw :im-raw
+    brightness: audition-centroid :re-raw 65536
+    audition-power :mid 960 20640 16384 :re-raw :im-raw
+    harmonicity: audition-harmonicity :re-raw 16384 130.8128
+    ; A chord that has died away has no tone left to be noisy or to wobble.
+    noisiness: make [#mutable f64!] 0.0
+    motion: make [#mutable f64!] 0.0
+    if sustain >= -30.0 [
+        audition-power :mid (AUDITION-CHORD-OFF-FRAME - (2 * AUDITION-SECOND)) (2 * AUDITION-SECOND) 65536 :re-raw :im-raw
+        noisiness: audition-flatness :re-raw 65536
+        motion: audition-motion-db :mid
+    ]
+    width: (audition-rms :side 0 AUDITION-FRAMES) / ((audition-rms :mid 0 AUDITION-FRAMES) + 0.00000000000000000001)
+
+    print "    measurements: ["
+    print rejoin ["        peak-dbfs: " (audition-db peak)]
+    print rejoin ["        attack-ms: " (audition-attack-ms :mid)]
+    print rejoin ["        ring-db: " (first-late - first-start)]
+    print rejoin ["        sustain-db: " sustain]
+    print rejoin ["        release-tail-db: " (tail - pre-release)]
+    print rejoin ["        brightness-hz: " brightness]
+    print rejoin ["        harmonicity: " harmonicity]
+    print rejoin ["        noisiness: " noisiness]
+    print rejoin ["        motion-db: " motion]
+    print rejoin ["        width: " width]
+    print "    ]"
+    unsafe/free re-raw
+    unsafe/free im-raw
+    return none
+]
+
+; --- entry ----------------------------------------------------------------------
+
+brom-audition-main: func [
+    "Apply the preset at $BROM_PRESET to any engine, render and measure it, and print a Brom-Audition block."
+    :engine [engine!] "Borrowed engine descriptor."
+    return: [i32!] "Parameters the preset applied."
+] [
+    print "Brom-Audition ["
+    print rejoin [{    plugin: "} (preset-name-slug (as c-pointer! engine/name)) {"}]
+    print rejoin [{    description: "} (preset-cstr-string (as c-pointer! engine/description)) {"}]
+    print rejoin [{    preset-dir: %"} (preset-dir :engine) {"}]
+
+    ; BROM_FACTORY=1 lists the factory bank instead of rendering: the bank is
+    ; the instrument's own vocabulary of good sounds, and the best examples a
+    ; model can be shown.
+    if (length? (get-env "BROM_FACTORY")) > 0 [
+        print "    factory: ["
+        repeat index (preset-factory-count :engine) [
+            print rejoin ["{" (preset-factory-text :engine index) "}"]
+        ]
+        print "    ]"
+        print "]"
+        return 0
+    ]
+
+    preset-file: get-env "BROM_PRESET"
+    requested: get-env "BROM_AUDITION_OUT"
+    path: either (length? requested) > 0 [requested] [make string! "/dev/null"]
+
+    core: make c-pointer! engine/create-fn
+    activated: make logic! engine/activate-fn core AUDITION-RATE AUDITION-BLOCK
+    unused activated
+
+    ; A preset says what it changes, so every parameter starts at its default.
+    info-raw: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+    unsafe/memset info-raw 0 (as i32! size-of param-info!)
+    repeat index engine/param-count [
+        if engine/param-info-fn index :info-raw [
+            info: make [#mutable param-info!] as param-info! info-raw
+            ok: make logic! engine/set-param-fn core info/id info/default-value
+            unused ok
+        ]
+    ]
+    text: preset-load :preset-file
+    applied: preset-apply :engine core :text
+    print rejoin [{    preset: "} (preset-name-of :text) {"}]
+    print rejoin ["    applied: " applied]
+    print "    params: ["
+    repeat index engine/param-count [
+        if engine/param-info-fn index :info-raw [
+            info: make [#mutable param-info!] as param-info! info-raw
+            value: make f64! engine/get-param-fn core info/id
+            print rejoin [
+                "        " (preset-slug-of :info-raw) " [value: " value
+                " min: " info/range/lo " max: " info/range/hi
+                " default: " info/default-value "]"
+            ]
+        ]
+    ]
+    print "    ]"
+    unsafe/free info-raw
+
+    header: make [#mutable audition-header!] []
+    pcm: make [#mutable audition-pcm!] []
+    header-bytes: addr-of header/bytes/0
+    header-pointer: addr-of header
+    pcm-pointer: addr-of pcm
+    audition-header :header-pointer (as u32! (AUDITION-BLOCKS * AUDITION-BLOCK))
+    file: make [port!] audition-port/open-file (as c-string! path) "wb"
+    audition-port/write-file header-bytes 1 44 :file
+
+    mid: make c-pointer! unsafe/malloc (as i32! size-of audition-signal!)
+    side: make c-pointer! unsafe/malloc (as i32! size-of audition-signal!)
+    peak: make [#mutable f64!] 0.0
+
+    phrase-keys: make [vector! [i32! 8]] [48 52 55 60 64 67 72 76]
+    phrase-velocities: make [vector! [f64! 8]] [0.8 0.5 0.6 0.9 0.4 0.7 0.5 1.0]
+    chord-keys: make [vector! [i32! 4]] [45 57 60 64]
+    chord-handles: make [#mutable vector! [i32! 4]] [-1 -1 -1 -1]
+    phrase-handle: make [#mutable i32!] -1
+    phrase-key: make [#mutable i32!] 0
+    next-id: make [#mutable i32!] 1
+
+    engine/reset-fn core
+    repeat block AUDITION-BLOCKS [
+        if all [block < AUDITION-CHORD-ON (block % AUDITION-NOTE-BLOCKS) = 0] [
+            note: block / AUDITION-NOTE-BLOCKS
+            if note < 8 [
+                audition-note-off :engine core phrase-handle phrase-key
+                phrase-key: phrase-keys/:note
+                phrase-handle: audition-note-on :engine core next-id phrase-key phrase-velocities/:note
+                next-id: next-id + 1
+            ]
+        ]
+        if block = AUDITION-CHORD-ON [
+            audition-note-off :engine core phrase-handle phrase-key
+            repeat index 4 [
+                chord-handles/:index: audition-note-on :engine core next-id chord-keys/:index 0.75
+                next-id: next-id + 1
+            ]
+        ]
+        if block = AUDITION-CHORD-OFF [
+            repeat index 4 [audition-note-off :engine core chord-handles/:index chord-keys/:index]
+        ]
+        engine/process-fn core AUDITION-BLOCK
+        left: make c-pointer! engine/output-fn core
+        right: make c-pointer! either engine/stereo-output [engine/output-right-fn core] [engine/output-fn core]
+        block-peak: audition-encode :left :right :pcm-pointer AUDITION-BLOCK :mid :side (block * AUDITION-BLOCK)
+        if block-peak > peak [peak: block-peak]
+        buffer: make [#mutable audition-pcm!] as audition-pcm! pcm-pointer
+        audition-port/write-file (addr-of buffer/bytes/0) 1 (AUDITION-BLOCK * 4) :file
+    ]
+    audition-port/close-port file
+    engine/destroy-fn core
+
+    audition-print-measurements :mid :side peak
+    unsafe/free mid
+    unsafe/free side
+    if (length? requested) > 0 [print rejoin [{    wav: %"} path {"}]]
+    print "]"
+    return applied
+]

@@ -1,0 +1,149 @@
+Recoil [
+    Title: "Filter A/B dump"
+    Description: {
+        Runs the same signals through the same filters the Rust oracle runs, and
+        writes the results as raw doubles for an external comparison.
+
+        Four signals per case, chosen so a wrong answer has nowhere to hide: an
+        impulse carries the whole transfer function in one shot, a step shows DC
+        gain and settling, seeded noise is broadband with no structure to
+        accidentally agree with, and a cutoff sweep is the only one of the four
+        that exercises the coefficient cache at all.
+    }
+    Type: module
+    Module: recoil-brom/test/filter-dump
+    Imports: [
+        brom/dsp/filter [
+            brom-juno! brom-juno-reset brom-juno-tick
+            brom-svf! brom-svf-reset brom-svf-tick
+            brom-2pole! brom-2pole-reset brom-2pole-tick
+            brom-multimode! brom-multimode-reset brom-multimode-tick
+        ]
+    ]
+    Exports: []
+]
+
+stdio: foreign <stdio.h> [
+    fopen: "fopen" [c-string! c-string! return: [c-pointer!]]
+    fwrite: "fwrite" [c-pointer! size! size! c-pointer! return: [size!]]
+    fclose: "fclose" [c-pointer! return: [i32!]]
+]
+
+SAMPLES: 512
+CASE-COUNT: 48
+SAMPLE-RATE: 44100.0
+DUMP-PATH: "recoil-filter.bin"
+
+; Four filters x four signals x three (cutoff, resonance, morph) settings.
+buffer!: make c-struct! [
+    values: [c-array! [f64! 24576]]
+]
+signal!: make c-struct! [
+    values: [c-array! [f64! 512]]
+]
+
+fill-signal: func [
+    "Write one of the four test signals into a caller-owned buffer."
+    :out [c-pointer!] "Borrowed signal! to fill."
+    kind [i32!] "0 impulse, 1 step, 2 seeded noise, 3 step (paired with a cutoff sweep)."
+    return: [none!] "No value; the signal is written in place."
+] [
+    signal: make [#mutable signal!] as signal! :out
+    ; A 32-bit linear congruential generator with the Numerical Recipes
+    ; constants. Not a good noise source, but an exactly reproducible one, which
+    ; is the only property that matters when both sides must see it.
+    seed: make [#mutable u32!] 12345
+    repeat i SAMPLES [
+        value: make [#mutable f64!] 0.0
+        if kind = 0 [value: either i = 0 [1.0] [0.0]]
+        if kind = 1 [value: 1.0]
+        if kind = 2 [
+            seed: (seed * 1664525) + 1013904223
+            scaled: as f64! (seed >> 16)
+            value: (scaled / 32768.0) - 1.0
+        ]
+        if kind = 3 [value: 1.0]
+        signal/values/(i): value
+    ]
+    return none
+]
+
+cutoff-at: func [
+    "Cutoff for one sample of a case, swept only for the fourth signal."
+    kind [i32!] "Signal kind; 3 sweeps, the others hold."
+    base [f64!] "Cutoff to hold, and the bottom of the sweep."
+    index [i32!] "Sample index within the case."
+    return: [f64!] "Cutoff in Hz for this sample."
+] [
+    ; The sweep climbs from base to base+4000 Hz over the buffer, which crosses
+    ; the cache's hundredth-of-a-hertz threshold on every single sample -- the
+    ; opposite of the static cases, where it is crossed exactly once.
+    if kind <> 3 [return base]
+    return base + (4000.0 * (as f64! index) / 511.0)
+]
+
+run-case: func [
+    "Run one filter over one signal, writing the output into the dump buffer."
+    :out [c-pointer!] "Borrowed buffer! to write into."
+    slot [i32!] "Case index; the output occupies SAMPLES doubles from slot * SAMPLES."
+    :input [c-pointer!] "Borrowed signal! holding the input samples."
+    which [i32!] "0 juno, 1 svf, 2 two-pole, 3 multimode."
+    kind [i32!] "Signal kind, which decides whether cutoff sweeps."
+    cutoff [f64!] "Cutoff in Hz."
+    resonance [f64!] "Resonance."
+    morph [f64!] "Morph blend; read by the multimode only."
+    return: [none!] "No value; the output is written in place."
+] [
+    dump: make [#mutable buffer!] as buffer! :out
+    signal: make [#mutable signal!] as signal! :input
+    juno: make c-pointer! unsafe/malloc (as i32! size-of brom-juno!)
+    svf: make c-pointer! unsafe/malloc (as i32! size-of brom-svf!)
+    two-pole: make c-pointer! unsafe/malloc (as i32! size-of brom-2pole!)
+    multimode: make c-pointer! unsafe/malloc (as i32! size-of brom-multimode!)
+    brom-juno-reset :juno
+    brom-svf-reset :svf
+    brom-2pole-reset :two-pole
+    brom-multimode-reset :multimode
+    base: slot * SAMPLES
+    repeat i SAMPLES [
+        sample: make f64! signal/values/(i)
+        frequency: cutoff-at kind cutoff i
+        value: make [#mutable f64!] 0.0
+        if which = 0 [value: brom-juno-tick :juno sample frequency resonance SAMPLE-RATE]
+        if which = 1 [value: brom-svf-tick :svf sample frequency resonance SAMPLE-RATE]
+        if which = 2 [value: brom-2pole-tick :two-pole sample frequency resonance SAMPLE-RATE]
+        if which = 3 [value: brom-multimode-tick :multimode sample frequency resonance morph SAMPLE-RATE]
+        dump/values/(base + i): value
+    ]
+    unsafe/free :juno
+    unsafe/free :svf
+    unsafe/free :two-pole
+    unsafe/free :multimode
+    return none
+]
+
+out: make c-pointer! unsafe/malloc (as i32! size-of buffer!)
+signal-store: make c-pointer! unsafe/malloc (as i32! size-of signal!)
+
+cutoffs: make [vector! [f64! 3]] [400.0 2000.0 8000.0]
+resonances: make [vector! [f64! 3]] [0.0 0.5 0.9]
+morphs: make [vector! [f64! 3]] [0.0 0.5 1.0]
+
+slot: make [#mutable i32!] 0
+repeat which 4 [
+    repeat kind 4 [
+        fill-signal :signal-store kind
+        repeat setting 3 [
+            run-case :out slot :signal-store which kind
+                cutoffs/:setting resonances/:setting morphs/:setting
+            slot: slot + 1
+        ]
+    ]
+]
+
+handle: stdio/fopen DUMP-PATH "wb"
+stdio/fwrite :out 8 (as size! (CASE-COUNT * SAMPLES)) handle
+stdio/fclose handle
+unsafe/free :out
+unsafe/free :signal-store
+print "dumped"

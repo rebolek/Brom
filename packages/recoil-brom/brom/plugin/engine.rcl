@@ -1,0 +1,463 @@
+Recoil [
+    Title: "Brom audio engine descriptor"
+    Description: {
+        The contract a plug-in's DSP satisfies so that one shared host shell can
+        drive it. This is the Recoil form of Brom's AudioEngine/SynthEngine
+        traits: Recoil has no traits, but a trait object is a table of function
+        pointers, and a c-struct! of fn-ptr! fields is exactly that.
+
+        Why it exists: kapralova/clap/clap_entry.rcl (1670 lines) and
+        loos/clap/clap_entry.rcl (1762) differ by 250 lines once the plug-in
+        name is normalised away. The other ~85% -- event dispatch, audio and
+        note ports, parameter plumbing, state, GUI lifecycle -- is host glue
+        that has nothing to do with either synth. A third copy for Mach would
+        make it ~5,100 lines of duplicated boilerplate.
+
+        The engine state itself is opaque. Every entry point takes a `core`
+        c-pointer! that the shell only ever passes back, so the shell needs no
+        knowledge of the plug-in's voice structs, and the plug-in needs none of
+        CLAP.
+
+        Parameters are described, not hardcoded: `param-info-fn` fills a
+        param-info! for an index, and the range carries a brom/plugin/values
+        taper, so a host sees the same curve the editor does.
+    }
+    Type: module
+    Module: brom/plugin/engine
+    Ffi: [c-string]
+    Imports: [
+        brom/plugin/values [param-range! param-denormalize param-normalize]
+        brom/plugin/meter [brom-meter-pair! brom-meter-observe brom-meter-unavailable]
+    ]
+    Exports: [
+        engine! param-info! brom-voice-state!
+        BROM-MAX-VOICES BROM-MAX-PARAMS BROM-MAX-STATE-BYTES
+        engine-param-info engine-param-count brom-select-voice
+        engine-set-param-normalized engine-get-param-normalized
+        engine-observe-meter
+    ]
+]
+
+; Ceilings on the fixed-size bookkeeping the shared CLAP shell keeps per
+; instance. They exist because a c-struct! field's c-array! length must be a
+; compile-time constant, and the shell is compiled once for every plug-in --
+; it cannot size itself from a descriptor it only sees at run time.
+;
+; The cost of headroom is a few KB per plug-in instance, so these are set well
+; above what any current plug-in needs (Kapralova 32 voices / 12 params, Loos
+; 4 / 12) rather than tuned. An engine declaring more is rejected at create
+; time instead of overrunning.
+BROM-MAX-VOICES: 64
+BROM-MAX-PARAMS: 256
+; 16 KB rather than 4: a plug-in whose state is preset text (see
+; brom/plugin/preset) spends roughly 45 bytes per parameter it has moved away
+; from its default, so Mach's 124 parameters need about 5 KB in the worst case
+; and 4096 would truncate a fully-dialled patch. The cost is per plug-in
+; INSTANCE in the shell's fixed buffer, which is the trade: a few kilobytes
+; against a session that silently fails to save.
+BROM-MAX-STATE-BYTES: 16384
+
+; What Brom needs to know about one voice to rank it for stealing. Four facts,
+; none of them instrument-specific -- which is the point: voice allocation is
+; the same problem for an electric piano, a sawtooth synth and an additive
+; engine, so it is solved once here instead of in each plug-in's DSP core.
+;
+; `active` and `gate` are deliberately different questions. `gate` is "the
+; player is still holding this key"; `active` is "this voice is still making
+; sound", which stays true through the release tail. Ranking on the wrong one
+; steals a voice that is still audible and clicks.
+brom-voice-state!: make struct! [
+    active: logic!
+    gate: logic!
+    energy: f64!
+    age: i64!
+]
+
+; One parameter's description, filled by the plug-in on demand rather than held
+; in a table, so the shell never owns plug-in-shaped storage.
+;
+; `name` and `module` are borrowed static strings; the shell copies them into
+; whatever fixed buffer the host ABI wants. `module` is the group a host shows
+; the parameter under ("Tine", "Pickup", ...); empty means ungrouped.
+;
+; `range` carries the taper, so `param-denormalize` here and the editor's knob
+; agree by construction rather than by two copies of the same constants.
+param-info!: make struct! [
+    id: u32!
+    name: c-string!
+    module: c-string!
+    default-value: f64!
+    range: param-range!
+]
+
+; The descriptor a plug-in fills in once, statically.
+;
+; Field names all carry an `-fn` suffix on purpose: function-pointer struct
+; fields resolve globally by field name in the parser, so a bare `reset` or
+; `process` here would collide with any same-named non-callable field elsewhere
+; in the program and turn every `x/reset` into an attempted call.
+;
+; Every entry point takes `core` -- the opaque pointer `create-fn` returned --
+; except `param-info-fn`, which describes the plug-in as a class rather than an
+; instance and so must be callable before any instance exists (a host asks for
+; parameter metadata during scanning).
+engine!: make c-struct! [
+    ; --- identity, read by the shell when it answers the host's scan ---
+    id: [c-string!]
+    name: [c-string!]
+    vendor: [c-string!]
+    version: [c-string!]
+    description: [c-string!]
+
+    param-count: [i32!]
+    ; Voice slots the shell keeps CLAP-side bookkeeping for. It must not exceed
+    ; BROM-MAX-VOICES, which sizes that bookkeeping.
+    max-voices: [i32!]
+    ; Bytes the engine's state blob occupies -- fixed, so the shell can stream it
+    ; without a length prefix and existing saved patches keep loading.
+    state-size: [i32!]
+    ; Frames the buffer returned by output-fn can hold; the shell renders in
+    ; chunks no larger than this.
+    output-capacity: [i32!]
+    editor-width: [i32!]
+    editor-height: [i32!]
+    ; Whether this plug-in has an editor at all. False makes the shell withhold
+    ; the clap.gui extension entirely, so a host shows its own generic parameter
+    ; UI instead of asking for a window nothing can draw. Defaults false because
+    ; a c-struct! field zero-initializes; every descriptor that wants an editor
+    ; sets it explicitly.
+    has-editor: [logic!]
+
+    ; --- lifecycle ---
+    create-fn: [fn-ptr! [return: [c-pointer!]]]
+    destroy-fn: [fn-ptr! [:core [c-pointer!] return: [none!]]]
+    activate-fn: [fn-ptr! [
+        :core [c-pointer!]
+        sample-rate [f64!]
+        max-frames [i32!]
+        return: [logic!]
+    ]]
+    reset-fn: [fn-ptr! [:core [c-pointer!] return: [none!]]]
+
+    ; --- voices ---
+    ; Reports one voice's state so brom-select-voice can rank it. An engine
+    ; supplies facts about its voices and Brom owns the stealing policy, rather
+    ; than every plug-in writing its own ranking loop.
+    voice-state-fn: [fn-ptr! [
+        :core [c-pointer!]
+        slot [i32!]
+        :out [c-pointer!]
+        return: [logic!]
+    ]]
+
+    ; Set only by an engine that wants a policy brom-select-voice cannot
+    ; express; when false, voice-slot-fn is never called and may be left null.
+    custom-voice-slot: [logic!]
+    voice-slot-fn: [fn-ptr! [
+        :core [c-pointer!]
+        note-id [i32!]
+        key [i32!]
+        return: [i32!]
+    ]]
+
+    ; --- audio ---
+    ; Renders `frames` into the engine's own output buffer; the shell then copies
+    ; that buffer into the host's ports. This is the hot path and the boundary
+    ; where branch-free inner loops start mattering.
+    process-fn: [fn-ptr! [:core [c-pointer!] frames [i32!] return: [none!]]]
+    ; Address of that buffer. Stable across a block, so the shell reads it once.
+    output-fn: [fn-ptr! [:core [c-pointer!] return: [c-pointer!]]]
+
+    ; `key` is the MIDI key the host sent; an engine that wants frequency
+    ; converts it itself, so the shell never carries tuning policy.
+    note-on-fn: [fn-ptr! [
+        :core [c-pointer!]
+        slot [i32!]
+        key [i32!]
+        velocity [f64!]
+        return: [none!]
+    ]]
+    note-off-fn: [fn-ptr! [:core [c-pointer!] slot [i32!] return: [none!]]]
+
+    ; --- parameters ---
+    ; Fills `out` (a param-info!) for `index` in 0 .. param-count-1; false when
+    ; the index is out of range.
+    param-info-fn: [fn-ptr! [
+        index [i32!]
+        :out [c-pointer!]
+        return: [logic!]
+    ]]
+    ; Values crossing these two are in the plug-in's own engineering units, not
+    ; normalized -- the taper conversion happens in the shell, where the
+    ; param-info! is already to hand.
+    get-param-fn: [fn-ptr! [:core [c-pointer!] id [u32!] return: [f64!]]]
+    set-param-fn: [fn-ptr! [
+        :core [c-pointer!]
+        id [u32!]
+        value [f64!]
+        return: [logic!]
+    ]]
+
+    ; --- state ---
+    ; Superseded by the state-subsystem/state-version/state-save-ascii/
+    ; has-state-context identity fields below, which brom/plugin/state/
+    ; dispatch.rcl's brom-state-load/-save read to route every plug-in's
+    ; state through one shared, format-aware mechanism. No CLAP or VST3
+    ; shell calls save-state-fn/load-state-fn any more; Mach and Loos still
+    ; wire them to their own hand-rolled functions, kept only until a future
+    ; migration deletes them along with the functions themselves.
+    save-state-fn: [fn-ptr! [
+        :core [c-pointer!]
+        out [c-pointer!]
+        capacity [i32!]
+        return: [logic!]
+    ]]
+    load-state-fn: [fn-ptr! [
+        :core [c-pointer!]
+        bytes [c-pointer!]
+        length [i32!]
+        return: [logic!]
+    ]]
+
+    ; --- optional modes ------------------------------------------------------
+    ; Three shapes the first two plug-ins did not need and Mach does. Each is a
+    ; flag plus the entry point it enables; every flag defaults to false, so an
+    ; engine that ignores this block behaves exactly as before and may leave the
+    ; matching fn-ptr! null. Added at the end of the struct on purpose -- a
+    ; descriptor is plain data and existing ones must keep their field offsets.
+
+    ; The engine allocates its own voices. When set, the shell does no slot
+    ; bookkeeping at all: find-voice-slot and brom-select-voice are skipped,
+    ; voice-state-fn and note-on-fn/note-off-fn are never called, and every note
+    ; event goes to note-event-fn as the host sent it. This is a different
+    ; question from custom-voice-slot, which only replaces the *ranking* while
+    ; the shell still owns the slots.
+    core-owned-voices: [logic!]
+    ; `on?` distinguishes note-on from note-off/note-end; `velocity` is
+    ; meaningless on a note-off and engines should ignore it there.
+    note-event-fn: [fn-ptr! [
+        :core [c-pointer!]
+        on? [logic!]
+        note-id [i32!]
+        channel [i32!]
+        key [i32!]
+        velocity [f64!]
+        return: [none!]
+    ]]
+
+    ; The engine renders two channels. output-fn keeps returning the left
+    ; buffer and output-right-fn returns the right; process-fn fills both. When
+    ; false the shell duplicates output-fn's mono buffer to every output
+    ; channel, which is what Kapralova and Loos rely on.
+    stereo-output: [logic!]
+    output-right-fn: [fn-ptr! [:core [c-pointer!] return: [c-pointer!]]]
+
+    ; The engine renders and parses its own parameter text. Brom needs no flag
+    ; for *units* -- a value crossing get/set-param-fn means whatever the
+    ; descriptor's param-range! says, so a plug-in reporting normalized 0..1
+    ; already works by declaring lo 0.0 / hi 1.0. What the shell cannot do is
+    ; display "-6.00 dB" for 0.635938, or read it back. Both directions are
+    ; here because supporting only one leaves a host's typed entry silently
+    ; writing a wrong value.
+    custom-param-text: [logic!]
+    param-text-fn: [fn-ptr! [
+        :core [c-pointer!]
+        id [u32!]
+        value [f64!]
+        out [c-pointer!]
+        capacity [u32!]
+        return: [logic!]
+    ]]
+    param-parse-fn: [fn-ptr! [
+        :core [c-pointer!]
+        id [u32!]
+        text [c-string!]
+        :out [c-pointer!]
+        return: [logic!]
+    ]]
+
+    ; --- factory presets -----------------------------------------------------
+    ; A plug-in's built-in patches, as preset text (see brom/plugin/preset).
+    ; The text rather than a struct of values, because the preset format is
+    ; already the plug-in-independent way to say "these parameters take these
+    ; values" -- a bank is a list of those, and needs no second representation.
+    ;
+    ; Appended at the end so descriptors written before this keep their field
+    ; offsets. A plug-in with no bank leaves factory-count at zero and the
+    ; fn-ptr! null, and every preset entry point reports an empty bank.
+    factory-count: [i32!]
+    factory-preset-fn: [fn-ptr! [
+        index [i32!]
+        return: [string!]
+    ]]
+
+    ; --- state identity -------------------------------------------------------
+    ; Pure data: which subsystem a binary state blob belongs to, that
+    ; subsystem's own schema-shape version, and whether its plain save is
+    ; ASCII preset text or the binary codec. codec.rcl and dispatch.rcl read
+    ; these; no plug-in writes save/load code against them directly.
+    ;
+    ; Appended at the end, like factory-count above, so existing descriptors
+    ; keep their field offsets. Every field defaults false/zero, so a
+    ; descriptor that ignores this block gets state-subsystem 0 and
+    ; state-save-ascii false -- a plug-in migrating onto the shared state
+    ; mechanism must set these explicitly.
+    state-subsystem: [u32!]
+    state-version: [u32!]
+    state-save-ascii: [logic!]
+    ; Whether this plug-in advertises CLAP's clap.state-context extension.
+    ; False withholds the extension entirely, the same way has-editor
+    ; withholds clap.gui.
+    has-state-context: [logic!]
+
+    ; Optional brom/plugin/effect descriptor. Null selects the existing synth
+    ; callbacks; an effect declares zero voices and supplies typed input/output
+    ; processing through this table. Append to preserve every existing offset.
+    effect-api: [c-pointer!]
+
+    ; Optional raw meter source, appended to preserve existing field offsets.
+    ; A false flag leaves the callback null and the shared service reports zero.
+    ; Called once immediately after EVERY rendered chunk, before any mailbox or
+    ; host transport coalescing. The callback fills a brom-meter-pair! and owns
+    ; only sample-peak measurement; Brom owns the envelope and publication.
+    has-meters: [logic!]
+    meter-source-fn: [fn-ptr! [
+        :core [c-pointer!]
+        :out [c-pointer!]
+        return: [logic!]
+    ]]
+]
+
+brom-select-voice: func [
+    "Pick the voice slot a new note should sound on, by Brom's shared stealing policy."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed opaque engine instance."
+    return: [i32!] "Slot in 0 .. max-voices-1, or -1 when the engine declares no voices."
+] [
+    count: make i32! engine/max-voices
+    if count <= 0 [return -1]
+
+    vs: make [#mutable brom-voice-state!] make brom-voice-state! [
+        active: false gate: false energy: 0.0 age: 0
+    ]
+
+    ; Tier 1 -- a silent voice. Free to take, so nothing else is considered.
+    repeat index count [
+        if engine/voice-state-fn :core index (addr-of vs) [
+            if not vs/active [return index]
+        ]
+    ]
+
+    ; Tier 2 -- the quietest voice whose key the player has already lifted,
+    ; oldest first on a tie. Cutting a voice that is fading out is far less
+    ; audible than cutting one that is still being held.
+    selected: make [#mutable i32!] -1
+    selected-energy: make [#mutable f64!] 0.0
+    selected-age: make [#mutable i64!] 0
+    repeat index count [
+        if engine/voice-state-fn :core index (addr-of vs) [
+            if not vs/gate [
+                if any [
+                    selected < 0
+                    vs/energy < selected-energy
+                    all [vs/energy = selected-energy vs/age < selected-age]
+                ] [
+                    selected: index
+                    selected-energy: vs/energy
+                    selected-age: vs/age
+                ]
+            ]
+        ]
+    ]
+    if selected >= 0 [return selected]
+
+    ; Tier 3 -- every key is still down, so there is no released voice to take
+    ; and something audible has to give: steal the oldest.
+    selected: 0
+    if engine/voice-state-fn :core 0 (addr-of vs) [selected-age: vs/age]
+    repeat index count [
+        if engine/voice-state-fn :core index (addr-of vs) [
+            if vs/age < selected-age [
+                selected: index
+                selected-age: vs/age
+            ]
+        ]
+    ]
+    return selected
+]
+
+engine-param-count: func [
+    "Number of parameters the engine exposes."
+    :engine [engine!] "Borrowed engine descriptor."
+    return: [i32!] "Parameter count; zero when the descriptor is empty."
+] [
+    return engine/param-count
+]
+
+engine-param-info: func [
+    "Fill `out` with the description of the parameter at `index`."
+    :engine [engine!] "Borrowed engine descriptor."
+    index [i32!] "Parameter index in 0 .. param-count-1."
+    :out [c-pointer!] "Borrowed address of a caller-owned param-info! to fill."
+    return: [logic!] "False when the index is out of range or unhandled."
+] [
+    if index < 0 [return false]
+    if index >= engine/param-count [return false]
+    if none? out [return false]
+    return engine/param-info-fn index :out
+]
+
+engine-set-param-normalized: func [
+    "Set a parameter from a normalized 0.0-1.0 value, applying the parameter's own taper. This is the entry point a host or an editor knob feeds, both of which speak normalized."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed opaque engine instance."
+    index [i32!] "Parameter index in 0 .. param-count-1."
+    normalized [f64!] "Position in 0.0-1.0."
+    return: [logic!] "False when the index is out of range."
+] [
+    info: make [#mutable param-info!] make param-info! [
+        id: 0 name: (as c-string! "") module: (as c-string! "") default-value: 0.0
+        range: make param-range! [
+            lo: 0.0 hi: 1.0 skew: 1.0 symmetric: 0 steps: 0 kind: 0
+        ]
+    ]
+    if not engine-param-info :engine index (addr-of info) [return false]
+    return engine/set-param-fn :core info/id (param-denormalize info/range normalized)
+]
+
+engine-get-param-normalized: func [
+    "Read a parameter back as a normalized 0.0-1.0 value, inverting the parameter's taper."
+    :engine [engine!] "Borrowed engine descriptor."
+    :core [c-pointer!] "Borrowed opaque engine instance."
+    index [i32!] "Parameter index in 0 .. param-count-1."
+    return: [f64!] "Position in 0.0-1.0; 0.0 when the index is out of range."
+] [
+    info: make [#mutable param-info!] make param-info! [
+        id: 0 name: (as c-string! "") module: (as c-string! "") default-value: 0.0
+        range: make param-range! [
+            lo: 0.0 hi: 1.0 skew: 1.0 symmetric: 0 steps: 0 kind: 0
+        ]
+    ]
+    if not engine-param-info :engine index (addr-of info) [return 0.0]
+    return param-normalize info/range (engine/get-param-fn :core info/id)
+]
+
+engine-observe-meter: func [
+    "Sample an optional engine source and reduce every rendered chunk in order."
+    :engine [engine!] "Borrowed engine descriptor; a missing meter source is optional."
+    :core [c-pointer!] "Borrowed opaque engine instance after rendering a chunk."
+    :meter [c-pointer!] "Borrowed per-instance Brom meter service, owned by the host shell."
+    now-ns [i64!] "Allocation-free CLOCK_MONOTONIC timestamp for this observation."
+    return: [none!] "No result."
+] [
+    if not engine/has-meters [
+        brom-meter-unavailable :meter now-ns
+        return none
+    ]
+    pair: make [#mutable brom-meter-pair!] [excitation: 0.0 output: 0.0]
+    either engine/meter-source-fn :core (addr-of pair) [
+        brom-meter-observe :meter pair/excitation pair/output now-ns
+    ] [
+        brom-meter-unavailable :meter now-ns
+    ]
+]

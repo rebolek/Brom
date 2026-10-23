@@ -1,0 +1,410 @@
+Recoil [
+    Title: "brom/plugin/engine vtable exercise"
+    Description: {
+        Builds a minimal two-parameter engine, fills an engine! descriptor with
+        pointers to its functions, and drives it only through that descriptor --
+        never by calling its functions directly. That is the property the whole
+        design rests on: if a shared CLAP shell can run a synth through this
+        table, it needs no knowledge of the synth.
+
+        The parameters deliberately use different tapers (an exponential cutoff
+        and a linear gain) so the normalized round-trip proves the shell applies
+        each parameter's own curve rather than one global assumption.
+    }
+    Type: module
+    Module: recoil-brom/test/engine-test
+    Imports: [
+        brom/plugin/engine [
+            engine! param-info! brom-voice-state!
+            engine-param-info engine-param-count brom-select-voice
+            engine-set-param-normalized engine-get-param-normalized
+        ]
+        brom/plugin/values [
+            param-range! param-linear param-exponential param-denormalize
+        ]
+    ]
+    Exports: []
+]
+
+check: func [
+    "Record one assertion as a PASS or FAIL line."
+    ok? [logic!] "Whether the assertion held."
+    return: [none!] "No value; the marker is written to stdout."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+near?: func [
+    "True when two values agree within an absolute tolerance."
+    a [f64!] "First value."
+    b [f64!] "Second value."
+    tol [f64!] "Absolute tolerance."
+    return: [logic!] "Whether |a - b| is below tol."
+] [
+    d: either (a - b) < 0.0 [b - a] [a - b]
+    return d < tol
+]
+
+; --- a minimal engine --------------------------------------------------------
+; Two parameters on different tapers, and just enough state to prove the opaque
+; core pointer survives the round trip through the descriptor.
+
+tone-core!: make c-struct! [
+    cutoff: [f64!]
+    gain: [f64!]
+    reset-count: [i32!]
+    frames-rendered: [i32!]
+    voice-active: [c-array! [logic! 2]]
+    voice-gate: [c-array! [logic! 2]]
+    voice-energy: [c-array! [f64! 2]]
+    voice-age: [c-array! [i64! 2]]
+]
+
+tone-create: func [
+    "Allocate a tone engine instance."
+    return: [c-pointer!] "Opaque engine state."
+] [
+    raw: make c-pointer! unsafe/malloc (as i32! size-of tone-core!)
+    core: make [#mutable tone-core!] as tone-core! raw
+    core/cutoff: 1000.0
+    core/gain: 0.5
+    core/reset-count: 0
+    core/frames-rendered: 0
+    repeat i 2 [
+        core/voice-active/:i: false
+        core/voice-gate/:i: false
+        core/voice-energy/:i: 0.0
+        core/voice-age/:i: 0
+    ]
+    return raw
+]
+
+tone-destroy: func [
+    "Release a tone engine instance."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [none!] "No value."
+] [
+    unsafe/free :core
+    return none
+]
+
+tone-activate: func [
+    "Prepare for playback at a given rate and block size."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    sample-rate [f64!] "Sample rate in Hz."
+    max-frames [i32!] "Largest block the host will ask for."
+    return: [logic!] "Whether activation succeeded."
+] [
+    unused core
+    unused sample-rate
+    unused max-frames
+    return true
+]
+
+tone-reset: func [
+    "Clear voice state, counting the call so the test can observe it."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [none!] "No value."
+] [
+    c: make [#mutable tone-core!] as tone-core! :core
+    c/reset-count: c/reset-count + 1
+    return none
+]
+
+tone-process: func [
+    "Render a block into the engine's own buffer, counting frames so the test can observe the call."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    frames [i32!] "Frames to render."
+    return: [none!] "No value."
+] [
+    c: make [#mutable tone-core!] as tone-core! :core
+    c/frames-rendered: c/frames-rendered + frames
+    return none
+]
+
+tone-output: func [
+    "Address of the engine's output buffer."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [c-pointer!] "Buffer the shell copies from; here the core itself, which is enough to prove the pointer survives the table."
+] [
+    return :core
+]
+
+tone-voice-state: func [
+    "Report one voice's state so Brom's shared policy can rank it."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Voice slot to describe."
+    out [c-pointer!] "Address of a caller-owned brom-voice-state!."
+    return: [logic!] "False when the slot is out of range."
+] [
+    if slot < 0 [return false]
+    if slot > 1 [return false]
+    c: make tone-core! as tone-core! :core
+    vs: make [#mutable brom-voice-state!] as brom-voice-state! out
+    vs/active: c/voice-active/:slot
+    vs/gate: c/voice-gate/:slot
+    vs/energy: c/voice-energy/:slot
+    vs/age: c/voice-age/:slot
+    return true
+]
+
+set-voice: func [
+    "Stage one voice's state, so the selection tiers can be driven from the test."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Voice slot to write."
+    active [logic!] "Whether the voice is still sounding."
+    gate [logic!] "Whether its key is still held."
+    energy [f64!] "Current amplitude."
+    age [i64!] "Note-on sequence number; lower is older."
+    return: [none!] "No value."
+] [
+    c: make [#mutable tone-core!] as tone-core! :core
+    c/voice-active/:slot: active
+    c/voice-gate/:slot: gate
+    c/voice-energy/:slot: energy
+    c/voice-age/:slot: age
+    return none
+]
+
+tone-note-on: func [
+    "Start a note on a given voice slot."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Voice slot the shell allocated."
+    key [i32!] "MIDI key."
+    velocity [f64!] "Normalized velocity."
+    return: [none!] "No value."
+] [
+    unused core
+    unused slot
+    unused key
+    unused velocity
+    return none
+]
+
+tone-note-off: func [
+    "Release the note sounding on a voice slot."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Voice slot to release."
+    return: [none!] "No value."
+] [
+    unused core
+    unused slot
+    return none
+]
+
+tone-param-info: func [
+    "Describe the parameter at `index`."
+    index [i32!] "Parameter index."
+    out [c-pointer!] "Address of a caller-owned param-info!."
+    return: [logic!] "False when the index is unknown."
+] [
+    info: make [#mutable param-info!] as param-info! out
+    if index = 0 [
+        r: param-exponential 20.0 20000.0
+        info/id: 0
+        info/name: as c-string! "Cutoff"
+        info/module: as c-string! "Filter"
+        info/default-value: 1000.0
+        info/range: r
+        return true
+    ]
+    if index = 1 [
+        r2: param-linear 0.0 1.0
+        info/id: 1
+        info/name: as c-string! "Gain"
+        info/module: as c-string! "Output"
+        info/default-value: 0.5
+        info/range: r2
+        return true
+    ]
+    return false
+]
+
+tone-get-param: func [
+    "Read a parameter in engineering units."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    id [u32!] "Parameter id."
+    return: [f64!] "Current value."
+] [
+    c: make tone-core! as tone-core! :core
+    if id = 0 [return c/cutoff]
+    if id = 1 [return c/gain]
+    return 0.0
+]
+
+tone-set-param: func [
+    "Write a parameter in engineering units."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    id [u32!] "Parameter id."
+    value [f64!] "New value."
+    return: [logic!] "Whether the id was known."
+] [
+    c: make [#mutable tone-core!] as tone-core! :core
+    if id = 0 [c/cutoff: value return true]
+    if id = 1 [c/gain: value return true]
+    return false
+]
+
+tone-save-state: func [
+    "Serialise engine state."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    out [c-pointer!] "Destination buffer."
+    capacity [i32!] "Bytes available."
+    return: [logic!] "Whether the blob was written."
+] [
+    if capacity < 16 [return false]
+    unsafe/memcpy out :core 16
+    return true
+]
+
+tone-load-state: func [
+    "Restore engine state."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    bytes [c-pointer!] "Source buffer."
+    length [i32!] "Bytes available."
+    return: [logic!] "Whether the state was accepted."
+] [
+    if length < 16 [return false]
+    unsafe/memcpy :core bytes 16
+    return true
+]
+
+; The descriptor is a plain data literal -- the shape this design exists for.
+tone-engine: make engine! [
+    id: (as c-string! "com.pokuston.tone")
+    name: (as c-string! "Tone")
+    vendor: (as c-string! "Pokuston")
+    version: (as c-string! "0.1.0")
+    description: (as c-string! "Two-parameter exercise engine")
+    param-count: 2
+    max-voices: 2
+    state-size: 16
+    output-capacity: 512
+    editor-width: 320
+    editor-height: 240
+    create-fn: :tone-create
+    destroy-fn: :tone-destroy
+    activate-fn: :tone-activate
+    reset-fn: :tone-reset
+    voice-state-fn: :tone-voice-state
+    custom-voice-slot: false
+    process-fn: :tone-process
+    output-fn: :tone-output
+    note-on-fn: :tone-note-on
+    note-off-fn: :tone-note-off
+    param-info-fn: :tone-param-info
+    get-param-fn: :tone-get-param
+    set-param-fn: :tone-set-param
+    save-state-fn: :tone-save-state
+    load-state-fn: :tone-load-state
+]
+
+; --- drive it only through the descriptor ------------------------------------
+
+check (engine-param-count :tone-engine) = 2
+
+inst: make c-pointer! tone-engine/create-fn
+check not none? inst
+
+; Lifecycle through the table.
+check tone-engine/activate-fn :inst 48000.0 512
+tone-engine/reset-fn :inst
+tone-engine/reset-fn :inst
+probe-core: make tone-core! as tone-core! :inst
+check probe-core/reset-count = 2
+
+; Parameter description.
+pi: make [#mutable param-info!] make param-info! [
+    id: 0 name: (as c-string! "") module: (as c-string! "") default-value: 0.0
+    range: make param-range! [lo: 0.0 hi: 1.0 skew: 1.0 symmetric: 0 steps: 0 kind: 0]
+]
+check engine-param-info :tone-engine 0 (addr-of pi)
+check pi/id = 0
+check near? pi/default-value 1000.0 0.000001
+check near? pi/range/lo 20.0 0.000001
+check near? pi/range/hi 20000.0 0.000001
+
+check engine-param-info :tone-engine 1 (addr-of pi)
+check near? pi/default-value 0.5 0.000001
+
+; Out-of-range indices are refused rather than trusted to the plug-in.
+check not engine-param-info :tone-engine 2 (addr-of pi)
+check not engine-param-info :tone-engine -1 (addr-of pi)
+
+; State identity fields default to zero/false.
+check tone-engine/state-subsystem = (as u32! 0)
+check tone-engine/state-version = (as u32! 0)
+check not tone-engine/state-save-ascii
+check not tone-engine/has-state-context
+
+; The taper is applied per parameter, not globally: mid-travel on the
+; exponential cutoff is the geometric mean, while the linear gain is its
+; arithmetic midpoint.
+check engine-set-param-normalized :tone-engine :inst 0 0.5
+check near? (tone-engine/get-param-fn :inst 0) 632.4555320336759 0.000001
+
+check engine-set-param-normalized :tone-engine :inst 1 0.5
+check near? (tone-engine/get-param-fn :inst 1) 0.5 0.000001
+
+; And it inverts.
+check near? (engine-get-param-normalized :tone-engine :inst 0) 0.5 0.000001
+check engine-set-param-normalized :tone-engine :inst 0 0.8
+check near? (engine-get-param-normalized :tone-engine :inst 0) 0.8 0.000001
+
+check not engine-set-param-normalized :tone-engine :inst 7 0.5
+check near? (engine-get-param-normalized :tone-engine :inst 7) 0.0 0.000001
+
+; The audio and voice slots of the table are reachable and carry their arguments.
+tone-engine/process-fn :inst 128
+tone-engine/process-fn :inst 64
+probe-after: make tone-core! as tone-core! :inst
+check probe-after/frames-rendered = 192
+check not none? (tone-engine/output-fn :inst)
+tone-engine/note-on-fn :inst 1 61 0.8
+tone-engine/note-off-fn :inst 1
+
+; Brom's shared stealing policy, driven through the descriptor. The engine only
+; reports facts about its voices; the ranking lives in brom-select-voice.
+
+; Tier 1 -- a silent voice is taken before anything is ranked.
+check (brom-select-voice :tone-engine :inst) = 0
+set-voice :inst 0 true true 0.9 1
+check (brom-select-voice :tone-engine :inst) = 1
+
+; Tier 2 -- with both sounding but neither key held, the quietest goes.
+set-voice :inst 0 true false 0.9 1
+set-voice :inst 1 true false 0.2 2
+check (brom-select-voice :tone-engine :inst) = 1
+set-voice :inst 1 true false 0.95 2
+check (brom-select-voice :tone-engine :inst) = 0
+
+; Tier 2 tie-break -- equal energy falls back to the oldest voice.
+set-voice :inst 0 true false 0.5 9
+set-voice :inst 1 true false 0.5 4
+check (brom-select-voice :tone-engine :inst) = 1
+
+; A held key outranks a quieter released one: releasing voices are cut first.
+set-voice :inst 0 true true 0.1 1
+set-voice :inst 1 true false 0.8 2
+check (brom-select-voice :tone-engine :inst) = 1
+
+; Tier 3 -- every key still down, so the oldest voice is stolen.
+set-voice :inst 0 true true 0.4 7
+set-voice :inst 1 true true 0.6 3
+check (brom-select-voice :tone-engine :inst) = 1
+set-voice :inst 0 true true 0.4 2
+set-voice :inst 1 true true 0.6 8
+check (brom-select-voice :tone-engine :inst) = 0
+
+; State round-trips through the opaque core.
+; A raw buffer, which is the shape a host actually hands the state calls.
+buf: make c-pointer! unsafe/malloc 32
+check tone-engine/save-state-fn :inst buf 32
+check engine-set-param-normalized :tone-engine :inst 1 0.25
+check tone-engine/load-state-fn :inst buf 16
+check near? (tone-engine/get-param-fn :inst 1) 0.5 0.000001
+unsafe/free buf
+
+tone-engine/destroy-fn :inst
+print "PASS"

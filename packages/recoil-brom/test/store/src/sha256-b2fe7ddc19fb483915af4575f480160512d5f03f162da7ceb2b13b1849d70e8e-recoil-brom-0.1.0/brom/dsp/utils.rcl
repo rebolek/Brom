@@ -1,0 +1,222 @@
+Recoil [
+    Title: "Brom DSP scalar helpers"
+    Description: {
+        The small numeric helpers every Brom instrument needs: range clamping,
+        magnitude, and the guard that keeps a feedback path finite.
+
+        These existed three times over before this module -- Kapralova had
+        clamp-f64 / absolute-f64 / finite-bounded, Loos had clamp-f64 /
+        sanitize-f64, and Mach's Rust core has its own utils.rs duplicating
+        brom-dsp-utils. Each lives once now.
+
+        brom-fast-exp is the odd one out: not a convenience but a deliberate
+        trade of accuracy for speed, and only correct to use where that trade
+        has been thought about.
+
+        Names carry a brom- prefix because an exported module function keeps its
+        name at C link time, and `clamp` or `abs` would collide with almost
+        anything.
+    }
+    Type: module
+    Module: brom/dsp/utils
+    Imports: []
+    Exports: [
+        BROM-DENORMAL-THRESHOLD
+        brom-clamp-f64 brom-clamp-i32 brom-abs-f64 brom-sanitize-f64
+        brom-fast-exp brom-fast-tanh brom-fast-tan
+        BROM-SOFT-CLIP-THRESHOLD brom-soft-clip
+    ]
+]
+
+utils-math: foreign <math.h> [
+    tanh: "tanh" [f64! return: [f64!]]
+]
+
+; Below this magnitude a value is flushed to zero. Denormals are not wrong, they
+; are slow: an IIR tail decaying into the denormal range can cost tens of times
+; a normal multiply on some hardware, and a filter that rings quietly forever
+; pays it on every sample.
+BROM-DENORMAL-THRESHOLD: 0.00000000000000000001
+
+brom-clamp-f64: func [
+    #inline
+    "Clamp a floating-point value to an inclusive range."
+    value [f64!] "Value to clamp."
+    low [f64!] "Lower bound."
+    high [f64!] "Upper bound."
+    return: [f64!] "Value, bounded to low..high."
+] [
+    if value < low [return low]
+    if value > high [return high]
+    return value
+]
+
+brom-clamp-i32: func [
+    #inline
+    "Clamp an integer to an inclusive range."
+    value [i32!] "Value to clamp."
+    low [i32!] "Lower bound."
+    high [i32!] "Upper bound."
+    return: [i32!] "Value, bounded to low..high."
+] [
+    if value < low [return low]
+    if value > high [return high]
+    return value
+]
+
+brom-abs-f64: func [
+    #inline
+    "Return the non-negative magnitude of a floating-point value."
+    value [f64!] "Value whose magnitude is wanted."
+    return: [f64!] "Absolute value."
+] [
+    return either value < 0.0 [0.0 - value] [value]
+]
+
+brom-sanitize-f64: func [
+    #inline
+    "Keep a feedback-path intermediate finite, bounded and denormal-free."
+    value [f64!] "Filter or resonator intermediate."
+    limit [f64!] "Absolute bound to hold the value inside."
+    return: [f64!] "Finite value in -limit..limit, with denormals flushed to zero."
+] [
+    ; NaN compares false against every bound, so it has to be caught first or it
+    ; propagates through the clamp untouched and poisons the whole feedback
+    ; path. Kapralova's finite-bounded tested for it and Loos' sanitize-f64 did
+    ; not; this is the stricter of the two.
+    if value <> value [return 0.0]
+    if value > limit [return limit]
+    if value < (0.0 - limit) [return 0.0 - limit]
+    if (brom-abs-f64 value) < BROM-DENORMAL-THRESHOLD [return 0.0]
+    return value
+]
+
+brom-fast-exp: func [
+    #inline
+    "Approximate e raised to a power, by constructing the result's bit pattern."
+    power [f64!] "Exponent; clamped to -87..88, the range a float can represent."
+    return: [f64!] "Approximate exp(power), within 3.94% relative error."
+] [
+    ; Schraudolph's method. A float already stores a power of two in its
+    ; exponent field, so writing a scaled, biased integer straight into those
+    ; bits gives 2^n for free and lets the mantissa interpolate between the
+    ; powers. The interpolation is linear where the true curve is not, which is
+    ; the whole of the error -- worst case 3.94% relative across -20..20, not
+    ; the 1.5% Mach's Rust core claims for the same constants. Measured against
+    ; libm, not quoted; fast-exp-test pins it from both sides.
+    ;
+    ; The bias is chosen to minimise error across the range rather than to be
+    ; exact anywhere, so even exp(0) comes back as 0.971008 rather than one.
+    ; Anything that needs a fixed point at zero needs a different function.
+    ;
+    ; That is far too coarse for anything a listener would hear directly. It is
+    ; fine for a harmonic level, where 3.7% is a third of a decibel on one
+    ; partial among dozens, and where the alternative is a libm call per entry
+    ; per table rebuild. Do not reach for it as a general exp.
+    ;
+    ; Deliberately computed at single precision, matching the reference bit for
+    ; bit: the two conversions cost less than the divergence would cost in
+    ; being unable to compare against it.
+    bounded: as f32! (brom-clamp-f64 power -87.0 88.0)
+    ; 12102203 is 2^23 / ln 2, so the multiply lands the exponent in place;
+    ; 1065353216 is the bias of 127 shifted into the exponent field; 486411
+    ; shifts the mantissa's linear ramp to minimise the resulting error.
+    ; Kept at single precision through the multiply as well as the write: doing
+    ; it wider rounds differently and moves the odd result by one ulp, which is
+    ; harmless in itself but costs the bit-for-bit comparison with the
+    ; reference implementation.
+    scale: make f32! 12102203.0
+    bias: make f32! 1065353216.0
+    correction: make f32! 486411.0
+    bits: as i32! ((bounded * scale) + bias - correction)
+    result: make [#mutable f32!] 0.0
+    unsafe/memcpy (addr-of result) (addr-of bits) 4
+    return as f64! result
+]
+
+brom-fast-tanh: func [
+    #inline
+    "Approximate the hyperbolic tangent, for soft saturation."
+    value [f64!] "Value to saturate; clamped to -3..3, where the curve already reaches its limit."
+    return: [f64!] "Approximate tanh(value), never outside -1..1."
+] [
+    ; Pade [3/3] approximant, (27x + x^3) / (27 + 9x^2).
+    ;
+    ; The clamp is THREE, and the number is load-bearing rather than a round
+    ; figure. This rational equals exactly one at x = 3 and its derivative there
+    ; is exactly zero, so clamping at that point saturates at precisely +/-1
+    ; with no kink -- value and slope both continuous across the join.
+    ;
+    ; It used to clamp at five, which put the function outside the range its own
+    ; docstring promised: the rational keeps CLIMBING past three, reaching 1.006
+    ; at four and 1.032 at five. A saturator that gains at high drive is the
+    ; opposite of a saturator, and any caller trusting the stated bound was
+    ; being told something false. Both resonant filter paths below feed it
+    ; arguments in that region routinely -- the Juno feedback term reaches about
+    ; four at full resonance.
+    ;
+    ; Accuracy, measured rather than assumed: peak error against real tanh is
+    ; 2.6% near x = 1.5, not the 0.1% previously claimed here, and it falls to
+    ; 0.5% by x = 3. That is fine for what this is -- a saturation SHAPE, where
+    ; the exact curve is inaudible and a kink or a fold-back is not -- but it is
+    ; not a substitute for tanh where the value itself matters.
+    bounded: as f32! (brom-clamp-f64 value -3.0 3.0)
+    squared: bounded * bounded
+    twenty-seven: make f32! 27.0
+    nine: make f32! 9.0
+    return as f64! ((bounded * (twenty-seven + squared)) / (twenty-seven + (nine * squared)))
+]
+
+brom-fast-tan: func [
+    #inline
+    "Approximate the tangent, for deriving a filter's frequency coefficient."
+    angle [f64!] "Angle in radians. Must stay below about 1.57; see below."
+    return: [f64!] "Approximate tan(angle)."
+] [
+    ; Pade [3/2] approximant, ~0.03% error for |x| < pi/4.
+    ;
+    ; It does NOT saturate outside its range, it DIVERGES: the denominator
+    ; 15 - 6x^2 reaches zero at x = 1.5811, and past that the sign flips. There
+    ; is deliberately no clamp -- a filter whose coefficient argument got that
+    ; large has a cutoff at or above Nyquist and is already wrong, and silently
+    ; returning a plausible number would hide that. Every caller in this module
+    ; bounds cutoff below Nyquist first, which keeps pi*f/sr under pi/2.
+    x: as f32! angle
+    squared: x * x
+    fifteen: make f32! 15.0
+    six: make f32! 6.0
+    return as f64! ((x * (fifteen - squared)) / (fifteen - (six * squared)))
+]
+
+; Where brom-soft-clip stops being a wire. Minus one decibel: high enough that
+; nothing an instrument is meant to produce ever reaches it, low enough to
+; leave the curve somewhere to bend.
+BROM-SOFT-CLIP-THRESHOLD: 0.8912509381337456
+
+brom-soft-clip: func [
+    "Pass a sample through unchanged below the threshold, and bend it toward unity above."
+    #inline
+    value [f64!] "Sample to limit."
+    return: [f64!] "value itself below the threshold; strictly inside -1..1 above it."
+] [
+    ; A safety net, not a tone control. Below the threshold this is the identity
+    ; -- not approximately, exactly -- so a mix that behaves is bit-for-bit the
+    ; mix that was handed in, and only what would have clipped is touched.
+    ;
+    ; Above it, the excess goes through a real tanh and is scaled back into the
+    ; gap between the threshold and one, which makes the curve continuous in
+    ; value AND in slope at the knee: the derivative there is sech(0)^2, which
+    ; is one, the same slope the identity had. A knee that matched in value but
+    ; not in slope would be audible as a rasp on every transient that touched it.
+    ;
+    ; brom-fast-tanh is deliberately NOT used here. It is bounded now, but it is
+    ; a saturation shape carrying up to 2.6% error, and the knee of a limiter is
+    ; the one place the value itself matters: the identity below the threshold
+    ; has slope exactly one, and only a real tanh meets it there exactly.
+    magnitude: brom-abs-f64 value
+    if magnitude <= BROM-SOFT-CLIP-THRESHOLD [return value]
+    headroom: 1.0 - BROM-SOFT-CLIP-THRESHOLD
+    limited: BROM-SOFT-CLIP-THRESHOLD +
+        (headroom * (utils-math/tanh ((magnitude - BROM-SOFT-CLIP-THRESHOLD) / headroom)))
+    return either value < 0.0 [0.0 - limited] [limited]
+]

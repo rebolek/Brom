@@ -1,0 +1,460 @@
+Recoil [
+    Title: "brom/dsp/convolver against direct convolution"
+    Description: {
+        The convolver splits a response over a direct head and four
+        partitioned levels with time-distributed work, so the failure modes are
+        an off-by-one-block at a level seam, a slot mix-up in a delay line, or
+        a crossover that leaves a level on the old set. Each shows up as a
+        mismatch against plain direct convolution, which is what this compares
+        with: every output of an impulse, and sampled outputs of noise through
+        a true-stereo response long enough to reach the top level.
+
+        Prints one PASS/FAIL line per check.
+    }
+    Type: module
+    Module: recoil-brom/test/convolver-test
+    Imports: [
+        brom/dsp/convolver [
+            BROM-CONV-HEAD
+            brom-conv-create brom-conv-destroy brom-conv-reset brom-conv-clear
+            brom-conv-process brom-conv-length brom-conv-busy
+            brom-conv-stage-begin brom-conv-stage-step brom-conv-staging
+            brom-conv-memory-bytes
+        ]
+    ]
+    Exports: []
+]
+
+cell!: make c-struct! [value: [f64!]]
+rng!: make struct! [state: u64!]
+
+check: func [
+    "Record one assertion as a PASS or FAIL line."
+    ok? [logic!] "Whether the assertion held."
+    label [string!] "What was checked, printed on failure."
+    return: [none!]
+] [
+    either ok? [print "PASS"] [print ["FAIL" label]]
+]
+
+peek: func [
+    #inline
+    "Read one f64 from a raw buffer."
+    :base [c-pointer!] "Borrowed buffer."
+    index [i32!] "Element index."
+    return: [f64!] "The element."
+] [
+    c: make [#mutable cell!] as cell! (base + (index * 8))
+    return c/value
+]
+
+poke: func [
+    #inline
+    "Write one f64 into a raw buffer."
+    :base [c-pointer!] "Borrowed buffer."
+    index [i32!] "Element index."
+    value [f64!] "Value to store."
+    return: [none!]
+] [
+    c: make [#mutable cell!] as cell! (base + (index * 8))
+    c/value: value
+]
+
+magnitude: func [
+    "Absolute value."
+    value [f64!] "Any value."
+    return: [f64!] "Its magnitude."
+] [
+    return either value < 0.0 [0.0 - value] [value]
+]
+
+alloc: func [
+    "Allocate and zero n f64."
+    n [i32!] "Element count."
+    return: [c-pointer!] "Owned buffer."
+] [
+    raw: make c-pointer! unsafe/malloc (n * 8)
+    unsafe/memset raw 0 (n * 8)
+    return raw
+]
+
+next-noise: func [
+    "xorshift64 noise in -1..1."
+    :rng [rng!] "Borrowed generator state."
+    return: [f64!] "Next value."
+] [
+    x0: rng/state
+    x1: x0 xor (x0 << 13)
+    x2: x1 xor (x1 >> 7)
+    x3: x2 xor (x2 << 17)
+    rng/state: x3
+    top: as i64! (x3 >> 11)
+    return ((as f64! top) / 4503599627370496.0) - 1.0
+]
+
+fill-response: func [
+    "Fill a path with decaying noise, so every level carries energy but the tail is quieter than the head."
+    :buf [c-pointer!] "Borrowed n f64."
+    n [i32!] "Taps."
+    seed [u64!] "Noise seed."
+    return: [none!]
+] [
+    rng: make [#mutable rng!] make rng! [state: seed]
+    repeat i n [
+        decay: 1.0 / (1.0 + ((as f64! i) / 4000.0))
+        poke :buf i ((next-noise :rng) * decay)
+    ]
+]
+
+stage-all: func [
+    "Stage a response and run staging to completion."
+    :conv [c-pointer!] "Borrowed convolver."
+    :ll [c-pointer!] "Borrowed L->L taps or null."
+    :lr [c-pointer!] "Borrowed L->R taps or null."
+    :rl [c-pointer!] "Borrowed R->L taps or null."
+    :rr [c-pointer!] "Borrowed R->R taps or null."
+    n [i32!] "Taps."
+    return: [logic!] "False when staging could not start."
+] [
+    if not brom-conv-stage-begin :conv :ll :lr :rl :rr n 1.0 [return false]
+    guard: make [#mutable i32!] 0
+    while [brom-conv-staging :conv] [
+        done: brom-conv-stage-step :conv 1000000
+        unused done
+        guard: guard + 1
+        if guard > 100000 [return false]
+    ]
+    return true
+]
+
+run-chunks: func [
+    "Process a buffer through the convolver in chunks of varying size."
+    :conv [c-pointer!] "Borrowed convolver."
+    :in-l [c-pointer!] "Borrowed left input."
+    :in-r [c-pointer!] "Borrowed right input."
+    :out-l [c-pointer!] "Borrowed left output."
+    :out-r [c-pointer!] "Borrowed right output."
+    n [i32!] "Total samples."
+    chunk [i32!] "Base chunk size; chunks cycle through chunk, chunk/2+1 and 2*chunk-1 to cross every alignment."
+    return: [none!]
+] [
+    done: make [#mutable i32!] 0
+    turn: make [#mutable i32!] 0
+    while [done < n] [
+        want: make [#mutable i32!] chunk
+        if (turn % 3) = 1 [want: (chunk / 2) + 1]
+        if (turn % 3) = 2 [want: (chunk * 2) - 1]
+        if (done + want) > n [want: n - done]
+        a: in-l + (done * 8)
+        b: in-r + (done * 8)
+        c: out-l + (done * 8)
+        d: out-r + (done * 8)
+        brom-conv-process :conv :a :b :c :d want
+        done: done + want
+        turn: turn + 1
+    ]
+]
+
+direct-at: func [
+    "Direct true-stereo convolution at one output index."
+    :in-l [c-pointer!] "Borrowed left input."
+    :in-r [c-pointer!] "Borrowed right input."
+    :h-a [c-pointer!] "Borrowed taps from left input to this output."
+    :h-b [c-pointer!] "Borrowed taps from right input to this output."
+    taps [i32!] "Response length."
+    t [i32!] "Output index."
+    return: [f64!] "y[t]."
+] [
+    acc: make [#mutable f64!] 0.0
+    limit: either t + 1 < taps [t + 1] [taps]
+    repeat k limit [
+        acc: acc + ((peek :h-a k) * (peek :in-l (t - k))) + ((peek :h-b k) * (peek :in-r (t - k)))
+    ]
+    return acc
+]
+
+; --- 1. An impulse returns the response, every sample, with zero latency ----
+
+impulse-check: func [
+    "Feed a unit impulse into the left input of a mono-path response and compare every output sample with the response."
+    return: [none!]
+] [
+    taps: 100000
+    conv: brom-conv-create 120000
+    h: alloc taps
+    fill-response :h taps 7
+    none-ptr: as c-pointer! 0
+    check (stage-all :conv :h :none-ptr :none-ptr :h taps) "impulse staging"
+    n: 110000
+    in-l: alloc n
+    in-r: alloc n
+    out-l: alloc n
+    out-r: alloc n
+    poke :in-l 0 1.0
+    run-chunks :conv :in-l :in-r :out-l :out-r n 256
+    worst: make [#mutable f64!] 0.0
+    worst-at: make [#mutable i32!] -1
+    repeat i n [
+        expected: either i < taps [peek :h i] [0.0]
+        d: magnitude ((peek :out-l i) - expected)
+        if d > worst [
+            worst: d
+            worst-at: i
+        ]
+        if (magnitude (peek :out-r i)) > worst [
+            worst: magnitude (peek :out-r i)
+            worst-at: i
+        ]
+    ]
+    if worst >= 0.000000001 [print ["impulse worst" worst "at" worst-at]]
+    check (worst < 0.000000001) "impulse equals response"
+    check ((peek :out-l 0) = (peek :h 0)) "zero latency"
+    brom-conv-destroy :conv
+]
+
+; --- 2. True-stereo noise against direct convolution, sampled ---------------
+
+stereo-check: func [
+    "Run noise through a four-path response reaching the top level, then compare sampled outputs with direct convolution."
+    return: [none!]
+] [
+    taps: 90000
+    conv: brom-conv-create taps
+    ll: alloc taps
+    lr: alloc taps
+    rl: alloc taps
+    rr: alloc taps
+    fill-response :ll taps 11
+    fill-response :lr taps 12
+    fill-response :rl taps 13
+    fill-response :rr taps 14
+    check (stage-all :conv :ll :lr :rl :rr taps) "stereo staging"
+    n: 140000
+    in-l: alloc n
+    in-r: alloc n
+    out-l: alloc n
+    out-r: alloc n
+    rng: make [#mutable rng!] make rng! [state: 99]
+    repeat i n [
+        poke :in-l i (next-noise :rng)
+        poke :in-r i (next-noise :rng)
+    ]
+    run-chunks :conv :in-l :in-r :out-l :out-r n 300
+    worst: make [#mutable f64!] 0.0
+    ; Sample across every seam and deep into the top level.
+    probes: make [vector! [i32! 16]] [0 1 127 128 129 2047 2048 2049 16383 16384 65535 65536 65537 90001 120000 139999]
+    repeat p 16 [
+        t: probes/:p
+        el: direct-at :in-l :in-r :ll :rl taps t
+        er: direct-at :in-l :in-r :lr :rr taps t
+        dl: magnitude ((peek :out-l t) - el)
+        dr: magnitude ((peek :out-r t) - er)
+        if dl > worst [worst: dl]
+        if dr > worst [worst: dr]
+    ]
+    if worst >= 0.00000001 [print ["stereo worst" worst]]
+    check (worst < 0.00000001) "true stereo equals direct convolution"
+    brom-conv-destroy :conv
+]
+
+; --- 3. Chunk size does not change a single bit -----------------------------
+
+chunk-check: func [
+    "Process the same noise with three different chunk patterns and require identical outputs."
+    return: [none!]
+] [
+    taps: 40000
+    ll: alloc taps
+    rr: alloc taps
+    fill-response :ll taps 21
+    fill-response :rr taps 22
+    none-ptr: as c-pointer! 0
+    n: 50000
+    in-l: alloc n
+    in-r: alloc n
+    rng: make [#mutable rng!] make rng! [state: 5]
+    repeat i n [
+        poke :in-l i (next-noise :rng)
+        poke :in-r i (next-noise :rng)
+    ]
+    a-l: alloc n
+    a-r: alloc n
+    b-l: alloc n
+    b-r: alloc n
+    conv-a: brom-conv-create taps
+    conv-b: brom-conv-create taps
+    staged-a: stage-all :conv-a :ll :none-ptr :none-ptr :rr taps
+    staged-b: stage-all :conv-b :ll :none-ptr :none-ptr :rr taps
+    run-chunks :conv-a :in-l :in-r :a-l :a-r n 1
+    run-chunks :conv-b :in-l :in-r :b-l :b-r n 777
+    same: make [#mutable logic!] all [staged-a staged-b]
+    repeat i n [
+        if (peek :a-l i) <> (peek :b-l i) [same: false]
+        if (peek :a-r i) <> (peek :b-r i) [same: false]
+    ]
+    check same "chunk size independent"
+    brom-conv-destroy :conv-a
+    brom-conv-destroy :conv-b
+]
+
+; --- 4. Crossover lands on the new response everywhere ----------------------
+
+crossover-check: func [
+    "Stage response A, run, stage B mid-stream, wait for the crossover, then require exact B convolution and a bounded transition."
+    return: [none!]
+] [
+    taps: 80000
+    conv: brom-conv-create taps
+    a: alloc taps
+    b: alloc taps
+    fill-response :a taps 31
+    fill-response :b taps 32
+    none-ptr: as c-pointer! 0
+    check (stage-all :conv :a :none-ptr :none-ptr :a taps) "crossover staging A"
+    n: 400000
+    in-l: alloc n
+    in-r: alloc n
+    out-l: alloc n
+    out-r: alloc n
+    rng: make [#mutable rng!] make rng! [state: 77]
+    repeat i n [
+        x: next-noise :rng
+        poke :in-l i x
+        poke :in-r i x
+    ]
+    first: 100000
+    run-chunks :conv :in-l :in-r :out-l :out-r first 512
+    check (stage-all :conv :b :none-ptr :none-ptr :b taps) "crossover staging B"
+    busy-start: brom-conv-busy :conv
+    ; Run in 512-sample blocks until the crossover finishes.
+    done: make [#mutable i32!] first
+    while [all [done < n brom-conv-busy :conv]] [
+        a1: in-l + (done * 8)
+        a2: in-r + (done * 8)
+        a3: out-l + (done * 8)
+        a4: out-r + (done * 8)
+        brom-conv-process :conv :a1 :a2 :a3 :a4 512
+        done: done + 512
+    ]
+    switched-at: done
+    check all [busy-start not brom-conv-busy :conv] "crossover completes"
+    check ((switched-at - first) <= 200000) "crossover within two top-level blocks"
+    rest-l: in-l + (done * 8)
+    rest-r: in-r + (done * 8)
+    rest-ol: out-l + (done * 8)
+    rest-or: out-r + (done * 8)
+    run-chunks :conv :rest-l :rest-r :rest-ol :rest-or (n - done) 333
+    worst: make [#mutable f64!] 0.0
+    silent-path: alloc taps
+    probes: make [vector! [i32! 6]] [0 1 1000 50000 100000 150000]
+    repeat p 6 [
+        t: switched-at + probes/:p
+        if t < n [
+            expected: direct-at :in-l :in-r :b :silent-path taps t
+            d: magnitude ((peek :out-l t) - expected)
+            if d > worst [worst: d]
+        ]
+    ]
+    if worst >= 0.00000001 [print ["crossover worst" worst]]
+    check (worst < 0.00000001) "after crossover equals B"
+    ; Through the transition no sample should exceed what either response
+    ; could produce: a level left on a stale buffer shows up as a spike.
+    peak-before: make [#mutable f64!] 0.0
+    repeat i 50000 [
+        v: magnitude (peek :out-l (first - 50000 + i))
+        if v > peak-before [peak-before: v]
+    ]
+    peak-during: make [#mutable f64!] 0.0
+    span: switched-at - first
+    repeat i span [
+        v2: magnitude (peek :out-l (first + i))
+        if v2 > peak-during [peak-during: v2]
+    ]
+    check (peak-during < (peak-before * 1.5)) "crossover has no spike"
+    brom-conv-destroy :conv
+]
+
+; --- 5. Reset silences, a short response skips idle levels ------------------
+
+short-check: func [
+    "A short response finishes its crossover quickly, and reset leaves no tail."
+    return: [none!]
+] [
+    conv: brom-conv-create 960000
+    ; 20 s at 48 kHz, true stereo, both partition sets: about 158 MB.
+    mb: (brom-conv-memory-bytes :conv) / 1048576
+    check (all [mb > 100 mb < 200]) "a 20 s true-stereo convolver stays under 200 MB"
+    taps: 1500
+    h: alloc taps
+    fill-response :h taps 41
+    none-ptr: as c-pointer! 0
+    check (stage-all :conv :h :none-ptr :none-ptr :h taps) "short staging"
+    n: 8192
+    in-l: alloc n
+    in-r: alloc n
+    out-l: alloc n
+    out-r: alloc n
+    poke :in-l 0 1.0
+    run-chunks :conv :in-l :in-r :out-l :out-r n 128
+    check (not brom-conv-busy :conv) "short response crosses over within 8192 samples"
+    check ((brom-conv-length :conv) = taps) "length reported"
+    brom-conv-reset :conv
+    zero-in: alloc n
+    run-chunks :conv :zero-in :zero-in :out-l :out-r n 128
+    silent: make [#mutable logic!] true
+    repeat i n [
+        if (peek :out-l i) <> 0.0 [silent: false]
+    ]
+    check silent "reset leaves no tail"
+    brom-conv-destroy :conv
+]
+
+clear-check: func [
+    "Clear abandons a crossover mid-way, and the next response is then heard at once and exactly."
+    return: [none!]
+] [
+    taps: 100000
+    conv: brom-conv-create 120000
+    a: alloc taps
+    b: alloc taps
+    c: alloc taps
+    fill-response :a taps 3
+    fill-response :b taps 5
+    fill-response :c taps 11
+    none-ptr: as c-pointer! 0
+    check (stage-all :conv :a :none-ptr :none-ptr :a taps) "clear: first staging"
+    n: 110000
+    in-l: alloc n
+    in-r: alloc n
+    out-l: alloc n
+    out-r: alloc n
+    poke :in-l 0 1.0
+    run-chunks :conv :in-l :in-r :out-l :out-r 5000 256
+    ; Leave a second response half crossed over, with input still ringing.
+    staged: stage-all :conv :b :none-ptr :none-ptr :b taps
+    unused staged
+    run-chunks :conv :in-l :in-r :out-l :out-r 3000 256
+    was-busy: brom-conv-busy :conv
+    brom-conv-clear :conv
+    check (all [was-busy not brom-conv-busy :conv (brom-conv-length :conv) = 0]) "clear abandons a crossover and forgets the response"
+    check (stage-all :conv :c :none-ptr :none-ptr :c taps) "clear: staging after clear"
+    check (not brom-conv-busy :conv) "a response staged after clear needs no crossover"
+    run-chunks :conv :in-l :in-r :out-l :out-r n 256
+    worst: make [#mutable f64!] 0.0
+    repeat i n [
+        expected: either i < taps [peek :c i] [0.0]
+        d: magnitude ((peek :out-l i) - expected)
+        if d > worst [worst: d]
+        if (magnitude (peek :out-r i)) > worst [worst: magnitude (peek :out-r i)]
+    ]
+    if worst >= 0.000000001 [print ["clear worst" worst]]
+    check (worst < 0.000000001) "after clear the impulse equals the new response alone"
+    brom-conv-destroy :conv
+]
+
+impulse-check
+stereo-check
+chunk-check
+crossover-check
+short-check
+clear-check

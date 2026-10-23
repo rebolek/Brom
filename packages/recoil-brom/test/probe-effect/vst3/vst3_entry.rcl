@@ -1,0 +1,15 @@
+Recoil [
+    Title: "Brom probe effect VST3 entry"
+    Description: {
+        The Recoil half of the probe's VST3 module: the probe's engine and
+        the effect shell interface the generic C++ shell calls, in one
+        translation unit.
+    }
+    Type: module
+    Module: recoil-brom/test/probe-effect/vst3/vst3_entry
+    Imports: [
+        brom/plugin/vst3/effect-shell []
+        recoil-brom/test/probe-effect/plugin []
+    ]
+    Exports: []
+]

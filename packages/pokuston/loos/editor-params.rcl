@@ -1,0 +1,28 @@
+Recoil [
+    Title: "Loos parameter ids"
+    Description: {
+        The one place Loos's parameter ordering is written down.
+
+        The editor names these ids in its layout block; the headless layout
+        check re-declares that block and must resolve the same names to the
+        same numbers, or it would confirm a layout nobody ships. Importing
+        the editor itself is not an option -- it carries a `foreign <loos.h>`
+        block and its whole body, neither of which a windowless check can
+        link. A module of nothing but an enum can be imported anywhere, for
+        the same reason editor-size.rcl can.
+    }
+    Type: module
+    Module: examples/pokuston/loos/editor-params
+    Exports: [Param!]
+]
+
+; Order is the ABI: these are the indices loos_get_parameter and
+; loos_parameter_default are called with, so a variant may only be appended --
+; except across a state-schema break, which is what removing the four filter
+; envelope stages was. Schema 2 renumbers, and loos-load-state refuses schema 1
+; rather than reading the old ids as though they still meant something.
+Param!: make enum! [
+    cutoff resonance env-amount
+    attack decay sustain release
+    lfo-rate lfo-cutoff-depth morph
+]

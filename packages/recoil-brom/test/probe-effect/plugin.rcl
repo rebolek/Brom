@@ -1,0 +1,530 @@
+Recoil [
+    Title: "Brom probe effect"
+    Description: {
+        A test effect for the shared plug-in shells, not a product. Its output
+        is the delayed main input plus PROBE-MARKER-GAIN times the sidechain,
+        so a fixture can check routing and sample conversion exactly, and its
+        parameters drive every latency and tail path of the effect ABI:
+
+          0 latency         0..64 samples, applied at once
+          1 staged latency  0..64 samples, applied by activate-fn; until then
+                            effect-latency-fn reports BROM-LATENCY-PENDING
+          2 tail            step 0..3, applied after PROBE-TAIL-DELAY-CALLS
+                            further process-slot calls (refused ones count)
+          3 tail now        step 0..3, applied at once
+          4 refuse          step 0..1; 1 makes the process slot return false
+          5 taper           0..100, skewed (100 * p^2 at normalized p), no
+                            effect on the sound: the process slot records the
+                            value it sees, so a fixture can check what a host's
+                            normalized value becomes in the engine
+
+        The tail steps are 0, 4800, 4294967294 (the largest finite tail) and
+        BROM-TAIL-INFINITE. Module-level observation storage records what the
+        last process-slot call was given, for the fixture to read back.
+    }
+    Type: module
+    Module: recoil-brom/test/probe-effect/plugin
+    Ffi: [c-string]
+    Imports: [
+        brom/plugin/engine [engine! param-info!]
+        brom/plugin/values [param-range! param-linear param-skewed param-stepped]
+        brom/plugin/effect [
+            brom-effect! BROM-EFFECT-MAGIC BROM-EFFECT-REVISION BROM-SAMPLE-F64
+            BROM-NO-BYPASS BROM-TAIL-INFINITE BROM-LATENCY-PENDING
+            BROM-EFFECT-VARIABLE-TAIL
+        ]
+        brom/dsp/audio [brom-audio-f64!]
+    ]
+    Exports: [
+        probe-brom-engine brom-engine-ptr
+        probe-create probe-destroy probe-activate probe-reset
+        probe-param-info probe-get-param probe-set-param
+        probe-process probe-midi probe-program probe-current-program
+        probe-latency probe-tail probe-deactivate
+    ]
+]
+
+PROBE-PARAM-COUNT: 6
+PROBE-MAX-LATENCY: 64.0
+; Two 64-sample delays in series fit one 128-sample ring per channel.
+PROBE-RING: 128
+PROBE-MARKER-GAIN: 0.5
+PROBE-TAIL-DELAY-CALLS: 2
+PROBE-STATE-SUBSYSTEM: as u32! 0#50524F42
+PROBE-STATE-VERSION: as u32! 1
+; BROM binary container: 20 header bytes plus one f64 per parameter.
+PROBE-STATE-BYTES: 68
+PROBE-TAPER-HIGH: 100.0
+PROBE-TAPER-SKEW: 0.5
+
+probe-core!: make c-struct! [
+    values: [c-array! [f64! 6]]
+    staged-applied: [i32!]
+    tail-applied: [u32!]
+    tail-target: [u32!]
+    tail-countdown: [i32!]
+    ring-pos: [i32!]
+    ring-left: [c-array! [f64! 128]]
+    ring-right: [c-array! [f64! 128]]
+]
+
+; What the last process-slot call received, read back through the exported
+; brom_probe_* accessors.
+probe-observation!: make c-struct! [
+    channels: [i32!]
+    sidechain-channels: [i32!]
+    process-calls: [u32!]
+    midi-calls: [u32!]
+    midi-message: [u32!]
+    midi-process-calls: [u32!]
+    program-calls: [u32!]
+    program-index: [u32!]
+    midi-latency: [f64!]
+    taper: [f64!]
+]
+
+probe-observed: make [#mutable probe-observation!] []
+
+probe-whole: func [
+    "Round a non-negative control value to whole samples or steps."
+    value [f64!] "Clamped engineering value."
+    return: [i32!] "Nearest integer."
+] [
+    return as i32! (value + 0.5)
+]
+
+probe-tail-for-step: func [
+    "Map a tail step to its sample count."
+    step [i32!] "Step 0..3."
+    return: [u32!] "Tail in samples, or BROM-TAIL-INFINITE for step 3."
+] [
+    if step <= 0 [return as u32! 0]
+    if step = 1 [return as u32! 4800]
+    if step = 2 [return make u32! 4294967294]
+    return BROM-TAIL-INFINITE
+]
+
+probe-param-high: func [
+    "Upper bound of a parameter."
+    id [u32!] "Parameter id."
+    return: [f64!] "Highest engineering value."
+] [
+    if id <= (as u32! 1) [return PROBE-MAX-LATENCY]
+    if id <= (as u32! 3) [return 3.0]
+    if id = (as u32! 5) [return PROBE-TAPER-HIGH]
+    return 1.0
+]
+
+probe-param-range: func [
+    "Host range of a parameter."
+    id [u32!] "Parameter id."
+    return: [param-range!] "Linear latency ranges, stepped tail and refuse ranges, a skewed taper range."
+] [
+    if id <= (as u32! 1) [return param-linear 0.0 PROBE-MAX-LATENCY]
+    if id <= (as u32! 3) [return param-stepped 0.0 3.0 4]
+    if id = (as u32! 5) [return param-skewed 0.0 PROBE-TAPER-HIGH PROBE-TAPER-SKEW]
+    return param-stepped 0.0 1.0 2
+]
+
+probe-param-name: func [
+    "Static host name of a parameter."
+    id [u32!] "Parameter id."
+    return: [c-string!] "Borrowed static name; empty for an unknown id."
+] [
+    if id = (as u32! 0) [return as c-string! "latency"]
+    if id = (as u32! 1) [return as c-string! "staged latency"]
+    if id = (as u32! 2) [return as c-string! "tail"]
+    if id = (as u32! 3) [return as c-string! "tail now"]
+    if id = (as u32! 4) [return as c-string! "refuse"]
+    if id = (as u32! 5) [return as c-string! "taper"]
+    return as c-string! ""
+]
+
+probe-clear-history: func [
+    "Silence both delay rings."
+    :core [c-pointer!] "Borrowed probe instance."
+    return: [none!] "No value."
+] [
+    state: make [#mutable probe-core!] as probe-core! :core
+    repeat i PROBE-RING [
+        state/ring-left/:i: 0.0
+        state/ring-right/:i: 0.0
+    ]
+    state/ring-pos: 0
+    return none
+]
+
+probe-create: func [
+    "Allocate a zeroed probe: every parameter at 0, no latency, no tail."
+    return: [c-pointer!] "Owned instance, released by probe-destroy; null on failure."
+] [
+    core: make c-pointer! unsafe/malloc (as i32! size-of probe-core!)
+    if none? core [return core]
+    unsafe/memset :core 0 (as i32! size-of probe-core!)
+    return core
+]
+
+probe-destroy: func [
+    "Release a probe instance."
+    :core [c-pointer!] "Borrowed instance; invalid after this call."
+    return: [none!] "No value."
+] [
+    if none? core [return none]
+    unsafe/free :core
+    return none
+]
+
+probe-activate: func [
+    "Apply the staged latency and clear the delay history."
+    :core [c-pointer!] "Borrowed probe instance."
+    sample-rate [f64!] "Host sample rate; unused."
+    max-frames [i32!] "Host block capacity; unused."
+    return: [logic!] "True for a live instance."
+] [
+    unused sample-rate
+    unused max-frames
+    if none? core [return false]
+    state: make [#mutable probe-core!] as probe-core! :core
+    state/staged-applied: probe-whole state/values/1
+    probe-clear-history :core
+    return true
+]
+
+probe-reset: func [
+    "Clear the delay history, keeping controls."
+    :core [c-pointer!] "Borrowed probe instance."
+    return: [none!] "No value."
+] [
+    if none? core [return none]
+    probe-clear-history :core
+    return none
+]
+
+probe-param-info: func [
+    "Describe one parameter."
+    index [i32!] "Zero-based parameter index."
+    :out [c-pointer!] "Borrowed param-info storage."
+    return: [logic!] "True when the storage was filled."
+] [
+    if any [none? out index < 0 index >= PROBE-PARAM-COUNT] [return false]
+    id: as u32! index
+    info: make [#mutable param-info!] as param-info! :out
+    info/id: id
+    info/name: probe-param-name id
+    info/module: as c-string! "Probe"
+    info/default-value: 0.0
+    info/range: probe-param-range id
+    return true
+]
+
+probe-get-param: func [
+    "Read a parameter in engineering units."
+    :core [c-pointer!] "Borrowed probe instance."
+    id [u32!] "Parameter id."
+    return: [f64!] "Stored value; zero for an unknown id."
+] [
+    if any [none? core id >= (as u32! PROBE-PARAM-COUNT)] [return 0.0]
+    state: make [#mutable probe-core!] as probe-core! :core
+    return state/values/(as i32! id)
+]
+
+probe-set-param: func [
+    "Store a clamped parameter and start whatever change it drives."
+    :core [c-pointer!] "Borrowed probe instance."
+    id [u32!] "Parameter id."
+    value [f64!] "Engineering value."
+    return: [logic!] "True when accepted; false for an unknown id or NaN."
+] [
+    if any [none? core id >= (as u32! PROBE-PARAM-COUNT)] [return false]
+    if value <> value [return false]
+    high: probe-param-high id
+    clamped: either value < 0.0 [0.0] [either value > high [high] [value]]
+    ; Latencies are whole samples and tail and refuse are steps, so they
+    ; store integers; the taper keeps the exact value it was given.
+    canonical: either id = (as u32! 5) [clamped] [as f64! (probe-whole clamped)]
+    state: make [#mutable probe-core!] as probe-core! :core
+    state/values/(as i32! id): canonical
+    step: probe-whole canonical
+    if id = (as u32! 2) [
+        state/tail-target: probe-tail-for-step step
+        state/tail-countdown: PROBE-TAIL-DELAY-CALLS
+    ]
+    if id = (as u32! 3) [
+        state/tail-applied: probe-tail-for-step step
+        state/tail-target: state/tail-applied
+        state/tail-countdown: 0
+    ]
+    return true
+]
+
+probe-process: func [
+    "Write delayed input plus the marker-scaled sidechain."
+    :core [c-pointer!] "Borrowed probe instance."
+    :input [brom-audio-f64!] "Main input; the right plane is zero for mono."
+    :sidechain [brom-audio-f64!] "Sidechain; zero planes where nothing was read."
+    :output [brom-audio-f64!] "Stereo output."
+    channels [i32!] "Main input planes the shell read."
+    sidechain-channels [i32!] "Sidechain planes the shell read."
+    frames [i32!] "Frames to render."
+    return: [logic!] "False when refuse is set, leaving output untouched."
+] [
+    probe-observed/channels: channels
+    probe-observed/sidechain-channels: sidechain-channels
+    probe-observed/process-calls: probe-observed/process-calls + (as u32! 1)
+    if none? core [return false]
+    state: make [#mutable probe-core!] as probe-core! :core
+    probe-observed/taper: state/values/5
+    ; A deferred tail change lands on the call that exhausts its countdown,
+    ; whether or not that call renders.
+    if state/tail-countdown > 0 [
+        state/tail-countdown: state/tail-countdown - 1
+        if state/tail-countdown = 0 [state/tail-applied: state/tail-target]
+    ]
+    if (probe-whole state/values/4) <> 0 [return false]
+    delay: (probe-whole state/values/0) + state/staged-applied
+    pos: make [#mutable i32!] state/ring-pos
+    repeat i frames [
+        tap: (pos + PROBE-RING - delay) % PROBE-RING
+        left-in: make f64! input/left/:i
+        right-in: make f64! input/right/:i
+        left-delayed: make f64! either delay > 0 [state/ring-left/:tap] [left-in]
+        right-delayed: make f64! either delay > 0 [state/ring-right/:tap] [right-in]
+        left-key: make f64! sidechain/left/:i
+        right-key: make f64! sidechain/right/:i
+        state/ring-left/:pos: left-in
+        state/ring-right/:pos: right-in
+        pos: (pos + 1) % PROBE-RING
+        output/left/:i: left-delayed + (PROBE-MARKER-GAIN * left-key)
+        output/right/:i: right-delayed + (PROBE-MARKER-GAIN * right-key)
+    ]
+    state/ring-pos: pos
+    return true
+]
+
+probe-midi: func [
+    "Record a MIDI message without acting on it."
+    :core [c-pointer!] "Borrowed probe instance."
+    status [u32!] "MIDI status byte."
+    data1 [u32!] "First data byte."
+    data2 [u32!] "Second data byte."
+    return: [logic!] "Always false."
+] [
+    ; What a fixture needs to see order and timing: the packed message, how
+    ; many process-slot calls preceded it, and the latency parameter it saw.
+    probe-observed/midi-calls: probe-observed/midi-calls + (as u32! 1)
+    probe-observed/midi-message: (status << 16) | (data1 << 8) | data2
+    probe-observed/midi-process-calls: probe-observed/process-calls
+    if not none? core [
+        state: make [#mutable probe-core!] as probe-core! :core
+        probe-observed/midi-latency: state/values/0
+    ]
+    return false
+]
+
+probe-program: func [
+    "Record a program change without acting on it."
+    :core [c-pointer!] "Borrowed probe instance."
+    index [u32!] "Program number."
+    return: [logic!] "Always false."
+] [
+    unused core
+    probe-observed/program-calls: probe-observed/program-calls + (as u32! 1)
+    probe-observed/program-index: index
+    return false
+]
+
+probe-current-program: func [
+    "Report that no program is selected."
+    :core [c-pointer!] "Borrowed probe instance."
+    return: [i32!] "Always minus one."
+] [
+    unused core
+    return -1
+]
+
+probe-latency: func [
+    "Report the applied latency, flagging a staged one that differs."
+    :core [c-pointer!] "Borrowed probe instance."
+    return: [u32!] "Applied samples, with BROM-LATENCY-PENDING while staged differs."
+] [
+    if none? core [return as u32! 0]
+    state: make [#mutable probe-core!] as probe-core! :core
+    applied: as u32! ((probe-whole state/values/0) + state/staged-applied)
+    pending: (probe-whole state/values/1) <> state/staged-applied
+    return either pending [applied | BROM-LATENCY-PENDING] [applied]
+]
+
+probe-tail: func [
+    "Report the applied tail."
+    :core [c-pointer!] "Borrowed probe instance."
+    return: [u32!] "Tail in samples, or BROM-TAIL-INFINITE."
+] [
+    if none? core [return as u32! 0]
+    state: make [#mutable probe-core!] as probe-core! :core
+    return state/tail-applied
+]
+
+probe-deactivate: func [
+    "Nothing to release."
+    :core [c-pointer!] "Borrowed probe instance."
+    return: [none!] "No value."
+] [
+    unused core
+    return none
+]
+
+probe-effect: make [#mutable brom-effect!] [
+    magic: BROM-EFFECT-MAGIC
+    revision: BROM-EFFECT-REVISION
+    category: (as c-string! "utility")
+    input-layouts: 3
+    sidechain-channels: 2
+    sample-format: BROM-SAMPLE-F64
+    bypass-param-id: BROM-NO-BYPASS
+    flags: BROM-EFFECT-VARIABLE-TAIL
+    effect-process-f64-fn: :probe-process
+    effect-midi-fn: :probe-midi
+    effect-program-fn: :probe-program
+    effect-current-program-fn: :probe-current-program
+    effect-latency-fn: :probe-latency
+    effect-tail-fn: :probe-tail
+    effect-deactivate-fn: :probe-deactivate
+]
+
+probe-brom-engine: make engine! [
+    id: (as c-string! "com.pokuston.brom-probe")
+    name: (as c-string! "BromProbe")
+    vendor: (as c-string! "Pokuston")
+    version: (as c-string! "0.1.0")
+    description: (as c-string! "Brom effect ABI test probe")
+    param-count: PROBE-PARAM-COUNT
+    max-voices: 0
+    state-size: PROBE-STATE-BYTES
+    output-capacity: 512
+    has-editor: false
+    create-fn: :probe-create
+    destroy-fn: :probe-destroy
+    activate-fn: :probe-activate
+    reset-fn: :probe-reset
+    param-info-fn: :probe-param-info
+    get-param-fn: :probe-get-param
+    set-param-fn: :probe-set-param
+    state-subsystem: PROBE-STATE-SUBSYSTEM
+    state-version: PROBE-STATE-VERSION
+    state-save-ascii: false
+    factory-count: 0
+    effect-api: (addr-of probe-effect)
+]
+
+#export [brom-engine-ptr]
+brom-engine-ptr: make c-pointer! addr-of probe-brom-engine
+
+brom-probe-set-sidechain-channels: func [
+    "Overwrite the table's sidechain width, so a fixture can read the mono sidechain port."
+    #export
+    value [u32!] "Sidechain channels to store."
+    return: [none!] "No value."
+] [
+    probe-effect/sidechain-channels: value
+    return none
+]
+
+brom-probe-set-magic: func [
+    "Overwrite the table's magic, so a fixture can make validation fail."
+    #export
+    value [u32!] "Magic to store."
+    return: [none!] "No value."
+] [
+    probe-effect/magic: value
+    return none
+]
+
+brom-probe-set-flags: func [
+    "Overwrite the table's flags, so a fixture can drive the fixed-tail and variable-tail paths."
+    #export
+    value [u32!] "Flags to store."
+    return: [none!] "No value."
+] [
+    probe-effect/flags: value
+    return none
+]
+
+brom-probe-observed-channels: func [
+    "Main input planes passed to the last process-slot call."
+    #export
+    return: [i32!] "Channels argument, zero before any call."
+] [
+    return probe-observed/channels
+]
+
+brom-probe-observed-sidechain-channels: func [
+    "Sidechain planes passed to the last process-slot call."
+    #export
+    return: [i32!] "Sidechain-channels argument, zero before any call."
+] [
+    return probe-observed/sidechain-channels
+]
+
+brom-probe-process-calls: func [
+    "Process-slot calls since the binary was loaded."
+    #export
+    return: [u32!] "Call count."
+] [
+    return probe-observed/process-calls
+]
+
+brom-probe-midi-calls: func [
+    "MIDI messages the effect-midi-fn slot received since the binary was loaded."
+    #export
+    return: [u32!] "Call count."
+] [
+    return probe-observed/midi-calls
+]
+
+brom-probe-last-midi: func [
+    "The last MIDI message, packed as status << 16 | data1 << 8 | data2."
+    #export
+    return: [u32!] "Packed message, zero before any call."
+] [
+    return probe-observed/midi-message
+]
+
+brom-probe-midi-process-calls: func [
+    "Process-slot calls made before the last MIDI message arrived."
+    #export
+    return: [u32!] "Process call count at the last MIDI message."
+] [
+    return probe-observed/midi-process-calls
+]
+
+brom-probe-midi-latency: func [
+    "The latency parameter the last MIDI message saw."
+    #export
+    return: [f64!] "Engineering value of parameter 0 at that call."
+] [
+    return probe-observed/midi-latency
+]
+
+brom-probe-program-calls: func [
+    "Program changes the effect-program-fn slot received since the binary was loaded."
+    #export
+    return: [u32!] "Call count."
+] [
+    return probe-observed/program-calls
+]
+
+brom-probe-last-program: func [
+    "The last program index effect-program-fn received."
+    #export
+    return: [u32!] "Program index, zero before any call."
+] [
+    return probe-observed/program-index
+]
+
+brom-probe-taper-value: func [
+    "The taper parameter the last process-slot call saw."
+    #export
+    return: [f64!] "Engineering value of parameter 5 at that call."
+] [
+    return probe-observed/taper
+]

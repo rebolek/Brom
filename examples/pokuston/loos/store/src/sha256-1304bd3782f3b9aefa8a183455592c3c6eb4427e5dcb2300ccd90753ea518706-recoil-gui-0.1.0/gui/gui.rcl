@@ -1,0 +1,760 @@
+Recoil [
+    Title: "Recoil unified GUI API"
+    Type: module
+    Module: gui/gui
+    Ffi: [c-string]
+    Imports: []
+    Exports: [
+        gui-rgb
+        gui-key-escape gui-key-enter gui-key-tab gui-key-backspace
+        gui-open-window gui-window-should-close? gui-close-window gui-set-target-fps gui-run-loop
+        gui-window-size gui-request-file gui-request-file-async gui-set-window-icon
+        gui-attach gui-detach gui-set-frame gui-tick
+        gui-context-attach gui-context-detach gui-context-tick
+        gui-context-begin-frame gui-context-end-frame gui-context-clear
+        gui-context-draw-rect gui-context-draw-rect-gradient-v gui-context-draw-line
+        gui-context-draw-circle gui-context-draw-arc gui-context-draw-text gui-context-measure-text
+        gui-context-image-create gui-context-image-width gui-context-image-height
+        gui-context-draw-image gui-context-draw-image-region gui-context-image-destroy
+        gui-context-mouse-pos gui-context-mouse-down? gui-context-mouse-pressed?
+        gui-context-mouse-released? gui-context-mouse-double-clicked? gui-context-shift-down?
+        gui-begin-frame gui-end-frame gui-clear
+        gui-draw-rect gui-draw-rect-gradient-v gui-draw-line gui-draw-text gui-draw-text-mono gui-measure-text
+        gui-draw-image
+        gui-mouse-pos gui-mouse-down? gui-mouse-pressed? gui-key-pressed? gui-char-pressed
+        gui-native-supported? gui-native-natural-size
+        gui-native-begin gui-native-face gui-native-end
+        gui-native-take-click gui-native-take-change gui-native-take-text
+        GUI-WINDING-CW GUI-WINDING-CCW
+        GUI-CAP-BUTT GUI-CAP-ROUND GUI-CAP-SQUARE
+        GUI-JOIN-MITER GUI-JOIN-ROUND GUI-JOIN-BEVEL
+        gui-path-supported? gui-path-begin gui-path-move-to gui-path-line-to
+        gui-path-bezier-to gui-path-quad-to gui-path-arc gui-path-rect
+        gui-path-rounded-rect gui-path-ellipse gui-path-close
+        gui-path-fill gui-path-stroke gui-path-fill-color gui-path-stroke-color
+        gui-path-stroke-width gui-path-line-cap gui-path-line-join
+        gui-path-save gui-path-restore gui-path-translate gui-path-rotate
+        gui-path-scale gui-path-scissor gui-path-reset-scissor gui-path-text
+    ]
+]
+
+gui-key-escape: 256
+gui-key-enter: 257
+gui-key-tab: 258
+gui-key-backspace: 259
+
+; The backend (recoil-gui-backend-*) provides these symbols; selected at install.
+g: foreign <recoil-gui.h> [
+    open-window*:   "rgui_open_window"          [i32! i32! c-string! return: [logic!]]
+    should-close*:  "rgui_window_should_close"  [return: [logic!]]
+    close-window*:  "rgui_close_window"         [return: [void!]]
+    set-fps*:       "rgui_set_target_fps"       [i32! return: [void!]]
+    run-loop*:      "rgui_run_loop"             [c-fn! [return: [none!]] return: [void!]]
+    window-width*:  "rgui_window_width"         [return: [i32!]]
+    window-height*: "rgui_window_height"        [return: [i32!]]
+    request-file*:  "rgui_request_file"         [c-string! c-string! return: [c-string!]]
+    request-file-async*: "rgui_request_file_async" [c-string! c-string! c-fn! [path [c-string!] return: [none!]] return: [void!]]
+    set-icon*:      "rgui_set_window_icon"      [c-string! return: [void!]]
+    attach*:        "rgui_attach"                [c-pointer! i32! i32! return: [logic!]]
+    detach*:        "rgui_detach"                [return: [void!]]
+    set-frame*:     "rgui_set_frame"             [c-fn! [return: [none!]] return: [void!]]
+    tick*:          "rgui_tick"                  [return: [void!]]
+    context-attach*: "rgui_context_attach"       [c-pointer! i32! i32! c-fn! [c-pointer! return: [none!]] c-pointer! return: [c-pointer!]]
+    context-detach*: "rgui_context_detach"       [c-pointer! return: [void!]]
+    context-tick*:   "rgui_context_tick"         [c-pointer! return: [void!]]
+    context-begin-frame*: "rgui_context_begin_frame" [c-pointer! return: [void!]]
+    context-end-frame*: "rgui_context_end_frame" [c-pointer! return: [void!]]
+    context-clear*:  "rgui_context_clear"        [c-pointer! u32! return: [void!]]
+    context-draw-rect*: "rgui_context_draw_rect" [c-pointer! i32! i32! i32! i32! u32! return: [void!]]
+    context-draw-grad-v*: "rgui_context_draw_rect_gradient_v" [c-pointer! i32! i32! i32! i32! u32! u32! return: [void!]]
+    context-draw-line*: "rgui_context_draw_line" [c-pointer! i32! i32! i32! i32! f32! u32! return: [void!]]
+    context-draw-circle*: "rgui_context_draw_circle" [c-pointer! i32! i32! i32! u32! return: [void!]]
+    context-draw-arc*: "rgui_context_draw_arc" [c-pointer! i32! i32! i32! f32! f32! f32! u32! return: [void!]]
+    context-draw-text*: "rgui_context_draw_text" [c-pointer! c-string! i32! i32! i32! u32! return: [void!]]
+    context-measure-text*: "rgui_context_measure_text" [c-pointer! c-string! i32! return: [i32!]]
+    context-image-create*: "rgui_context_image_create" [c-pointer! c-pointer! i32! return: [c-pointer!]]
+    image-width*: "rgui_image_width" [c-pointer! return: [i32!]]
+    image-height*: "rgui_image_height" [c-pointer! return: [i32!]]
+    context-draw-image*: "rgui_context_draw_image" [c-pointer! c-pointer! i32! i32! i32! i32! return: [logic!]]
+    context-draw-image-region*: "rgui_context_draw_image_region" [c-pointer! c-pointer! i32! i32! i32! i32! i32! i32! i32! i32! return: [logic!]]
+    context-image-destroy*: "rgui_context_image_destroy" [c-pointer! c-pointer! return: [void!]]
+    context-mouse-x*: "rgui_context_mouse_x" [c-pointer! return: [i32!]]
+    context-mouse-y*: "rgui_context_mouse_y" [c-pointer! return: [i32!]]
+    context-mouse-down*: "rgui_context_mouse_down" [c-pointer! i32! return: [logic!]]
+    context-mouse-pressed*: "rgui_context_mouse_pressed" [c-pointer! i32! return: [logic!]]
+    context-mouse-released*: "rgui_context_mouse_released" [c-pointer! i32! return: [logic!]]
+    context-mouse-double-clicked*: "rgui_context_mouse_double_clicked" [c-pointer! i32! return: [logic!]]
+    context-shift-down*: "rgui_context_shift_down" [c-pointer! return: [logic!]]
+    ; --- path contract (see docs/plans/backlog/draw-dialect.md) --------------
+    path-supported*: "rgui_path_supported" [c-pointer! return: [i32!]]
+    path-begin*: "rgui_path_begin" [c-pointer! return: [void!]]
+    path-move-to*: "rgui_path_move_to" [c-pointer! f32! f32! return: [void!]]
+    path-line-to*: "rgui_path_line_to" [c-pointer! f32! f32! return: [void!]]
+    path-bezier-to*: "rgui_path_bezier_to" [c-pointer! f32! f32! f32! f32! f32! f32! return: [void!]]
+    path-quad-to*: "rgui_path_quad_to" [c-pointer! f32! f32! f32! f32! return: [void!]]
+    path-arc*: "rgui_path_arc" [c-pointer! f32! f32! f32! f32! f32! i32! return: [void!]]
+    path-rect*: "rgui_path_rect" [c-pointer! f32! f32! f32! f32! return: [void!]]
+    path-rounded-rect*: "rgui_path_rounded_rect" [c-pointer! f32! f32! f32! f32! f32! return: [void!]]
+    path-ellipse*: "rgui_path_ellipse" [c-pointer! f32! f32! f32! f32! return: [void!]]
+    path-close*: "rgui_path_close" [c-pointer! return: [void!]]
+    path-fill*: "rgui_path_fill" [c-pointer! return: [void!]]
+    path-stroke*: "rgui_path_stroke" [c-pointer! return: [void!]]
+    path-fill-color*: "rgui_path_fill_color" [c-pointer! u32! return: [void!]]
+    path-stroke-color*: "rgui_path_stroke_color" [c-pointer! u32! return: [void!]]
+    path-stroke-width*: "rgui_path_stroke_width" [c-pointer! f32! return: [void!]]
+    path-line-cap*: "rgui_path_line_cap" [c-pointer! i32! return: [void!]]
+    path-line-join*: "rgui_path_line_join" [c-pointer! i32! return: [void!]]
+    path-save*: "rgui_path_save" [c-pointer! return: [void!]]
+    path-restore*: "rgui_path_restore" [c-pointer! return: [void!]]
+    path-translate*: "rgui_path_translate" [c-pointer! f32! f32! return: [void!]]
+    path-rotate*: "rgui_path_rotate" [c-pointer! f32! return: [void!]]
+    path-scale*: "rgui_path_scale" [c-pointer! f32! f32! return: [void!]]
+    path-scissor*: "rgui_path_scissor" [c-pointer! f32! f32! f32! f32! return: [void!]]
+    path-reset-scissor*: "rgui_path_reset_scissor" [c-pointer! return: [void!]]
+    path-text*: "rgui_path_text" [c-pointer! f32! f32! f32! c-string! return: [void!]]
+    begin-frame*:   "rgui_begin_frame"          [return: [void!]]
+    end-frame*:     "rgui_end_frame"            [return: [void!]]
+    clear*:         "rgui_clear"                [u32! return: [void!]]
+    draw-rect*:     "rgui_draw_rect"            [i32! i32! i32! i32! u32! return: [void!]]
+    draw-grad-v*:   "rgui_draw_rect_gradient_v" [i32! i32! i32! i32! u32! u32! return: [void!]]
+    draw-line*:     "rgui_draw_line"            [i32! i32! i32! i32! f32! u32! return: [void!]]
+    draw-text*:     "rgui_draw_text"            [c-string! i32! i32! i32! u32! return: [void!]]
+    draw-text-mono*: "rgui_draw_text_mono"      [c-string! i32! i32! i32! i32! u32! return: [void!]]
+    draw-image*:    "rgui_draw_image"           [c-pointer! i32! i32! i32! i32! i32! return: [void!]]
+    measure-text*:  "rgui_measure_text"         [c-string! i32! return: [i32!]]
+    mouse-x*:       "rgui_mouse_x"              [return: [i32!]]
+    mouse-y*:       "rgui_mouse_y"              [return: [i32!]]
+    mouse-down*:    "rgui_mouse_down"           [i32! return: [logic!]]
+    mouse-pressed*: "rgui_mouse_pressed"        [i32! return: [logic!]]
+    key-pressed*:   "rgui_key_pressed"          [i32! return: [logic!]]
+    char-pressed*:  "rgui_char_pressed"         [return: [i32!]]
+    native-supported*: "rgui_native_supported"  [return: [i32!]]
+    native-natural-size*: "rgui_native_natural_size" [i32! c-string! i32! i32! c-pointer! c-pointer! return: [void!]]
+    native-begin*:  "rgui_native_begin"         [return: [void!]]
+    native-face*:   "rgui_native_face"          [i32! i32! c-string! i32! i32! i32! i32! f64! c-string! return: [void!]]
+    native-end*:    "rgui_native_end"           [return: [void!]]
+    native-take-click*: "rgui_native_take_click" [c-pointer! return: [i32!]]
+    native-take-change*: "rgui_native_take_change" [c-pointer! c-pointer! return: [i32!]]
+    native-take-text*: "rgui_native_take_text"  [c-pointer! return: [c-string!]]
+]
+
+; Pack r,g,b,a (0..255) into a 0xRRGGBBAA u32 (i64 intermediate avoids i32 overflow).
+gui-rgb: func [
+    "Pack 8-bit r,g,b,a channels into a 0xRRGGBBAA u32 colour."
+    r [i32!] "Red channel (0..255)."
+    g [i32!] "Green channel (0..255)."
+    b [i32!] "Blue channel (0..255)."
+    a [i32!] "Alpha channel (0..255)."
+    return: [u32!] "Packed 0xRRGGBBAA colour."
+] [
+    v: make i64! (((as i64! r) * 16777216) + ((as i64! g) * 65536) + ((as i64! b) * 256) + (as i64! a))
+    return as u32! v
+]
+
+; --- lifecycle / loop ---
+gui-open-window: func [
+    "Open the application window; returns false if the backend could not create it."
+    w [i32!] "Window width in pixels."
+    h [i32!] "Window height in pixels."
+    :title [string!] "Borrowed window title."
+    return: [logic!] "True on success, false if the window failed to open."
+] [
+    return g/open-window* w h (as c-string! title/data)
+]
+gui-window-should-close?: func [
+    "True once the user has requested the window to close (close button / quit)."
+    return: [logic!]
+] [ return g/should-close* ]
+gui-close-window: func ["Destroy the window and release backend resources." return: [none!]] [ g/close-window* return none ]
+gui-set-target-fps: func [
+    "Cap the frame loop to `fps` frames per second."
+    fps [i32!] "Target frames per second (0 = uncapped)."
+    return: [none!]
+] [ g/set-fps* fps return none ]
+gui-run-loop: func [
+    "Drive `frame` once per vsync until the window closes (backend-owned loop)."
+    frame [c-fn! [return: [none!]]] "Per-frame callback invoked between begin/end."
+    return: [none!]
+] [ g/run-loop* frame return none ]
+gui-window-size: func [
+    "Return the current standalone window size in pixels."
+    return: [pair!] "Current backend window content size."
+] [
+    return make pair! [x: g/window-width* y: g/window-height*]
+]
+gui-request-file: func [
+    "Open a native file picker and return the selected path, or an empty string when cancelled/unsupported."
+    :title [string!] "Borrowed dialog title."
+    :filters [string!] "Borrowed backend-specific filter text; empty means all files."
+    return: [string!] "Selected path as a borrowed backend string copied into Recoil."
+] [
+    return as string! g/request-file* (as c-string! title/data) (as c-string! filters/data)
+]
+gui-request-file-async: func [
+    "Request a file path and invoke `handler` once the backend completes or cancels."
+    :title [string!] "Borrowed dialog title."
+    :filters [string!] "Borrowed backend-specific filter text."
+    handler [c-fn! [path [c-string!] return: [none!]]] "Completion callback receiving a backend-owned path or an empty path."
+    return: [none!] "No synchronous result; completion arrives through `handler`."
+] [
+    g/request-file-async* (as c-string! title/data) (as c-string! filters/data) handler
+    return none
+]
+gui-set-window-icon: func [
+    "Ask the backend to set the window icon; unsupported backends ignore the request."
+    :path [string!] "Borrowed filesystem path to an icon/image."
+    return: [none!]
+] [
+    g/set-icon* (as c-string! path/data)
+    return none
+]
+
+; --- embedded lifecycle ---
+gui-attach: func [
+    "Embed the GUI as a child view in a host-owned parent; returns false if the backend can't embed."
+    parent [c-pointer!] "Host-owned native parent view/window handle."
+    w [i32!] "Child view width in pixels."
+    h [i32!] "Child view height in pixels."
+    return: [logic!] "True on success, false if embedding failed or is unsupported."
+] [ return g/attach* parent w h ]
+gui-detach: func ["Tear down the embedded view and release backend resources." return: [none!]] [ g/detach* return none ]
+gui-set-frame: func [
+    "Register the per-frame callback that gui-tick drives (call before the first gui-tick)."
+    frame [c-fn! [return: [none!]]] "Per-frame callback invoked between begin/end."
+    return: [none!]
+] [ g/set-frame* frame return none ]
+gui-tick: func ["Pump host-driven events and render one frame in embedded mode." return: [none!]] [ g/tick* return none ]
+
+; --- handle-based embedded contexts ---
+gui-context-attach: func [
+    "Create an independently rendered child surface inside a host-owned native parent."
+    :parent [c-pointer!] "Borrowed native parent handle; the host must keep it alive until detach."
+    w [i32!] "Child surface width in pixels."
+    h [i32!] "Child surface height in pixels."
+    frame [c-fn! [user [c-pointer!] return: [none!]]] "C-ABI frame callback receiving the borrowed user pointer."
+    :user [c-pointer!] "Borrowed callback state kept alive by the caller until detach."
+    return: [c-pointer!] "Owned opaque context, or null if the backend cannot attach."
+] [
+    return g/context-attach* parent w h frame user
+]
+gui-context-detach: func [
+    "Destroy a child surface and consume its opaque context handle."
+    context [c-pointer!] "Owned context returned by gui-context-attach."
+    return: [none!]
+] [ g/context-detach* context return none ]
+gui-context-tick: func [
+    "Render one host-driven frame and clear transient input edges afterward."
+    :context [c-pointer!] "Borrowed live context."
+    return: [none!]
+] [ g/context-tick* context return none ]
+gui-context-begin-frame: func [
+    "Begin drawing to a host-parented child surface."
+    :context [c-pointer!] "Borrowed live context."
+    return: [none!]
+] [ g/context-begin-frame* context return none ]
+gui-context-end-frame: func [
+    "Finish drawing to a host-parented child surface."
+    :context [c-pointer!] "Borrowed live context."
+    return: [none!]
+] [ g/context-end-frame* context return none ]
+gui-context-clear: func [
+    "Clear a child surface to a solid colour."
+    :context [c-pointer!] "Borrowed live context."
+    rgba [u32!] "Packed 0xRRGGBBAA fill colour."
+    return: [none!]
+] [ g/context-clear* context rgba return none ]
+gui-context-draw-rect: func [
+    "Fill an axis-aligned rectangle in a child surface."
+    :context [c-pointer!] "Borrowed live context."
+    x [i32!] "Left edge in pixels." y [i32!] "Top edge in pixels."
+    w [i32!] "Width in pixels." h [i32!] "Height in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA fill colour."
+    return: [none!]
+] [ g/context-draw-rect* context x y w h rgba return none ]
+gui-context-draw-rect-gradient-v: func [
+    "Fill a child-surface rectangle with a vertical colour gradient."
+    :context [c-pointer!] "Borrowed live context."
+    x [i32!] "Left edge in pixels." y [i32!] "Top edge in pixels."
+    w [i32!] "Width in pixels." h [i32!] "Height in pixels."
+    top [u32!] "Packed colour at the top edge."
+    bottom [u32!] "Packed colour at the bottom edge."
+    return: [none!]
+] [ g/context-draw-grad-v* context x y w h top bottom return none ]
+gui-context-draw-line: func [
+    "Draw a line segment in a child surface."
+    :context [c-pointer!] "Borrowed live context."
+    x0 [i32!] "Start x in pixels." y0 [i32!] "Start y in pixels."
+    x1 [i32!] "End x in pixels." y1 [i32!] "End y in pixels."
+    thick [f32!] "Line thickness in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA line colour."
+    return: [none!]
+] [ g/context-draw-line* context x0 y0 x1 y1 thick rgba return none ]
+gui-context-draw-circle: func [
+    "Fill a circle in a child surface."
+    :context [c-pointer!] "Borrowed live context."
+    cx [i32!] "Centre x in pixels." cy [i32!] "Centre y in pixels."
+    radius [i32!] "Circle radius in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA fill colour."
+    return: [none!]
+] [ g/context-draw-circle* context cx cy radius rgba return none ]
+gui-context-draw-arc: func [
+    "Stroke an arc in a child surface."
+    :context [c-pointer!] "Borrowed live context."
+    cx [i32!] "Centre x in pixels." cy [i32!] "Centre y in pixels."
+    radius [i32!] "Arc radius in pixels."
+    start-radians [f32!] "Start angle in radians."
+    end-radians [f32!] "End angle in radians."
+    thick [f32!] "Stroke thickness in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA stroke colour."
+    return: [none!]
+] [ g/context-draw-arc* context cx cy radius start-radians end-radians thick rgba return none ]
+gui-context-draw-text: func [
+    "Draw text in a child surface using its default font."
+    :context [c-pointer!] "Borrowed live context."
+    :text [string!] "Borrowed UTF-8 text."
+    x [i32!] "Left x in pixels." y [i32!] "Top y in pixels."
+    size [i32!] "Font size in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA text colour."
+    return: [none!]
+] [ g/context-draw-text* context (as c-string! text/data) x y size rgba return none ]
+gui-context-measure-text: func [
+    "Measure text using a child surface's default font."
+    :context [c-pointer!] "Borrowed live context."
+    :text [string!] "Borrowed UTF-8 text."
+    size [i32!] "Font size in pixels."
+    return: [i32!] "Rendered width in pixels."
+] [ return g/context-measure-text* context (as c-string! text/data) size ]
+; PNG bytes are borrowed only during creation. The handle belongs to context
+; until explicitly destroyed or that context is detached.
+gui-context-image-create: func [
+    "Decode embedded PNG bytes once into a context-owned image; null on failure."
+    :context [c-pointer!] :png [c-pointer!] size [i32!]
+    return: [c-pointer!]
+] [ return g/context-image-create* context png size ]
+gui-context-image-width: func ["Image width, or zero for null." :image [c-pointer!] return: [i32!]] [ return g/image-width* image ]
+gui-context-image-height: func ["Image height, or zero for null." :image [c-pointer!] return: [i32!]] [ return g/image-height* image ]
+gui-context-draw-image: func [
+    "Draw a retained image during its context's frame; false on invalid input."
+    :context [c-pointer!] :image [c-pointer!]
+    x [i32!] y [i32!] width [i32!] height [i32!] return: [logic!]
+] [ return g/context-draw-image* context image x y width height ]
+gui-context-draw-image-region: func [
+    "Draw a source rectangle; false for invalid bounds or a different context."
+    :context [c-pointer!] :image [c-pointer!]
+    sx [i32!] sy [i32!] sw [i32!] sh [i32!]
+    x [i32!] y [i32!] width [i32!] height [i32!] return: [logic!]
+] [ return g/context-draw-image-region* context image sx sy sw sh x y width height ]
+gui-context-image-destroy: func [
+    "Release an image owned by context; null and a different owner are harmless."
+    :context [c-pointer!] image [c-pointer!] return: [none!]
+] [ g/context-image-destroy* context image return none ]
+
+gui-context-mouse-pos: func [
+    "Return the current pointer position relative to a child surface."
+    :context [c-pointer!] "Borrowed live context."
+    return: [pair!] "Current pointer coordinates in pixels."
+] [ return make pair! [x: g/context-mouse-x* context y: g/context-mouse-y* context] ]
+gui-context-mouse-down?: func [
+    "Return whether a child-surface mouse button is held."
+    :context [c-pointer!] "Borrowed live context."
+    button [i32!] "Mouse button index (0 = left)."
+    return: [logic!]
+] [ return g/context-mouse-down* context button ]
+gui-context-mouse-pressed?: func [
+    "Return whether a child-surface mouse button was pressed this tick."
+    :context [c-pointer!] "Borrowed live context."
+    button [i32!] "Mouse button index (0 = left)."
+    return: [logic!]
+] [ return g/context-mouse-pressed* context button ]
+gui-context-mouse-released?: func [
+    "Return whether a child-surface mouse button was released this tick."
+    :context [c-pointer!] "Borrowed live context."
+    button [i32!] "Mouse button index (0 = left)."
+    return: [logic!]
+] [ return g/context-mouse-released* context button ]
+gui-context-mouse-double-clicked?: func [
+    "Return whether a child-surface mouse button double-clicked this tick."
+    :context [c-pointer!] "Borrowed live context."
+    button [i32!] "Mouse button index (0 = left)."
+    return: [logic!]
+] [ return g/context-mouse-double-clicked* context button ]
+gui-context-shift-down?: func [
+    "Return whether Shift is held for the child surface's current input state."
+    :context [c-pointer!] "Borrowed live context."
+    return: [logic!]
+] [ return g/context-shift-down* context ]
+
+; --- drawing ---
+gui-begin-frame: func ["Begin a drawing frame; pair with gui-end-frame." return: [none!]] [ g/begin-frame* return none ]
+gui-end-frame: func ["End the drawing frame and present it to the screen." return: [none!]] [ g/end-frame* return none ]
+gui-clear: func [
+    "Clear the framebuffer to a solid colour."
+    rgba [u32!] "Packed 0xRRGGBBAA fill colour."
+    return: [none!]
+] [ g/clear* rgba return none ]
+gui-draw-rect: func [
+    "Fill an axis-aligned rectangle."
+    x [i32!] "Left edge in pixels." y [i32!] "Top edge in pixels."
+    w [i32!] "Width in pixels." h [i32!] "Height in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA fill colour."
+    return: [none!]
+] [
+    g/draw-rect* x y w h rgba return none
+]
+gui-draw-rect-gradient-v: func [
+    "Fill a rectangle with a vertical top-to-bottom colour gradient."
+    x [i32!] "Left edge in pixels." y [i32!] "Top edge in pixels."
+    w [i32!] "Width in pixels." h [i32!] "Height in pixels."
+    top [u32!] "Packed colour at the top edge."
+    bottom [u32!] "Packed colour at the bottom edge."
+    return: [none!]
+] [
+    g/draw-grad-v* x y w h top bottom return none
+]
+gui-draw-line: func [
+    "Draw a line segment of the given thickness."
+    x0 [i32!] "Start x in pixels." y0 [i32!] "Start y in pixels."
+    x1 [i32!] "End x in pixels." y1 [i32!] "End y in pixels."
+    thick [f32!] "Line thickness in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA line colour."
+    return: [none!]
+] [
+    g/draw-line* x0 y0 x1 y1 thick rgba return none
+]
+gui-draw-text: func [
+    "Draw a text string at (x,y) in the default font."
+    :text [string!] "Borrowed text to draw."
+    x [i32!] "Left baseline x in pixels." y [i32!] "Top y in pixels."
+    size [i32!] "Font size in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA text colour."
+    return: [none!]
+] [
+    g/draw-text* (as c-string! text/data) x y size rgba return none
+]
+gui-draw-text-mono: func [
+    "Draw text with a fixed per-character advance (monospace column layout)."
+    :text [string!] "Borrowed text to draw."
+    x [i32!] "Left x in pixels." y [i32!] "Top y in pixels."
+    size [i32!] "Font size in pixels."
+    cw [i32!] "Per-character cell advance in pixels."
+    rgba [u32!] "Packed 0xRRGGBBAA text colour."
+    return: [none!]
+] [
+    g/draw-text-mono* (as c-string! text/data) x y size cw rgba return none
+]
+gui-measure-text: func [
+    "Measure the pixel width `text` would occupy at `size`."
+    :text [string!] "Borrowed text to measure."
+    size [i32!] "Font size in pixels."
+    return: [i32!]
+] [
+    return g/measure-text* (as c-string! text/data) size
+]
+
+gui-draw-image: func [
+    "Blit a straight-alpha RGBA8 pixel buffer into a rectangle at (x,y)."
+    :pixels [vector! [u8!]] "Borrowed RGBA8 pixels, at least h rows of w*4 bytes."
+    x [i32!] "Left x in pixels." y [i32!] "Top y in pixels."
+    w [i32!] "Width in pixels." h [i32!] "Height in pixels."
+    return: [none!]
+] [
+    stride: make i32! (w * 4)
+    g/draw-image* pixels/data x y w h stride return none
+]
+
+; --- input ---
+; Rebol-side combination of the two native reads -- pair! isn't a primitive C
+; return type, so the mouse-x*/mouse-y* imports stay as-is in every backend.
+gui-mouse-pos: func [
+    "Current mouse position in window pixels."
+    return: [pair!]
+] [ return make pair! [x: g/mouse-x* y: g/mouse-y*] ]
+gui-mouse-down?: func [
+    "True while `button` is held down."
+    button [i32!] "Mouse button index (0 = left)."
+    return: [logic!]
+] [ return g/mouse-down* button ]
+gui-mouse-pressed?: func [
+    "True only on the frame `button` transitions to pressed."
+    button [i32!] "Mouse button index (0 = left)."
+    return: [logic!]
+] [ return g/mouse-pressed* button ]
+gui-key-pressed?: func [
+    "True only on the frame `key` transitions to pressed."
+    key [i32!] "Backend key code."
+    return: [logic!]
+] [ return g/key-pressed* key ]
+gui-char-pressed: func [
+    "Pop the next queued Unicode codepoint typed this frame, or 0 if none."
+    return: [i32!]
+] [ return g/char-pressed* ]
+
+; --- native widgets (optional capability; unsupported backends report none) ---
+
+; VID face kinds: fk-button=0, fk-slider=2, fk-field=3 map onto the backend
+; RGUI_NATIVE_* kinds (button=0, slider=1, field=2).
+gui-native-kind-button: 0
+gui-native-kind-slider: 1
+gui-native-kind-field: 2
+
+gui-native-supported?: func [
+    "True if the backend can render native widgets for `kind`."
+    kind [i32!] "RGUI native kind (gui-native-kind-*)."
+    return: [logic!]
+] [
+    mask: make i32! (1 << kind)
+    return (g/native-supported* and mask) <> 0
+]
+
+gui-native-natural-size: func [
+    "Ask the backend for the effective size a native control of `kind` will use."
+    kind [i32!] "RGUI native kind."
+    :label [string!] "Borrowed control label (empty for sliders)."
+    req-w [i32!] "Requested width (0 = unspecified)."
+    req-h [i32!] "Requested height (0 = unspecified)."
+    return: [pair!] "Effective size the widget will occupy."
+] [
+    ow: make [#mutable i32!] 0
+    oh: make [#mutable i32!] 0
+    g/native-natural-size* kind (as c-string! label/data) req-w req-h (addr-of ow) (addr-of oh)
+    return make pair! [x: ow y: oh]
+]
+
+gui-native-begin: func [
+    "Begin a per-frame native-widget reconciliation pass."
+    return: [none!]
+] [ g/native-begin* return none ]
+
+gui-native-face: func [
+    "Create or update the native control for face index `idx`."
+    idx [i32!] "Face index (matches the VID face array position)."
+    kind [i32!] "RGUI native kind."
+    :label [string!] "Borrowed control label."
+    x [i32!] y [i32!] w [i32!] h [i32!] "Face rectangle."
+    value [f64!] "Normalized slider position in 0.0..1.0; unused otherwise."
+    :text [string!] "Borrowed field text; unused otherwise."
+    return: [none!]
+] [
+    g/native-face* idx kind (as c-string! label/data) x y w h value (as c-string! text/data)
+    return none
+]
+
+gui-native-end: func [
+    "Finish a reconciliation pass; destroy controls not synced this frame."
+    return: [none!]
+] [ g/native-end* return none ]
+
+gui-native-take-click: func [
+    "Pop the next queued native button click; false when drained."
+    idx-ptr [c-pointer!] "Out-param address for the face index."
+    return: [logic!] "True if a click was returned."
+] [ return (g/native-take-click* idx-ptr) <> 0 ]
+
+gui-native-take-change: func [
+    "Pop the next queued native slider value change; false when drained."
+    idx-ptr [c-pointer!] "Out-param address for the face index."
+    value-ptr [c-pointer!] "Out-param address for the normalized 0.0..1.0 value."
+    return: [logic!] "True if a change was returned."
+] [ return (g/native-take-change* idx-ptr value-ptr) <> 0 ]
+
+gui-native-take-text: func [
+    "Pop the next queued native field text change; empty and idx -1 when drained."
+    idx-ptr [c-pointer!] "Out-param address for the face index."
+    return: [string!] "Copied field text (empty when drained)."
+] [ return as string! g/native-take-text* idx-ptr ]
+
+; --- path contract ----------------------------------------------------------
+;
+; Build a path, then fill or stroke it with the current paint. The
+; gui-context-draw-* calls above take a colour per shape, which is why each new
+; shape there costs one implementation in every backend; these do not, so a
+; shape is sugar written once above this layer. See
+; docs/plans/backlog/draw-dialect.md.
+;
+; Coordinates are f32! throughout: once a transform is in play, integer pixels
+; are the wrong unit.
+
+GUI-WINDING-CW: 0
+GUI-WINDING-CCW: 1
+GUI-CAP-BUTT: 0
+GUI-CAP-ROUND: 1
+GUI-CAP-SQUARE: 2
+GUI-JOIN-MITER: 0
+GUI-JOIN-ROUND: 1
+GUI-JOIN-BEVEL: 2
+
+gui-path-supported?: func [
+    "True when this backend implements the path contract; false leaves Draw with nothing to draw on."
+    :context [c-pointer!] "Borrowed live context."
+    return: [logic!]
+] [ return (g/path-supported* context) <> 0 ]
+
+gui-path-begin: func [
+    "Start a new path, discarding any path under construction."
+    :context [c-pointer!] "Borrowed live context." return: [none!]
+] [ g/path-begin* context return none ]
+
+gui-path-move-to: func [
+    "Move the pen without drawing, starting a new sub-path."
+    :context [c-pointer!] "Borrowed live context."
+    x [f32!] "Destination x." y [f32!] "Destination y."
+    return: [none!]
+] [ g/path-move-to* context x y return none ]
+
+gui-path-line-to: func [
+    "Add a straight segment from the current point."
+    :context [c-pointer!] "Borrowed live context."
+    x [f32!] "Destination x." y [f32!] "Destination y."
+    return: [none!]
+] [ g/path-line-to* context x y return none ]
+
+gui-path-bezier-to: func [
+    "Add a cubic bezier from the current point."
+    :context [c-pointer!] "Borrowed live context."
+    c1x [f32!] "First control x." c1y [f32!] "First control y."
+    c2x [f32!] "Second control x." c2y [f32!] "Second control y."
+    x [f32!] "Destination x." y [f32!] "Destination y."
+    return: [none!]
+] [ g/path-bezier-to* context c1x c1y c2x c2y x y return none ]
+
+gui-path-quad-to: func [
+    "Add a quadratic bezier from the current point."
+    :context [c-pointer!] "Borrowed live context."
+    cx [f32!] "Control x." cy [f32!] "Control y."
+    x [f32!] "Destination x." y [f32!] "Destination y."
+    return: [none!]
+] [ g/path-quad-to* context cx cy x y return none ]
+
+gui-path-arc: func [
+    "Add an arc, joined to the current point by a line when one exists."
+    :context [c-pointer!] "Borrowed live context."
+    cx [f32!] "Centre x." cy [f32!] "Centre y." radius [f32!] "Radius."
+    start-radians [f32!] "Start angle." end-radians [f32!] "End angle."
+    winding [i32!] "GUI-WINDING-CW or GUI-WINDING-CCW."
+    return: [none!]
+] [ g/path-arc* context cx cy radius start-radians end-radians winding return none ]
+
+gui-path-rect: func [
+    "Add a rectangle as a closed sub-path."
+    :context [c-pointer!] "Borrowed live context."
+    x [f32!] "Left." y [f32!] "Top." w [f32!] "Width." h [f32!] "Height."
+    return: [none!]
+] [ g/path-rect* context x y w h return none ]
+
+gui-path-rounded-rect: func [
+    "Add a rectangle with rounded corners as a closed sub-path."
+    :context [c-pointer!] "Borrowed live context."
+    x [f32!] "Left." y [f32!] "Top." w [f32!] "Width." h [f32!] "Height."
+    radius [f32!] "Corner radius."
+    return: [none!]
+] [ g/path-rounded-rect* context x y w h radius return none ]
+
+gui-path-ellipse: func [
+    "Add an ellipse as a closed sub-path."
+    :context [c-pointer!] "Borrowed live context."
+    cx [f32!] "Centre x." cy [f32!] "Centre y."
+    rx [f32!] "Radius on x." ry [f32!] "Radius on y."
+    return: [none!]
+] [ g/path-ellipse* context cx cy rx ry return none ]
+
+gui-path-close: func [
+    "Close the current sub-path back to its first point."
+    :context [c-pointer!] "Borrowed live context." return: [none!]
+] [ g/path-close* context return none ]
+
+gui-path-fill: func [
+    "Fill the current path with the current fill colour."
+    :context [c-pointer!] "Borrowed live context." return: [none!]
+] [ g/path-fill* context return none ]
+
+gui-path-stroke: func [
+    "Stroke the current path with the current stroke colour and width."
+    :context [c-pointer!] "Borrowed live context." return: [none!]
+] [ g/path-stroke* context return none ]
+
+gui-path-fill-color: func [
+    "Set the fill colour used by subsequent fills."
+    :context [c-pointer!] "Borrowed live context."
+    rgba [u32!] "Packed 0xRRGGBBAA."
+    return: [none!]
+] [ g/path-fill-color* context rgba return none ]
+
+gui-path-stroke-color: func [
+    "Set the stroke colour used by subsequent strokes."
+    :context [c-pointer!] "Borrowed live context."
+    rgba [u32!] "Packed 0xRRGGBBAA."
+    return: [none!]
+] [ g/path-stroke-color* context rgba return none ]
+
+gui-path-stroke-width: func [
+    "Set the stroke width in pixels."
+    :context [c-pointer!] "Borrowed live context."
+    width [f32!] "Width in pixels."
+    return: [none!]
+] [ g/path-stroke-width* context width return none ]
+
+gui-path-line-cap: func [
+    "Set how stroked ends are capped."
+    :context [c-pointer!] "Borrowed live context."
+    cap [i32!] "GUI-CAP-BUTT, GUI-CAP-ROUND or GUI-CAP-SQUARE."
+    return: [none!]
+] [ g/path-line-cap* context cap return none ]
+
+gui-path-line-join: func [
+    "Set how stroked corners are joined."
+    :context [c-pointer!] "Borrowed live context."
+    join [i32!] "GUI-JOIN-MITER, GUI-JOIN-ROUND or GUI-JOIN-BEVEL."
+    return: [none!]
+] [ g/path-line-join* context join return none ]
+
+gui-path-save: func [
+    "Push paint, transform and clip onto the state stack."
+    :context [c-pointer!] "Borrowed live context." return: [none!]
+] [ g/path-save* context return none ]
+
+gui-path-restore: func [
+    "Pop the state stack, undoing transforms and clips made since the matching save."
+    :context [c-pointer!] "Borrowed live context." return: [none!]
+] [ g/path-restore* context return none ]
+
+gui-path-translate: func [
+    "Shift the coordinate system."
+    :context [c-pointer!] "Borrowed live context."
+    x [f32!] "Shift on x." y [f32!] "Shift on y."
+    return: [none!]
+] [ g/path-translate* context x y return none ]
+
+gui-path-rotate: func [
+    "Rotate the coordinate system about its origin."
+    :context [c-pointer!] "Borrowed live context."
+    radians [f32!] "Angle in radians."
+    return: [none!]
+] [ g/path-rotate* context radians return none ]
+
+gui-path-scale: func [
+    "Scale the coordinate system."
+    :context [c-pointer!] "Borrowed live context."
+    x [f32!] "Factor on x." y [f32!] "Factor on y."
+    return: [none!]
+] [ g/path-scale* context x y return none ]
+
+gui-path-scissor: func [
+    "Narrow the clip region to a rectangle, intersected with whatever is already clipped."
+    :context [c-pointer!] "Borrowed live context."
+    x [f32!] "Left." y [f32!] "Top." w [f32!] "Width." h [f32!] "Height."
+    return: [none!]
+] [ g/path-scissor* context x y w h return none ]
+
+gui-path-reset-scissor: func [
+    "Drop all clipping."
+    :context [c-pointer!] "Borrowed live context." return: [none!]
+] [ g/path-reset-scissor* context return none ]
+
+gui-path-text: func [
+    "Draw text with the current fill colour, so fill-pen governs it as it governs a filled shape."
+    :context [c-pointer!] "Borrowed live context."
+    x [f32!] "Left edge." y [f32!] "Top of the line."
+    size [f32!] "Point size."
+    :text [string!] "Borrowed text to draw."
+    return: [none!]
+] [ g/path-text* context x y size (as c-string! text/data) return none ]

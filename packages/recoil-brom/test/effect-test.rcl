@@ -1,0 +1,410 @@
+Recoil [
+    Title: "Brom optional effect contract"
+    Type: module
+    Module: recoil-brom/test/effect-test
+    Imports: [
+        brom/plugin/engine [engine! brom-select-voice]
+        brom/plugin/effect [
+            brom-effect! brom-effect-valid?
+            BROM-EFFECT-MAGIC BROM-EFFECT-REVISION BROM-SAMPLE-F32 BROM-SAMPLE-F64
+            BROM-NO-BYPASS BROM-TAIL-INFINITE BROM-LATENCY-PENDING
+            BROM-EFFECT-VARIABLE-TAIL
+        ]
+        brom/dsp/audio [brom-audio-f32! brom-audio-f64!]
+    ]
+    Exports: []
+]
+
+check: func [
+    "Report an unmet contract assertion."
+    ok? [logic!] "Expected observable condition."
+    return: [none!] "No value."
+] [
+    if not ok? [print "FAIL"]
+    return none
+]
+
+pass-state!: make c-struct! [active: [logic!] program: [i32!] midi: [u32!]]
+
+pass-create: func [
+    "Allocate a tiny effect instance."
+    return: [c-pointer!] "Owned instance released by pass-destroy."
+] [
+    raw: make c-pointer! unsafe/malloc (as i32! size-of pass-state!)
+    if not none? raw [unsafe/memset raw 0 (as i32! size-of pass-state!)]
+    return raw
+]
+
+pass-destroy: func [
+    "Release the tiny effect instance."
+    :core [c-pointer!] "Borrowed opaque instance."
+    return: [none!] "No value."
+] [unsafe/free :core return none]
+
+pass-activate: func [
+    "Activate only for the test's supported sample rate."
+    :core [c-pointer!] "Borrowed opaque instance."
+    rate [f64!] "Sample rate in Hz."
+    frames [i32!] "Maximum block frames."
+    return: [logic!] "False for unsupported activation."
+] [
+    state: make [#mutable pass-state!] as pass-state! :core
+    state/active: all [rate = 48000.0 frames > 0 frames <= 512]
+    return state/active
+]
+
+pass-deactivate: func [
+    "Stop processing and reset the instance."
+    :core [c-pointer!] "Borrowed opaque instance."
+    return: [none!] "No value."
+] [
+    state: make [#mutable pass-state!] as pass-state! :core
+    state/active: false
+    return none
+]
+
+pass-process: func [
+    "Copy typed f32 planes while active."
+    :core [c-pointer!] "Borrowed opaque instance."
+    :input [brom-audio-f32!] "Borrowed source planes."
+    :sidechain [brom-audio-f32!] "Borrowed sidechain planes, ignored."
+    :output [brom-audio-f32!] "Borrowed destination planes."
+    channels [i32!] "One or two source planes."
+    sidechain-channels [i32!] "Sidechain planes read, ignored."
+    frames [i32!] "Number of samples to copy."
+    return: [logic!] "True when the block was copied."
+] [
+    unused sidechain
+    unused sidechain-channels
+    state: make [#mutable pass-state!] as pass-state! :core
+    if not state/active [return false]
+    repeat frame frames [
+        output/left/:frame: input/left/:frame
+        output/right/:frame: either channels = 1 [input/left/:frame] [input/right/:frame]
+    ]
+    return true
+]
+
+pass-process-f64: func [
+    "Copy typed f64 planes while active."
+    :core [c-pointer!] "Borrowed opaque instance."
+    :input [brom-audio-f64!] "Borrowed source planes."
+    :sidechain [brom-audio-f64!] "Borrowed sidechain planes, ignored."
+    :output [brom-audio-f64!] "Borrowed destination planes."
+    channels [i32!] "One or two source planes."
+    sidechain-channels [i32!] "Sidechain planes read, ignored."
+    frames [i32!] "Number of samples to copy."
+    return: [logic!] "True when the block was copied."
+] [
+    unused sidechain
+    unused sidechain-channels
+    state: make [#mutable pass-state!] as pass-state! :core
+    if not state/active [return false]
+    repeat frame frames [
+        output/left/:frame: input/left/:frame
+        output/right/:frame: either channels = 1 [input/left/:frame] [input/right/:frame]
+    ]
+    return true
+]
+
+pass-midi: func [
+    "Record a full MIDI message in the instance."
+    :core [c-pointer!] "Borrowed opaque instance."
+    status [u32!] "Status byte."
+    data1 [u32!] "First data byte."
+    data2 [u32!] "Second data byte."
+    return: [logic!] "True after recording the message."
+] [
+    state: make [#mutable pass-state!] as pass-state! :core
+    state/midi: status | (data1 << 8) | (data2 << 16)
+    return true
+]
+
+pass-program: func [
+    "Select the test program."
+    :core [c-pointer!] "Borrowed opaque instance."
+    index [u32!] "Program index."
+    return: [logic!] "True when selected."
+] [
+    state: make [#mutable pass-state!] as pass-state! :core
+    state/program: as i32! index
+    return true
+]
+
+pass-current-program: func [
+    "Read the selected test program."
+    :core [c-pointer!] "Borrowed opaque instance."
+    return: [i32!] "Selected program index."
+] [
+    state: make [#mutable pass-state!] as pass-state! :core
+    return state/program
+]
+
+pass-tail: func [
+    "Report a tail only while active."
+    :core [c-pointer!] "Borrowed opaque instance."
+    return: [u32!] "Tail samples."
+] [
+    state: make [#mutable pass-state!] as pass-state! :core
+    return either state/active [as u32! 17] [as u32! 0]
+]
+
+pass-latency: func [
+    "Report no latency."
+    :core [c-pointer!] "Borrowed opaque instance."
+    return: [u32!] "Applied latency in samples."
+] [
+    unused core
+    return as u32! 0
+]
+
+pass-param-info: func [
+    "Stub parameter description for the parameter-count cases."
+    index [i32!] "Zero-based parameter index."
+    :out [c-pointer!] "Borrowed param-info storage, untouched."
+    return: [logic!] "Always false: the stub describes nothing."
+] [
+    unused index
+    unused out
+    return false
+]
+
+pass-get: func [
+    "Stub parameter read."
+    :core [c-pointer!] "Borrowed opaque instance."
+    id [u32!] "Parameter id."
+    return: [f64!] "Always zero."
+] [
+    unused core
+    unused id
+    return 0.0
+]
+
+pass-set: func [
+    "Stub parameter write."
+    :core [c-pointer!] "Borrowed opaque instance."
+    id [u32!] "Parameter id."
+    value [f64!] "Ignored value."
+    return: [logic!] "Always false."
+] [
+    unused core
+    unused id
+    unused value
+    return false
+]
+
+effect-test: func [
+    "Drive an optional effect and reject incomplete descriptors."
+    return: [none!] "No value; assertion failures are printed."
+] [
+    ; The exported constants keep the spec's values (static-assert takes only
+    ; literals, so these are pinned here).
+    check BROM-EFFECT-MAGIC = (make u32! 1112688216)
+    check BROM-EFFECT-REVISION = (as u32! 2)
+    check BROM-SAMPLE-F32 = (as u32! 1)
+    check BROM-SAMPLE-F64 = (as u32! 2)
+    check BROM-NO-BYPASS = (make u32! 4294967295)
+    check BROM-TAIL-INFINITE = (make u32! 4294967295)
+    check BROM-LATENCY-PENDING = (make u32! 2147483648)
+    check BROM-EFFECT-VARIABLE-TAIL = (as u32! 1)
+    effect: make [#mutable brom-effect!] [
+        magic: BROM-EFFECT-MAGIC
+        revision: BROM-EFFECT-REVISION
+        category: (as c-string! "reverb")
+        input-layouts: 3
+        sidechain-channels: 0
+        sample-format: BROM-SAMPLE-F32
+        bypass-param-id: BROM-NO-BYPASS
+        flags: 0
+        effect-process-fn: :pass-process
+        effect-midi-fn: :pass-midi
+        effect-program-fn: :pass-program
+        effect-current-program-fn: :pass-current-program
+        effect-latency-fn: :pass-latency
+        effect-tail-fn: :pass-tail
+        effect-deactivate-fn: :pass-deactivate
+    ]
+    saved-effect: make [#mutable brom-effect!] []
+    table-bytes: as i32! size-of brom-effect!
+    unsafe/memcpy (addr-of saved-effect) (addr-of effect) table-bytes
+    empty-engine: make engine! []
+    descriptor: make [#mutable engine!] [
+        max-voices: 0
+        output-capacity: 512
+        create-fn: :pass-create
+        destroy-fn: :pass-destroy
+        activate-fn: :pass-activate
+        reset-fn: :pass-deactivate
+        effect-api: (addr-of effect)
+    ]
+
+    check brom-effect-valid? :descriptor
+    core: make c-pointer! descriptor/create-fn
+    check not none? core
+    check (brom-select-voice :descriptor :core) = -1
+    check not (descriptor/activate-fn :core 44100.0 8)
+    input: make [#mutable brom-audio-f32!] []
+    sidechain: make [#mutable brom-audio-f32!] []
+    output: make [#mutable brom-audio-f32!] []
+    input-view: make [#mutable brom-audio-f32!] as brom-audio-f32! (addr-of input)
+    sidechain-view: make [#mutable brom-audio-f32!] as brom-audio-f32! (addr-of sidechain)
+    output-view: make [#mutable brom-audio-f32!] as brom-audio-f32! (addr-of output)
+    input/left/0: as f32! 0.25
+    input/right/0: as f32! -0.75
+    api: make [#mutable brom-effect!] as brom-effect! descriptor/effect-api
+    check not (api/effect-process-fn :core :input-view :sidechain-view :output-view 2 0 1)
+    check descriptor/activate-fn :core 48000.0 8
+    check api/effect-process-fn :core :input-view :sidechain-view :output-view 2 0 1
+    check all [output/left/0 = (as f32! 0.25) output/right/0 = (as f32! -0.75)]
+    check api/effect-process-fn :core :input-view :sidechain-view :output-view 1 0 1
+    check output/right/0 = (as f32! 0.25)
+    check api/effect-midi-fn :core (as u32! 179) (as u32! 22) (as u32! 95)
+    state: make [#mutable pass-state!] as pass-state! :core
+    check state/midi = (as u32! 6231731)
+    check api/effect-program-fn :core (as u32! 4)
+    check (api/effect-current-program-fn :core) = 4
+    check (api/effect-latency-fn :core) = (as u32! 0)
+    check (api/effect-tail-fn :core) = (as u32! 17)
+    api/effect-deactivate-fn :core
+    check (api/effect-tail-fn :core) = (as u32! 0)
+    check not (api/effect-process-fn :core :input-view :sidechain-view :output-view 2 0 1)
+    descriptor/destroy-fn :core
+
+    ; Header, layout, sidechain, flag and bypass words, each from the saved table.
+    check brom-effect-valid? :descriptor
+    effect/magic: as u32! 0
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/revision: as u32! 0
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/revision: as u32! 3
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/sample-format: as u32! 0
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/sample-format: as u32! 3
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/sample-format: as u32! 5
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/input-layouts: 0
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/input-layouts: 4
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/sidechain-channels: 3
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/flags: as u32! 2
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/flags: BROM-EFFECT-VARIABLE-TAIL
+    check brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/bypass-param-id: as u32! 0
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/input-layouts: 1
+    check brom-effect-valid? :descriptor
+    effect/input-layouts: 2
+    check brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    effect/sidechain-channels: 2
+    check brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+
+    ; Revision 1 began with the category pointer: its bytes are not a header.
+    legacy: make [#mutable brom-effect!] []
+    unsafe/memset (addr-of legacy) 0 table-bytes
+    unsafe/memcpy (addr-of legacy) ((addr-of saved-effect) + offset-of brom-effect! category) (as i32! size-of c-pointer!)
+    descriptor/effect-api: (addr-of legacy)
+    check not brom-effect-valid? :descriptor
+    descriptor/effect-api: (addr-of effect)
+    check brom-effect-valid? :descriptor
+
+    ; Exactly the process slot matching sample-format is set.
+    slot-bytes: 2 * (as i32! size-of c-pointer!)
+    process-offset: offset-of brom-effect! effect-process-fn
+    process-f64-offset: offset-of brom-effect! effect-process-f64-fn
+    ; Slots are set by copying from typed tables built with make.
+    f64-slots: make [#mutable brom-effect!] [effect-process-f64-fn: :pass-process-f64]
+    unsafe/memset ((addr-of effect) + process-offset) 0 slot-bytes
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy ((addr-of effect) + process-f64-offset) ((addr-of f64-slots) + process-f64-offset) slot-bytes
+    check not brom-effect-valid? :descriptor
+    unsafe/memcpy ((addr-of effect) + process-offset) ((addr-of saved-effect) + process-offset) slot-bytes
+    check not brom-effect-valid? :descriptor
+    unsafe/memset ((addr-of effect) + process-offset) 0 slot-bytes
+    effect/sample-format: BROM-SAMPLE-F64
+    check brom-effect-valid? :descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    check brom-effect-valid? :descriptor
+
+    ; Null each remaining ABI slot independently, restoring the complete typed descriptor.
+    midi-offset: offset-of brom-effect! effect-midi-fn
+    program-offset: offset-of brom-effect! effect-program-fn
+    current-offset: offset-of brom-effect! effect-current-program-fn
+    latency-offset: offset-of brom-effect! effect-latency-fn
+    tail-offset: offset-of brom-effect! effect-tail-fn
+    deactivate-offset: offset-of brom-effect! effect-deactivate-fn
+    offsets: make [vector! [i32! 7]] [midi-offset program-offset current-offset latency-offset tail-offset deactivate-offset process-offset]
+    repeat index 7 [
+        unsafe/memset ((addr-of effect) + offsets/:index) 0 slot-bytes
+        check not brom-effect-valid? :descriptor
+        ; An environment alone cannot make a missing invocation callable.
+        environment: make c-pointer! addr-of descriptor
+        unsafe/memcpy ((addr-of effect) + offsets/:index) (addr-of environment) (as i32! size-of c-pointer!)
+        check not brom-effect-valid? :descriptor
+        unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+        check brom-effect-valid? :descriptor
+    ]
+    descriptor/max-voices: 1
+    check not brom-effect-valid? :descriptor
+    descriptor/max-voices: 0
+    saved-engine: make [#mutable engine!] []
+    unsafe/memcpy (addr-of saved-engine) (addr-of descriptor) (as i32! size-of engine!)
+
+    ; A bypass id must name a parameter.
+    param-descriptor: make [#mutable engine!] [
+        max-voices: 0
+        param-count: 1
+        output-capacity: 512
+        create-fn: :pass-create
+        destroy-fn: :pass-destroy
+        activate-fn: :pass-activate
+        reset-fn: :pass-deactivate
+        param-info-fn: :pass-param-info
+        get-param-fn: :pass-get
+        set-param-fn: :pass-set
+        effect-api: (addr-of effect)
+    ]
+    effect/bypass-param-id: as u32! 0
+    check brom-effect-valid? :param-descriptor
+    effect/bypass-param-id: as u32! 1
+    check not brom-effect-valid? :param-descriptor
+    unsafe/memcpy (addr-of effect) (addr-of saved-effect) table-bytes
+    check brom-effect-valid? :param-descriptor
+
+    create-offset: offset-of engine! create-fn
+    destroy-offset: offset-of engine! destroy-fn
+    activate-offset: offset-of engine! activate-fn
+    reset-offset: offset-of engine! reset-fn
+    lifecycle-offsets: make [vector! [i32! 4]] [create-offset destroy-offset activate-offset reset-offset]
+    repeat index 4 [
+        unsafe/memset ((addr-of descriptor) + lifecycle-offsets/:index) 0 slot-bytes
+        check not brom-effect-valid? :descriptor
+        unsafe/memcpy (addr-of descriptor) (addr-of saved-engine) (as i32! size-of engine!)
+        check brom-effect-valid? :descriptor
+    ]
+    descriptor/effect-api: as c-pointer! 0
+    check not brom-effect-valid? :descriptor
+    check none? empty-engine/effect-api
+    print "effect-contract-pass"
+    return none
+]
+
+effect-test

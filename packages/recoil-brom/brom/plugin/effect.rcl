@@ -1,0 +1,169 @@
+Recoil [
+    Title: "Brom optional audio effect descriptor"
+    Type: module
+    Module: brom/plugin/effect
+    Imports: [
+        brom/plugin/engine [engine! BROM-MAX-PARAMS BROM-MAX-STATE-BYTES]
+        brom/dsp/audio [brom-audio-f32! brom-audio-f64! BROM-AUDIO-CAPACITY]
+    ]
+    Exports: [
+        brom-effect! brom-effect-valid?
+        BROM-EFFECT-MAGIC BROM-EFFECT-REVISION
+        BROM-SAMPLE-F32 BROM-SAMPLE-F64
+        BROM-NO-BYPASS BROM-TAIL-INFINITE BROM-LATENCY-PENDING
+        BROM-EFFECT-VARIABLE-TAIL
+    ]
+]
+
+; Declare the mirrored audio tag before generated callable typedefs. Native
+; product builds include the Pokuston root; consumers need that include root.
+audio-abi: foreign <packages/recoil-brom/brom/dsp/audio.h> []
+callable-bytes: foreign <string.h> [
+    compare: "memcmp" [:c-pointer! :c-pointer! size! return: [i32!]]
+]
+
+; Revision-2 constants, mirrored by brom/plugin/effect.h. static-assert only
+; takes literals, so the magic's hex spelling is asserted here and the contract
+; test (test/effect-test.rcl) pins every exported constant to its decimal value.
+BROM-EFFECT-MAGIC: as u32! 0#42524658
+BROM-EFFECT-REVISION: as u32! 2
+BROM-SAMPLE-F32: as u32! 1
+BROM-SAMPLE-F64: as u32! 2
+BROM-NO-BYPASS: make u32! 4294967295
+BROM-TAIL-INFINITE: make u32! 4294967295
+BROM-LATENCY-PENDING: make u32! 2147483648
+BROM-EFFECT-VARIABLE-TAIL: as u32! 1
+
+static-assert (0#42524658 = 1112688216) "Effect magic decimal value"
+static-assert (0#42524658 = ((66 << 24) | (82 << 16) | (70 << 8) | 88)) "Effect magic is BRFX"
+
+; The engine retains identity, lifecycle, parameters and state. This optional
+; table adds the input audio and control services an effect needs. Every
+; callback is required except the process slot that does not match
+; sample-format, which must stay null; ignored MIDI/programs return false,
+; absent latency and tails zero. After `revision` the table is append-only.
+brom-effect!: make c-struct! [
+    magic: [u32!]
+    revision: [u32!]
+    category: [c-string!]
+    ; Bit 0: mono input to stereo output. Bit 1: stereo input/output.
+    input-layouts: [u32!]
+    ; 0 = no sidechain port, 1 mono, 2 stereo.
+    sidechain-channels: [u32!]
+    sample-format: [u32!]
+    ; A parameter id, or BROM-NO-BYPASS.
+    bypass-param-id: [u32!]
+    ; Bit 0 BROM-EFFECT-VARIABLE-TAIL; other bits 0.
+    flags: [u32!]
+    ; Exactly one of these is set: the one matching sample-format.
+    effect-process-fn: [fn-ptr! [
+        :core [c-pointer!]
+        :input [brom-audio-f32!] :sidechain [brom-audio-f32!] :output [brom-audio-f32!]
+        channels [i32!] sidechain-channels [i32!] frames [i32!]
+        return: [logic!]
+    ]]
+    effect-process-f64-fn: [fn-ptr! [
+        :core [c-pointer!]
+        :input [brom-audio-f64!] :sidechain [brom-audio-f64!] :output [brom-audio-f64!]
+        channels [i32!] sidechain-channels [i32!] frames [i32!]
+        return: [logic!]
+    ]]
+    effect-midi-fn: [fn-ptr! [
+        :core [c-pointer!]
+        status [u32!] data1 [u32!] data2 [u32!]
+        return: [logic!]
+    ]]
+    effect-program-fn: [fn-ptr! [:core [c-pointer!] index [u32!] return: [logic!]]]
+    effect-current-program-fn: [fn-ptr! [:core [c-pointer!] return: [i32!]]]
+    effect-latency-fn: [fn-ptr! [:core [c-pointer!] return: [u32!]]]
+    effect-tail-fn: [fn-ptr! [:core [c-pointer!] return: [u32!]]]
+    effect-deactivate-fn: [fn-ptr! [:core [c-pointer!] return: [none!]]]
+]
+
+; The leading words of every revision, read before the full table is viewed
+; so a short foreign table is never over-read.
+brom-effect-header!: make c-struct! [
+    magic: [u32!]
+    revision: [u32!]
+]
+
+static-assert ((offset-of brom-effect-header! magic) = (offset-of brom-effect! magic)) "Effect header magic offset"
+static-assert ((offset-of brom-effect-header! revision) = (offset-of brom-effect! revision)) "Effect header revision offset"
+static-assert ((offset-of brom-effect! magic) = 0) "Effect magic leads the table"
+static-assert ((offset-of brom-effect! revision) = 4) "Effect revision follows magic"
+
+; The supported native ABI stores fn-ptr! as {void *env, invoke}, with both
+; addresses pointer-sized. Guard that width for the process pair and the
+; lifecycle slots; a process slot appended later gets its own assert.
+static-assert (((offset-of brom-effect! effect-process-f64-fn) - (offset-of brom-effect! effect-process-fn)) = (2 * size-of c-pointer!)) "Native effect process callable pair width"
+static-assert (((offset-of engine! destroy-fn) - (offset-of engine! create-fn)) = (2 * size-of c-pointer!)) "Native lifecycle callable pair width"
+
+brom-effect-callable?: func [
+    "Read whether a callable slot has an invocation address."
+    :slot [c-pointer!] "Borrowed address of an ABI fn-ptr! slot."
+    :null-slot [c-pointer!] "Borrowed same-signature slot in a zero-initialized typed descriptor."
+    return: [logic!] "True when invoking the slot is possible."
+] [
+    ; A zero-argument field read invokes the callable. Compare its object
+    ; bytes with the same exact function-pointer type initialized to NULL.
+    ; memcmp reads character bytes, so neither struct aliasing nor conversion
+    ; to a data-pointer representation occurs. Supported native ABIs have a
+    ; canonical function-pointer representation without padding bits.
+    return (callable-bytes/compare (slot + size-of c-pointer!)
+        (null-slot + size-of c-pointer!) (as size! size-of c-pointer!)) <> 0
+]
+
+brom-effect-valid?: func [
+    "Validate an effect table before a host creates or calls an instance."
+    :engine [engine!] "Borrowed descriptor with an optional effect table."
+    return: [logic!] "True for a complete zero-voice effect; false for synths or invalid tables."
+] [
+    if none? engine/effect-api [return false]
+    if any [engine/max-voices <> 0 engine/param-count < 0
+        engine/param-count > BROM-MAX-PARAMS engine/state-size < 0
+        engine/state-size > BROM-MAX-STATE-BYTES engine/output-capacity <= 0
+        engine/output-capacity > BROM-AUDIO-CAPACITY] [return false]
+    ; Identify the table and its revision before viewing any later field.
+    header: make [#mutable brom-effect-header!] as brom-effect-header! engine/effect-api
+    if any [header/magic <> BROM-EFFECT-MAGIC header/revision < (as u32! 2)
+        header/revision > BROM-EFFECT-REVISION] [return false]
+    effect: make [#mutable brom-effect!] as brom-effect! engine/effect-api
+    if any [none? effect/category effect/input-layouts = (as u32! 0)
+        effect/input-layouts > (as u32! 3) effect/sidechain-channels > (as u32! 2)
+        (effect/flags | BROM-EFFECT-VARIABLE-TAIL) <> BROM-EFFECT-VARIABLE-TAIL] [return false]
+    if all [effect/bypass-param-id <> BROM-NO-BYPASS
+        effect/bypass-param-id >= (as u32! engine/param-count)] [return false]
+    empty-effect: make brom-effect! []
+    empty-engine: make engine! []
+    null-effect: addr-of empty-effect
+    null-engine: addr-of empty-engine
+    effect-raw: as c-pointer! effect
+    engine-raw: as c-pointer! engine
+    ; Exactly the process slot matching the sample format is callable.
+    process-f32?: brom-effect-callable? (effect-raw + offset-of brom-effect! effect-process-fn) (null-effect + offset-of brom-effect! effect-process-fn)
+    process-f64?: brom-effect-callable? (effect-raw + offset-of brom-effect! effect-process-f64-fn) (null-effect + offset-of brom-effect! effect-process-f64-fn)
+    if not any [
+        all [effect/sample-format = BROM-SAMPLE-F32 process-f32? not process-f64?]
+        all [effect/sample-format = BROM-SAMPLE-F64 process-f64? not process-f32?]
+    ] [return false]
+    if any [
+        not brom-effect-callable? (effect-raw + offset-of brom-effect! effect-midi-fn) (null-effect + offset-of brom-effect! effect-midi-fn)
+        not brom-effect-callable? (effect-raw + offset-of brom-effect! effect-program-fn) (null-effect + offset-of brom-effect! effect-program-fn)
+        not brom-effect-callable? (effect-raw + offset-of brom-effect! effect-current-program-fn) (null-effect + offset-of brom-effect! effect-current-program-fn)
+        not brom-effect-callable? (effect-raw + offset-of brom-effect! effect-latency-fn) (null-effect + offset-of brom-effect! effect-latency-fn)
+        not brom-effect-callable? (effect-raw + offset-of brom-effect! effect-tail-fn) (null-effect + offset-of brom-effect! effect-tail-fn)
+        not brom-effect-callable? (effect-raw + offset-of brom-effect! effect-deactivate-fn) (null-effect + offset-of brom-effect! effect-deactivate-fn)
+        not brom-effect-callable? (engine-raw + offset-of engine! create-fn) (null-engine + offset-of engine! create-fn)
+        not brom-effect-callable? (engine-raw + offset-of engine! destroy-fn) (null-engine + offset-of engine! destroy-fn)
+        not brom-effect-callable? (engine-raw + offset-of engine! activate-fn) (null-engine + offset-of engine! activate-fn)
+        not brom-effect-callable? (engine-raw + offset-of engine! reset-fn) (null-engine + offset-of engine! reset-fn)
+    ] [return false]
+    if engine/param-count > 0 [
+        if any [
+            not brom-effect-callable? (engine-raw + offset-of engine! param-info-fn) (null-engine + offset-of engine! param-info-fn)
+            not brom-effect-callable? (engine-raw + offset-of engine! get-param-fn) (null-engine + offset-of engine! get-param-fn)
+            not brom-effect-callable? (engine-raw + offset-of engine! set-param-fn) (null-engine + offset-of engine! set-param-fn)
+        ] [return false]
+    ]
+    return true
+]

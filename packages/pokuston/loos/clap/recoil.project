@@ -1,0 +1,14 @@
+Recoil-Project [
+    Name: clap-loos
+    Version: 0.2.0
+    Dependencies: [
+        [package: recoil-brom source: [path %../../../../packages/recoil-brom/]]
+        ; The parent package, for editor-size.rcl alone: the editor and this
+        ; descriptor have to agree on the window size, and a mismatch is a
+        ; silent black window rather than a diagnostic.
+        [package: loos-core source: [path %../]]
+        [package: pokuston-clap-sdk source: [path %../../../../packages/pokuston-clap-sdk/]]
+        [package: recoil-gui source: [recoil %packages/recoil-gui/]]
+        [package: recoil-gui-backend-pugl source: [recoil %packages/recoil-gui-backend-pugl/]]
+    ]
+]

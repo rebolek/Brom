@@ -1,0 +1,7 @@
+Recoil [
+    Title: "Pokuston VST3 SDK source package"
+    Type: module
+    Module: pokuston/vst3/sdk
+    Imports: []
+    Exports: []
+]

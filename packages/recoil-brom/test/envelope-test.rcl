@@ -1,0 +1,213 @@
+Recoil [
+    Title: "brom/dsp/envelope exercise"
+    Description: {
+        The envelope had no test of its own -- Loos' render gate was all it had,
+        which is exactly the gap the filter and oscillator tests were written to
+        close. It also had a docstring claiming it matched Mach's Rust when it
+        did not, which a test of the curve parameter would have caught.
+
+        Checks what an ADSR is rather than replaying stored numbers: the stages
+        are reached in order, each segment moves monotonically toward its
+        target, sustain holds exactly, a retrigger restarts from zero from any
+        stage, and the two curve constants produce measurably different shapes.
+    }
+    Type: module
+    Module: recoil-brom/test/envelope-test
+    Imports: [
+        brom/dsp/envelope [
+            adsr-config! adsr-envelope!
+            ADSR_STAGE_IDLE ADSR_STAGE_ATTACK ADSR_STAGE_DECAY
+            ADSR_STAGE_SUSTAIN ADSR_STAGE_RELEASE
+            adsr-config-brom adsr-config-mach
+            adsr-reset adsr-trigger adsr-release adsr-tick adsr-tick-n
+            adsr-active? adsr-level adsr-releasing?
+        ]
+        brom/dsp/utils [brom-abs-f64]
+    ]
+    Exports: []
+]
+
+RATE: 44100.0
+
+check: func [
+    "Record one assertion as a PASS or FAIL line."
+    ok? [logic!] "Whether the assertion held."
+    return: [none!] "No value; the marker is written to stdout."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+near?: func [
+    "Whether two values agree to within a tolerance."
+    a [f64!] "First value."
+    b [f64!] "Second value."
+    tolerance [f64!] "Largest accepted absolute difference."
+    return: [logic!] "True when the values are close enough."
+] [
+    return (brom-abs-f64 (a - b)) <= tolerance
+]
+
+; --- a fresh envelope is idle and silent ------------------------------------
+
+fresh: adsr-reset
+check (adsr-level fresh) = 0.0
+check (adsr-active? fresh) = false
+check (adsr-releasing? fresh) = false
+check fresh/stage = ADSR_STAGE_IDLE
+
+; --- and reaches its stages in order ----------------------------------------
+; Walked with a slow attack and decay so each stage lasts thousands of samples
+; and cannot be skipped past.
+
+config: adsr-config-brom 0.05 0.05 0.6 0.05
+envelope: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+check envelope/stage = ADSR_STAGE_ATTACK
+check (adsr-level envelope) = 0.0
+check (adsr-active? envelope) = true
+
+; Attack rises to one and hands over to decay.
+rising: make [#mutable logic!] true
+previous: make [#mutable f64!] -1.0
+saw-decay: make [#mutable logic!] false
+repeat i 6000 [
+    envelope: adsr-tick envelope config RATE
+    level: adsr-level envelope
+    if envelope/stage = ADSR_STAGE_ATTACK [
+        if level < previous [rising: false]
+        previous: level
+    ]
+    if envelope/stage = ADSR_STAGE_DECAY [saw-decay: true]
+]
+check rising
+check saw-decay
+
+; Decay falls to the sustain level and stops there.
+falling: make [#mutable logic!] true
+previous: 2.0
+saw-sustain: make [#mutable logic!] false
+repeat i 6000 [
+    envelope: adsr-tick envelope config RATE
+    level: adsr-level envelope
+    if envelope/stage = ADSR_STAGE_DECAY [
+        if level > previous [falling: false]
+        previous: level
+    ]
+    if envelope/stage = ADSR_STAGE_SUSTAIN [saw-sustain: true]
+]
+check falling
+check saw-sustain
+
+; Sustain is exact and holds indefinitely.
+repeat i 1000 [envelope: adsr-tick envelope config RATE]
+check (adsr-level envelope) = 0.6
+check envelope/stage = ADSR_STAGE_SUSTAIN
+
+; Release falls from the sustain level to silence and goes idle.
+envelope: adsr-release envelope
+check envelope/stage = ADSR_STAGE_RELEASE
+check (adsr-releasing? envelope) = true
+check (near? (adsr-level envelope) 0.6 0.0)
+releasing: make [#mutable logic!] true
+previous: 2.0
+repeat i 8000 [
+    envelope: adsr-tick envelope config RATE
+    level: adsr-level envelope
+    if level > previous [releasing: false]
+    previous: level
+]
+check releasing
+check (adsr-level envelope) = 0.0
+check (adsr-active? envelope) = false
+
+; --- a retrigger restarts from zero, from any stage -------------------------
+; Otherwise a fast repeated note would step up from wherever the last one left
+; off instead of re-articulating.
+
+repeat stage-index 4 [
+    restart: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+    repeat i (stage-index * 1500) [restart: adsr-tick restart config RATE]
+    restart: adsr-trigger restart
+    check (adsr-level restart) = 0.0
+    check restart/stage = ADSR_STAGE_ATTACK
+]
+
+; --- releasing an idle envelope does not resurrect it ------------------------
+
+check (adsr-releasing? (adsr-release adsr-reset)) = false
+
+; --- an N-step advance is exactly N single steps ----------------------------
+; Within a segment, since a strided run only notices a stage boundary at the
+; end of its group and so leaves a stage up to N-1 samples late. That is the
+; trade a strided update makes, and it is why this is measured inside a segment
+; rather than across one.
+
+slow: adsr-config-brom 2.0 2.0 0.5 2.0
+stepwise: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+grouped: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+repeat i 400 [stepwise: adsr-tick stepwise slow RATE]
+repeat i 100 [grouped: adsr-tick-n grouped slow 4 RATE]
+check stepwise/stage = ADSR_STAGE_ATTACK
+check grouped/stage = ADSR_STAGE_ATTACK
+check (near? (adsr-level stepwise) (adsr-level grouped) 0.000000000001)
+
+; And a stride of one is the plain path, not a special case of it.
+single: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+plain: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+repeat i 400 [
+    single: adsr-tick-n single slow 1 RATE
+    plain: adsr-tick plain slow RATE
+]
+check (adsr-level single) = (adsr-level plain)
+
+; --- the curve constant is threaded through, not ignored --------------------
+; Both configurations name the same times; only the shape differs. Mach's curve
+; reaches sixty decibels down where Brom's reaches a hundred, so at the same
+; point in the same nominal attack it must be measurably further along.
+
+brom-curve: adsr-config-brom 0.1 0.1 0.5 0.1
+mach-curve: adsr-config-mach 0.1 0.1 0.5 0.1
+brom-env: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+mach-env: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+repeat i 1000 [
+    brom-env: adsr-tick brom-env brom-curve RATE
+    mach-env: adsr-tick mach-env mach-curve RATE
+]
+; Brom's steeper constant gets closer to one in the same time.
+check (adsr-level brom-env) > (adsr-level mach-env)
+check ((adsr-level brom-env) - (adsr-level mach-env)) > 0.01
+
+; --- a segment at or below min-time is instant ------------------------------
+; Mach treats anything under a ten-thousandth of a second as immediate; Brom
+; only an exactly-zero one. Both are asserted, because a config field that is
+; never read is not a setting.
+;
+; Fifty microseconds, chosen so the two configurations genuinely disagree about
+; it. Going shorter does not sharpen the test, it destroys it: by ten
+; microseconds Brom's curve covers all but 5e-12 of the span in a single sample,
+; lands inside its own snap band and snaps to exactly one -- so both
+; configurations reach 1.0 and the assertion passes against an implementation
+; that ignores min-time entirely.
+
+BRIEF-ATTACK: 0.00005
+
+instant: adsr-config-mach BRIEF-ATTACK 0.1 0.5 0.1
+quick: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+quick: adsr-tick quick instant RATE
+check (adsr-level quick) = 1.0
+check quick/stage = ADSR_STAGE_DECAY
+
+zero-attack: adsr-config-brom 0.0 0.1 0.5 0.1
+immediate: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+immediate: adsr-tick immediate zero-attack RATE
+check (adsr-level immediate) = 1.0
+
+; The same fifty microseconds under Brom's curve runs the segment fast rather
+; than skipping it, so one sample gets close to one without reaching it.
+tiny: adsr-config-brom BRIEF-ATTACK 0.1 0.5 0.1
+brief: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+brief: adsr-tick brief tiny RATE
+check (adsr-level brief) < 1.0
+check (adsr-level brief) > 0.9
+
+print "done"

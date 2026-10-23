@@ -1,0 +1,1205 @@
+Recoil [
+    Title: "Brom zero-latency true-stereo convolver"
+    Description: {
+        Convolves a stereo signal with a true-stereo impulse response: four
+        paths, L->L, L->R, R->L and R->R, up to the capacity given at create.
+        Zero latency, f64 throughout, no threads, and deterministic, so an
+        offline bounce is bit-identical to a realtime one.
+
+        Layout of the impulse response:
+
+            taps [0, 128)           direct-form FIR, per sample
+            taps [128, 2048)        level 0: 30 partitions of 64
+            taps [2048, 16384)      level 1: 14 partitions of 1024
+            taps [16384, 65536)     level 2: 6 partitions of 8192
+            taps [65536, capacity)  level 3: partitions of 32768
+
+        Every level is a uniformly partitioned overlap-save convolver whose
+        work for one block is spread evenly over the 64-sample ticks of the
+        following block. A level of partition size P whose first tap sits at
+        2P has exactly one block period in which to finish, which is why each
+        level starts at twice its own size (Gardner 1995, with the work
+        scheduled by tick count rather than a worker thread). Level 0's block
+        is a single tick, so it does its whole block at once; the direct head
+        is 128 taps rather than 64 so that level 0 obeys the same rule and
+        needs no special case.
+
+        The cost per sample stays flat because no level does a whole block's
+        work in one tick. The largest single unit is one 65536-point real FFT,
+        which is why the top level stops at 32768.
+
+        Changing the impulse response is time-sliced too. `brom-conv-stage-*`
+        transforms the new response into the spare partition set a few FFTs
+        per call; once complete, each level crosses over at its own next block
+        boundary. It computes both outputs for one block and fades between
+        them over the next one, so the early part changes within milliseconds
+        and the far tail follows within one top-level period (65536 samples,
+        under 1.5 s at 44.1 kHz) -- by which time it is only now being heard.
+
+        Memory is allocated once at create for the capacity, two partition sets
+        (live and spare) plus the frequency-domain delay line, about 24 bytes
+        per tap of capacity per path pair: roughly 185 MB for 20 s at 48 kHz
+        including the caller's time-domain staging copy. The audio path
+        never allocates.
+
+        Ownership. std/math/fft takes an `rfft-plan!` value and `vector!
+        [f64!]` buffers, both refcounted, while everything else here is raw
+        memory. Each level keeps its plan and the vectors that cross the
+        FFT call (time frame, the two input snapshots, a spectrum pair) as
+        fields of its `conv-level!` record, and the records themselves live
+        in one `vector! [conv-level!]` that the state owns as a raw pointer.
+        Field stores into a record are plain moves, and releasing that one
+        vector at destroy runs the compiler's element drop on every record,
+        which releases each plan and vector exactly once. The delay line,
+        the partition spectra and the accumulators stay raw; a transform's
+        result is copied into its slot from the spectrum pair, and an
+        accumulator into the pair before the inverse, since the inverse
+        overwrites the spectrum it is given.
+    }
+    Type: module
+    Module: brom/dsp/convolver
+    Imports: [
+        std/math/fft [rfft-plan! rfft-plan rfft-forward rfft-inverse]
+    ]
+    Exports: [
+        BROM-CONV-TICK BROM-CONV-HEAD BROM-CONV-HEAD-FADE
+        brom-conv-create brom-conv-destroy brom-conv-reset brom-conv-clear brom-conv-capacity
+        brom-conv-process brom-conv-length brom-conv-busy
+        brom-conv-stage-begin brom-conv-stage-step brom-conv-staging
+        brom-conv-memory-bytes
+    ]
+]
+
+; The scheduler's tick, which is also level 0's partition size.
+BROM-CONV-TICK: 64
+; Direct-form head length: twice the tick, where level 0 starts.
+BROM-CONV-HEAD: 128
+; Samples over which the direct head crosses from the old response to the
+; new. Every partitioned level fades over one of its own blocks.
+BROM-CONV-HEAD-FADE: 1024
+BROM-CONV-LEVELS: 4
+
+; The four true-stereo paths, as input * 2 + output.
+BROM-CONV-LL: 0
+BROM-CONV-LR: 1
+BROM-CONV-RL: 2
+BROM-CONV-RR: 3
+
+; Level phases around a response change.
+CONV-PHASE-STEADY: 0
+; This block computes outputs with both sets.
+CONV-PHASE-DUAL: 1
+; This block plays the two outputs computed last block, fading old to new.
+CONV-PHASE-FADE: 2
+
+conv-cell!: make c-struct! [value: [f64!]]
+
+conv-level!: make c-struct! [
+    lv-size: [i32!]
+    lv-offset: [i32!]
+    lv-max-parts: [i32!]
+    lv-bins: [i32!]
+    ; Ticks per block: lv-size / BROM-CONV-TICK. One for level 0.
+    lv-ticks: [i32!]
+    ; Owned by the record: released by the level store's element drop.
+    lv-plan: [rfft-plan!]
+    ; 2P input history per channel: [previous block | block being filled].
+    lv-frame-l: [c-pointer!]
+    lv-frame-r: [c-pointer!]
+    ; Copy of the frame at the boundary, so the second channel's FFT can run
+    ; on a later tick while the frame keeps filling. Owned, 2P each.
+    lv-snap-l: [vector! [f64!]]
+    lv-snap-r: [vector! [f64!]]
+    ; Spectrum of the transform just run, lv-bins each: a forward result
+    ; waits here to be copied into its slot, and an accumulator is copied
+    ; here to be inverted. Owned.
+    lv-spec-re: [vector! [f64!]]
+    lv-spec-im: [vector! [f64!]]
+    ; Frequency-domain delay line: lv-max-parts slots of lv-bins per channel.
+    lv-fdl-re-l: [c-pointer!]
+    lv-fdl-im-l: [c-pointer!]
+    lv-fdl-re-r: [c-pointer!]
+    lv-fdl-im-r: [c-pointer!]
+    lv-fdl-head: [i32!]
+    ; Partition spectra, two sets: 4 paths x lv-max-parts x lv-bins each.
+    lv-h-re-0: [c-pointer!]
+    lv-h-im-0: [c-pointer!]
+    lv-h-re-1: [c-pointer!]
+    lv-h-im-1: [c-pointer!]
+    ; Accumulators per output channel; -alt is the other set's during DUAL.
+    lv-acc-re-l: [c-pointer!]
+    lv-acc-im-l: [c-pointer!]
+    lv-acc-re-r: [c-pointer!]
+    lv-acc-im-r: [c-pointer!]
+    lv-alt-re-l: [c-pointer!]
+    lv-alt-im-l: [c-pointer!]
+    lv-alt-re-r: [c-pointer!]
+    lv-alt-im-r: [c-pointer!]
+    ; 2P time frame: a staged partition's input, and an inverse's output.
+    ; Owned.
+    lv-time: [vector! [f64!]]
+    ; Output being played this block, and being built for the next one. The
+    ; -alt pair carries the second set's output across a crossover.
+    lv-play-l: [c-pointer!]
+    lv-play-r: [c-pointer!]
+    lv-play-alt-l: [c-pointer!]
+    lv-play-alt-r: [c-pointer!]
+    lv-build-l: [c-pointer!]
+    lv-build-r: [c-pointer!]
+    lv-build-alt-l: [c-pointer!]
+    lv-build-alt-r: [c-pointer!]
+    ; Position inside the current block, and the scheduler's state.
+    lv-pos: [i32!]
+    lv-tick: [i32!]
+    lv-units: [i32!]
+    lv-done: [i32!]
+    ; Which set is live, the crossover phase, and whether this level has
+    ; already crossed over to the pending set.
+    lv-set: [i32!]
+    lv-phase: [i32!]
+    lv-switched: [logic!]
+]
+
+conv-state!: make c-struct! [
+    cv-capacity: [i32!]
+    ; The level records: an owned vector! [conv-level!], held as a raw
+    ; pointer that carries its one reference until conv-release gives it
+    ; back. cv-levels is that vector's data, which never moves.
+    cv-level-store: [c-pointer!]
+    cv-levels: [c-pointer!]
+    ; Head taps, reversed, 4 paths x HEAD, two sets.
+    cv-head-0: [c-pointer!]
+    cv-head-1: [c-pointer!]
+    ; 2 x HEAD input history per channel, written twice so the last HEAD
+    ; samples are always contiguous.
+    cv-hist-l: [c-pointer!]
+    cv-hist-r: [c-pointer!]
+    cv-hist-pos: [i32!]
+    ; Samples since the last tick.
+    cv-tick-pos: [i32!]
+    ; Response length per set, in taps, and the live set.
+    cv-length-0: [i32!]
+    cv-length-1: [i32!]
+    cv-set: [i32!]
+    ; A complete response waits in the spare set to be crossed over to.
+    cv-pending: [logic!]
+    ; Samples left in the head and level-0 crossfade; zero when none runs.
+    cv-head-fade: [i32!]
+    ; Staging: the source paths (borrowed), their length, gain, and the
+    ; next unit to transform.
+    cv-staging: [logic!]
+    cv-src-ll: [c-pointer!]
+    cv-src-lr: [c-pointer!]
+    cv-src-rl: [c-pointer!]
+    cv-src-rr: [c-pointer!]
+    cv-src-length: [i32!]
+    cv-src-gain: [f64!]
+    cv-stage-level: [i32!]
+    cv-stage-path: [i32!]
+    cv-stage-part: [i32!]
+    cv-bytes: [i64!]
+]
+
+conv-get: func [
+    #inline
+    "Read one f64 from a raw buffer."
+    :base [c-pointer!] "Borrowed buffer."
+    index [i32!] "Element index."
+    return: [f64!] "The element."
+] [
+    cell: make [#mutable conv-cell!] as conv-cell! (base + ((as u64! index) << 3))
+    return cell/value
+]
+
+conv-put: func [
+    #inline
+    "Write one f64 into a raw buffer."
+    :base [c-pointer!] "Borrowed buffer."
+    index [i32!] "Element index."
+    value [f64!] "Value to store."
+    return: [none!]
+] [
+    cell: make [#mutable conv-cell!] as conv-cell! (base + ((as u64! index) << 3))
+    cell/value: value
+]
+
+conv-at: func [
+    #inline
+    "Address of element `index` of an f64 buffer."
+    :base [c-pointer!] "Borrowed buffer."
+    index [i32!] "Element index."
+    return: [c-pointer!] "Borrowed address inside the same buffer."
+] [
+    return base + ((as u64! index) << 3)
+]
+
+conv-alloc: func [
+    "Allocate and zero `count` f64 values, adding their size to the state's tally."
+    :state [conv-state!] "Borrowed convolver state, for the byte tally."
+    count [i32!] "Element count."
+    return: [c-pointer!] "Owned buffer, or null when count is zero."
+] [
+    if count <= 0 [return as c-pointer! 0]
+    raw: make c-pointer! unsafe/malloc (count * 8)
+    unsafe/memset raw 0 (count * 8)
+    state/cv-bytes: state/cv-bytes + (as i64! count) * 8
+    return raw
+]
+
+conv-free: func [
+    "Release a buffer from conv-alloc."
+    :buffer [c-pointer!] "Owned buffer; null is ignored."
+    return: [none!]
+] [
+    if buffer = as c-pointer! 0 [return none]
+    unsafe/free buffer
+]
+
+conv-clear: func [
+    "Zero `count` f64 values."
+    :buffer [c-pointer!] "Borrowed buffer; null is ignored."
+    count [i32!] "Element count."
+    return: [none!]
+] [
+    if buffer = as c-pointer! 0 [return none]
+    if count <= 0 [return none]
+    unsafe/memset buffer 0 (count * 8)
+    return none
+]
+
+conv-vector: func [
+    "A zeroed, writable f64 vector of `count` elements, adding its size to the state's tally. Setup only: it allocates."
+    :state [conv-state!] "Borrowed convolver state, for the byte tally."
+    count [i32!] "Element count."
+    return: [vector! [f64!]] "Owned vector."
+] [
+    grow: make [#flexible vector! [f64!]] none
+    repeat i count [append grow 0.0]
+    state/cv-bytes: state/cv-bytes + (as i64! count) * 8
+    return thaw freeze grow
+]
+
+conv-release: func [
+    "Give back the level store's reference that brom-conv-create cast to a raw pointer. On the last one the store is freed, and its element drop releases every record's plan and vectors."
+    :held [c-pointer!] "Owned raw reference to the store; null is ignored."
+    return: [none!]
+] [
+    if held = as c-pointer! 0 [return none]
+    store: as vector! held
+    unused store
+]
+
+conv-level-view: func [
+    #inline
+    "Address of level `index`'s record."
+    :state [conv-state!] "Borrowed convolver state."
+    index [i32!] "Level 0 .. BROM-CONV-LEVELS-1."
+    return: [c-pointer!] "Borrowed level record."
+] [
+    return state/cv-levels + (index * (as i32! size-of conv-level!))
+]
+
+conv-level-size: func [
+    "Partition size of level `index`."
+    index [i32!] "Level 0 .. BROM-CONV-LEVELS-1."
+    return: [i32!] "64, 1024, 8192 or 32768."
+] [
+    if index = 0 [return 64]
+    if index = 1 [return 1024]
+    if index = 2 [return 8192]
+    return 32768
+]
+
+conv-level-offset: func [
+    "First tap level `index` covers."
+    index [i32!] "Level 0 .. BROM-CONV-LEVELS-1."
+    return: [i32!] "Tap offset: twice the level's partition size."
+] [
+    return 2 * (conv-level-size index)
+]
+
+conv-level-span: func [
+    "Taps level `index` can cover at most: up to the next level's offset, or to capacity for the top level."
+    index [i32!] "Level 0 .. BROM-CONV-LEVELS-1."
+    capacity [i32!] "Convolver capacity in taps."
+    return: [i32!] "Tap count; zero when capacity ends before this level starts."
+] [
+    start: conv-level-offset index
+    stop: either index = (BROM-CONV-LEVELS - 1) [capacity] [conv-level-offset (index + 1)]
+    limit: either stop < capacity [stop] [capacity]
+    if limit <= start [return 0]
+    return limit - start
+]
+
+conv-parts-for: func [
+    "Partitions level `index` needs to cover a response of `length` taps."
+    index [i32!] "Level 0 .. BROM-CONV-LEVELS-1."
+    length [i32!] "Response length in taps."
+    return: [i32!] "Partition count, possibly zero."
+] [
+    size: conv-level-size index
+    span: conv-level-span index length
+    if span <= 0 [return 0]
+    return (span + size - 1) / size
+]
+
+brom-conv-create: func [
+    "Allocate a convolver for responses up to `capacity` taps."
+    capacity [i32!] "Longest response in taps, e.g. 20 s at the activation sample rate."
+    return: [c-pointer!] "Owned convolver; release with brom-conv-destroy. Null for a non-positive capacity."
+] [
+    if capacity <= 0 [return as c-pointer! 0]
+    raw: make c-pointer! unsafe/malloc (as i32! size-of conv-state!)
+    unsafe/memset raw 0 (as i32! size-of conv-state!)
+    state: make [#mutable conv-state!] as conv-state! raw
+    state/cv-capacity: capacity
+    ; Zeroed records, one per level (4 is BROM-CONV-LEVELS; a vector's
+    ; length must be written as a literal). The store's data is where they
+    ; live.
+    store: make [#mutable vector! [conv-level! 4]] []
+    state/cv-levels: store/data
+    ; The cast consumes `store`: its reference now belongs to the state,
+    ; and conv-release gives it back at destroy.
+    state/cv-level-store: as c-pointer! store
+    state/cv-head-0: conv-alloc :state (4 * BROM-CONV-HEAD)
+    state/cv-head-1: conv-alloc :state (4 * BROM-CONV-HEAD)
+    state/cv-hist-l: conv-alloc :state (2 * BROM-CONV-HEAD)
+    state/cv-hist-r: conv-alloc :state (2 * BROM-CONV-HEAD)
+    repeat index BROM-CONV-LEVELS [
+        lv: make [#mutable conv-level!] as conv-level! (conv-level-view :state index)
+        size: conv-level-size index
+        bins: size + 1
+        parts: conv-parts-for index capacity
+        lv/lv-size: size
+        lv/lv-offset: conv-level-offset index
+        lv/lv-max-parts: parts
+        lv/lv-bins: bins
+        lv/lv-ticks: size / BROM-CONV-TICK
+        lv/lv-switched: true
+        if parts > 0 [
+            ; Stored straight from the call: a field store moves the plan in,
+            ; where a local would hold an extra reference to its tables.
+            lv/lv-plan: rfft-plan (2 * size)
+            lv/lv-frame-l: conv-alloc :state (2 * size)
+            lv/lv-frame-r: conv-alloc :state (2 * size)
+            lv/lv-snap-l: conv-vector :state (2 * size)
+            lv/lv-snap-r: conv-vector :state (2 * size)
+            lv/lv-spec-re: conv-vector :state bins
+            lv/lv-spec-im: conv-vector :state bins
+            lv/lv-fdl-re-l: conv-alloc :state (parts * bins)
+            lv/lv-fdl-im-l: conv-alloc :state (parts * bins)
+            lv/lv-fdl-re-r: conv-alloc :state (parts * bins)
+            lv/lv-fdl-im-r: conv-alloc :state (parts * bins)
+            lv/lv-h-re-0: conv-alloc :state (4 * parts * bins)
+            lv/lv-h-im-0: conv-alloc :state (4 * parts * bins)
+            lv/lv-h-re-1: conv-alloc :state (4 * parts * bins)
+            lv/lv-h-im-1: conv-alloc :state (4 * parts * bins)
+            lv/lv-acc-re-l: conv-alloc :state bins
+            lv/lv-acc-im-l: conv-alloc :state bins
+            lv/lv-acc-re-r: conv-alloc :state bins
+            lv/lv-acc-im-r: conv-alloc :state bins
+            lv/lv-alt-re-l: conv-alloc :state bins
+            lv/lv-alt-im-l: conv-alloc :state bins
+            lv/lv-alt-re-r: conv-alloc :state bins
+            lv/lv-alt-im-r: conv-alloc :state bins
+            lv/lv-time: conv-vector :state (2 * size)
+            lv/lv-play-l: conv-alloc :state size
+            lv/lv-play-r: conv-alloc :state size
+            lv/lv-play-alt-l: conv-alloc :state size
+            lv/lv-play-alt-r: conv-alloc :state size
+            lv/lv-build-l: conv-alloc :state size
+            lv/lv-build-r: conv-alloc :state size
+            lv/lv-build-alt-l: conv-alloc :state size
+            lv/lv-build-alt-r: conv-alloc :state size
+        ]
+    ]
+    return raw
+]
+
+brom-conv-destroy: func [
+    "Release a convolver made by brom-conv-create."
+    :conv [c-pointer!] "Owned convolver; null is ignored."
+    return: [none!]
+] [
+    if conv = as c-pointer! 0 [return none]
+    state: make [#mutable conv-state!] as conv-state! conv
+    repeat index BROM-CONV-LEVELS [
+        lv: make [#mutable conv-level!] as conv-level! (conv-level-view :state index)
+        ; Raw buffers only: the plan and the vectors go with the store below.
+        if lv/lv-max-parts > 0 [
+            conv-free lv/lv-frame-l
+            conv-free lv/lv-frame-r
+            conv-free lv/lv-fdl-re-l
+            conv-free lv/lv-fdl-im-l
+            conv-free lv/lv-fdl-re-r
+            conv-free lv/lv-fdl-im-r
+            conv-free lv/lv-h-re-0
+            conv-free lv/lv-h-im-0
+            conv-free lv/lv-h-re-1
+            conv-free lv/lv-h-im-1
+            conv-free lv/lv-acc-re-l
+            conv-free lv/lv-acc-im-l
+            conv-free lv/lv-acc-re-r
+            conv-free lv/lv-acc-im-r
+            conv-free lv/lv-alt-re-l
+            conv-free lv/lv-alt-im-l
+            conv-free lv/lv-alt-re-r
+            conv-free lv/lv-alt-im-r
+            conv-free lv/lv-play-l
+            conv-free lv/lv-play-r
+            conv-free lv/lv-play-alt-l
+            conv-free lv/lv-play-alt-r
+            conv-free lv/lv-build-l
+            conv-free lv/lv-build-r
+            conv-free lv/lv-build-alt-l
+            conv-free lv/lv-build-alt-r
+        ]
+    ]
+    ; Last, since the records live in it: every plan and vector is released.
+    conv-release state/cv-level-store
+    state/cv-level-store: as c-pointer! 0
+    state/cv-levels: as c-pointer! 0
+    conv-free state/cv-head-0
+    conv-free state/cv-head-1
+    conv-free state/cv-hist-l
+    conv-free state/cv-hist-r
+    unsafe/free conv
+]
+
+brom-conv-capacity: func [
+    "Longest response the convolver accepts."
+    :conv [c-pointer!] "Borrowed convolver."
+    return: [i32!] "Capacity in taps."
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    return state/cv-capacity
+]
+
+brom-conv-memory-bytes: func [
+    "Bytes the convolver allocated for its buffers."
+    :conv [c-pointer!] "Borrowed convolver."
+    return: [i64!] "Total, excluding FFT plans and records."
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    return state/cv-bytes
+]
+
+brom-conv-length: func [
+    "Length of the response currently being heard."
+    :conv [c-pointer!] "Borrowed convolver."
+    return: [i32!] "Taps; zero before any response was staged. During a crossover, the longer of the two."
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    live: either state/cv-set = 0 [state/cv-length-0] [state/cv-length-1]
+    if not state/cv-pending [return live]
+    spare: either state/cv-set = 0 [state/cv-length-1] [state/cv-length-0]
+    return either spare > live [spare] [live]
+]
+
+brom-conv-busy: func [
+    "Whether a response is being staged or crossed over to, so a new one cannot start yet."
+    :conv [c-pointer!] "Borrowed convolver."
+    return: [logic!] "True while staging or crossing over."
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    return any [state/cv-staging state/cv-pending]
+]
+
+brom-conv-staging: func [
+    "Whether a staged response is still being transformed."
+    :conv [c-pointer!] "Borrowed convolver."
+    return: [logic!] "True until brom-conv-stage-step has transformed every partition."
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    return state/cv-staging
+]
+
+brom-conv-reset: func [
+    "Silence the convolver: clear every input history, delay line and pending output. The live response is kept."
+    :conv [c-pointer!] "Borrowed convolver."
+    return: [none!]
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    conv-clear state/cv-hist-l (2 * BROM-CONV-HEAD)
+    conv-clear state/cv-hist-r (2 * BROM-CONV-HEAD)
+    state/cv-hist-pos: 0
+    state/cv-tick-pos: 0
+    repeat index BROM-CONV-LEVELS [
+        lv: make [#mutable conv-level!] as conv-level! (conv-level-view :state index)
+        parts: lv/lv-max-parts
+        if parts > 0 [
+            size: lv/lv-size
+            bins: lv/lv-bins
+            conv-clear lv/lv-frame-l (2 * size)
+            conv-clear lv/lv-frame-r (2 * size)
+            conv-clear lv/lv-fdl-re-l (parts * bins)
+            conv-clear lv/lv-fdl-im-l (parts * bins)
+            conv-clear lv/lv-fdl-re-r (parts * bins)
+            conv-clear lv/lv-fdl-im-r (parts * bins)
+            conv-clear lv/lv-play-l size
+            conv-clear lv/lv-play-r size
+            conv-clear lv/lv-play-alt-l size
+            conv-clear lv/lv-play-alt-r size
+            conv-clear lv/lv-build-l size
+            conv-clear lv/lv-build-r size
+            conv-clear lv/lv-build-alt-l size
+            conv-clear lv/lv-build-alt-r size
+            lv/lv-fdl-head: 0
+            lv/lv-pos: 0
+            lv/lv-tick: 0
+            lv/lv-units: 0
+            lv/lv-done: 0
+            lv/lv-phase: CONV-PHASE-STEADY
+        ]
+    ]
+]
+
+brom-conv-clear: func [
+    "Silence the convolver and forget its response, abandoning any staging or crossover, so the next response staged is taken at once instead of faded to. For a host's activate, which builds a new response before audio starts; not while the audio thread is processing."
+    :conv [c-pointer!] "Borrowed convolver."
+    return: [none!]
+] [
+    brom-conv-reset :conv
+    state: make [#mutable conv-state!] as conv-state! conv
+    state/cv-staging: false
+    state/cv-pending: false
+    state/cv-head-fade: 0
+    state/cv-length-0: 0
+    state/cv-length-1: 0
+    conv-clear state/cv-head-0 (4 * BROM-CONV-HEAD)
+    conv-clear state/cv-head-1 (4 * BROM-CONV-HEAD)
+    ; Every level back on the live set with nothing pending, as after create.
+    repeat index BROM-CONV-LEVELS [
+        lv: make [#mutable conv-level!] as conv-level! (conv-level-view :state index)
+        lv/lv-set: state/cv-set
+        lv/lv-switched: true
+    ]
+]
+
+; --- staging ----------------------------------------------------------------
+
+brom-conv-stage-begin: func [
+    "Start staging a new response into the spare set. The four sources are read, not copied, so they must stay valid and unchanged until brom-conv-staging turns false."
+    :conv [c-pointer!] "Borrowed convolver."
+    :ll [c-pointer!] "Borrowed L->L taps, or null for a silent path."
+    :lr [c-pointer!] "Borrowed L->R taps, or null."
+    :rl [c-pointer!] "Borrowed R->L taps, or null."
+    :rr [c-pointer!] "Borrowed R->R taps, or null."
+    length [i32!] "Taps per path; clamped to the capacity."
+    gain [f64!] "Linear gain applied to every tap as it is staged."
+    return: [logic!] "False while a previous response is still staging or crossing over."
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    if any [state/cv-staging state/cv-pending] [return false]
+    taps: make [#mutable i32!] length
+    if taps < 0 [taps: 0]
+    if taps > state/cv-capacity [taps: state/cv-capacity]
+    state/cv-src-ll: ll
+    state/cv-src-lr: lr
+    state/cv-src-rl: rl
+    state/cv-src-rr: rr
+    state/cv-src-length: taps
+    state/cv-src-gain: gain
+    state/cv-stage-level: -1
+    state/cv-stage-path: 0
+    state/cv-stage-part: 0
+    state/cv-staging: true
+    return true
+]
+
+conv-source: func [
+    #inline
+    "The staged source buffer for one path."
+    :state [conv-state!] "Borrowed convolver state."
+    path [i32!] "BROM-CONV-LL .. BROM-CONV-RR."
+    return: [c-pointer!] "Borrowed source, possibly null."
+] [
+    if path = BROM-CONV-LL [return state/cv-src-ll]
+    if path = BROM-CONV-LR [return state/cv-src-lr]
+    if path = BROM-CONV-RL [return state/cv-src-rl]
+    return state/cv-src-rr
+]
+
+conv-stage-head: func [
+    "Copy the first BROM-CONV-HEAD taps of every path, reversed and scaled, into the spare head set."
+    :state [conv-state!] "Borrowed convolver state."
+    return: [none!]
+] [
+    head: either state/cv-set = 0 [state/cv-head-1] [state/cv-head-0]
+    gain: state/cv-src-gain
+    taps: state/cv-src-length
+    repeat path 4 [
+        src: conv-source :state path
+        repeat j BROM-CONV-HEAD [
+            tap: BROM-CONV-HEAD - 1 - j
+            value: either any [src = as c-pointer! 0 tap >= taps] [0.0] [gain * (conv-get :src tap)]
+            conv-put :head ((path * BROM-CONV-HEAD) + j) value
+        ]
+    ]
+]
+
+conv-forward: func [
+    "Forward-transform a 2P time frame into a spectrum slot of lv-bins real and imaginary parts."
+    :lv [conv-level!] "Borrowed level record."
+    :input [vector! [f64!]] "Borrowed 2P time frame."
+    :dest-re [c-pointer!] "Borrowed slot for the real parts."
+    :dest-im [c-pointer!] "Borrowed slot for the imaginary parts."
+    return: [none!]
+] [
+    bytes: lv/lv-bins * 8
+    plan: lv/lv-plan
+    spec-re: lv/lv-spec-re
+    spec-im: lv/lv-spec-im
+    rfft-forward :plan :input :spec-re :spec-im
+    unsafe/memcpy dest-re spec-re/data bytes
+    unsafe/memcpy dest-im spec-im/data bytes
+    return none
+]
+
+conv-stage-partition: func [
+    "Transform one partition of one path into the spare set."
+    :state [conv-state!] "Borrowed convolver state."
+    :lv [conv-level!] "Borrowed level record."
+    path [i32!] "BROM-CONV-LL .. BROM-CONV-RR."
+    part [i32!] "Partition index inside the level."
+    return: [none!]
+] [
+    size: lv/lv-size
+    bins: lv/lv-bins
+    time-vec: lv/lv-time
+    time: time-vec/data
+    src: conv-source :state path
+    gain: state/cv-src-gain
+    taps: state/cv-src-length
+    ; Not called `first`: once any module of the build imports std/string,
+    ; even only `find`, a local `first` here is compiled as a call to
+    ; std/string's `first` (a Recoil compiler bug, T4108 with no location).
+    first-tap: lv/lv-offset + (part * size)
+    conv-clear time (2 * size)
+    if src <> as c-pointer! 0 [
+        repeat j size [
+            tap: first-tap + j
+            if tap < taps [conv-put :time j (gain * (conv-get :src tap))]
+        ]
+    ]
+    spare-re: either state/cv-set = 0 [lv/lv-h-re-1] [lv/lv-h-re-0]
+    spare-im: either state/cv-set = 0 [lv/lv-h-im-1] [lv/lv-h-im-0]
+    slot: ((path * lv/lv-max-parts) + part) * bins
+    conv-forward :lv :time-vec (conv-at :spare-re slot) (conv-at :spare-im slot)
+]
+
+brom-conv-stage-step: func [
+    "Transform staged partitions until roughly `budget` FFT points have been spent. Call once per block from the audio thread; when the last partition is done, the response starts crossing over."
+    :conv [c-pointer!] "Borrowed convolver."
+    budget [i32!] "FFT points to spend; at least one partition is always transformed."
+    return: [logic!] "True when staging has finished (including on this call)."
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    if not state/cv-staging [return true]
+    spent: make [#mutable i32!] 0
+    if state/cv-stage-level < 0 [
+        conv-stage-head :state
+        state/cv-stage-level: 0
+        spent: BROM-CONV-HEAD * 4
+    ]
+    while [state/cv-stage-level < BROM-CONV-LEVELS] [
+        lv: make [#mutable conv-level!] as conv-level! (conv-level-view :state state/cv-stage-level)
+        parts: conv-parts-for state/cv-stage-level state/cv-src-length
+        if any [state/cv-stage-part >= parts lv/lv-max-parts = 0] [
+            state/cv-stage-part: 0
+            state/cv-stage-path: state/cv-stage-path + 1
+            if any [state/cv-stage-path >= 4 parts = 0] [
+                state/cv-stage-path: 0
+                state/cv-stage-level: state/cv-stage-level + 1
+            ]
+            continue
+        ]
+        if spent >= budget [return false]
+        conv-stage-partition :state :lv state/cv-stage-path state/cv-stage-part
+        spent: spent + (2 * lv/lv-size)
+        state/cv-stage-part: state/cv-stage-part + 1
+    ]
+    ; Every partition is in the spare set. Record its extent, then hand it to
+    ; the levels, which cross over one by one at their own boundaries.
+    spare-length: state/cv-src-length
+    either state/cv-set = 0 [state/cv-length-1: spare-length] [state/cv-length-0: spare-length]
+    live-length: either state/cv-set = 0 [state/cv-length-0] [state/cv-length-1]
+    repeat index BROM-CONV-LEVELS [
+        lv2: make [#mutable conv-level!] as conv-level! (conv-level-view :state index)
+        ; A level neither response reaches has nothing to fade, so it crosses
+        ; over at once instead of holding the swap for a whole block of its
+        ; own -- which for the top level would be 65536 samples of waiting.
+        idle: all [
+            (conv-parts-for index live-length) = 0
+            (conv-parts-for index spare-length) = 0
+        ]
+        lv2/lv-switched: any [lv2/lv-max-parts = 0 idle]
+        if all [lv2/lv-max-parts > 0 idle] [lv2/lv-set: 1 - lv2/lv-set]
+    ]
+    state/cv-staging: false
+    ; Nothing is heard yet, so there is nothing to fade from: take the new
+    ; response at once. This is what makes the first load immediate.
+    if live-length = 0 [
+        repeat index3 BROM-CONV-LEVELS [
+            lv3: make [#mutable conv-level!] as conv-level! (conv-level-view :state index3)
+            if not lv3/lv-switched [lv3/lv-set: 1 - lv3/lv-set]
+            lv3/lv-switched: true
+        ]
+        state/cv-set: 1 - state/cv-set
+        state/cv-pending: false
+        state/cv-head-fade: 0
+        return true
+    ]
+    state/cv-pending: true
+    state/cv-head-fade: BROM-CONV-HEAD-FADE
+    return true
+]
+
+; --- block work -------------------------------------------------------------
+
+conv-set-parts: func [
+    "Partitions in use by one set at one level."
+    :state [conv-state!] "Borrowed convolver state."
+    index [i32!] "Level index."
+    set [i32!] "Set 0 or 1."
+    return: [i32!] "Partition count."
+] [
+    length: either set = 0 [state/cv-length-0] [state/cv-length-1]
+    return conv-parts-for index length
+]
+
+conv-mac: func [
+    "Accumulate one partition's contribution for both outputs: acc_o += X_L[slot] H_L->o[part] + X_R[slot] H_R->o[part]."
+    :lv [conv-level!] "Borrowed level record."
+    set [i32!] "Partition set 0 or 1."
+    part [i32!] "Partition index."
+    alt [logic!] "Accumulate into the -alt accumulators instead."
+    return: [none!]
+] [
+    bins: lv/lv-bins
+    parts: lv/lv-max-parts
+    raw-slot: lv/lv-fdl-head - part
+    slot: either raw-slot < 0 [raw-slot + parts] [raw-slot]
+    x-off: slot * bins
+    xlr: conv-at lv/lv-fdl-re-l x-off
+    xli: conv-at lv/lv-fdl-im-l x-off
+    xrr: conv-at lv/lv-fdl-re-r x-off
+    xri: conv-at lv/lv-fdl-im-r x-off
+    h-re: either set = 0 [lv/lv-h-re-0] [lv/lv-h-re-1]
+    h-im: either set = 0 [lv/lv-h-im-0] [lv/lv-h-im-1]
+    ll-off: ((BROM-CONV-LL * parts) + part) * bins
+    lr-off: ((BROM-CONV-LR * parts) + part) * bins
+    rl-off: ((BROM-CONV-RL * parts) + part) * bins
+    rr-off: ((BROM-CONV-RR * parts) + part) * bins
+    hllr: conv-at :h-re ll-off
+    hlli: conv-at :h-im ll-off
+    hlrr: conv-at :h-re lr-off
+    hlri: conv-at :h-im lr-off
+    hrlr: conv-at :h-re rl-off
+    hrli: conv-at :h-im rl-off
+    hrrr: conv-at :h-re rr-off
+    hrri: conv-at :h-im rr-off
+    acc-lr: either alt [lv/lv-alt-re-l] [lv/lv-acc-re-l]
+    acc-li: either alt [lv/lv-alt-im-l] [lv/lv-acc-im-l]
+    acc-rr: either alt [lv/lv-alt-re-r] [lv/lv-acc-re-r]
+    acc-ri: either alt [lv/lv-alt-im-r] [lv/lv-acc-im-r]
+    repeat k bins [
+        a-r: conv-get :xlr k
+        a-i: conv-get :xli k
+        b-r: conv-get :xrr k
+        b-i: conv-get :xri k
+        p-r: conv-get :hllr k
+        p-i: conv-get :hlli k
+        q-r: conv-get :hrlr k
+        q-i: conv-get :hrli k
+        conv-put :acc-lr k ((conv-get :acc-lr k) + (((a-r * p-r) - (a-i * p-i)) + ((b-r * q-r) - (b-i * q-i))))
+        conv-put :acc-li k ((conv-get :acc-li k) + (((a-r * p-i) + (a-i * p-r)) + ((b-r * q-i) + (b-i * q-r))))
+        s-r: conv-get :hlrr k
+        s-i: conv-get :hlri k
+        t-r: conv-get :hrrr k
+        t-i: conv-get :hrri k
+        conv-put :acc-rr k ((conv-get :acc-rr k) + (((a-r * s-r) - (a-i * s-i)) + ((b-r * t-r) - (b-i * t-i))))
+        conv-put :acc-ri k ((conv-get :acc-ri k) + (((a-r * s-i) + (a-i * s-r)) + ((b-r * t-i) + (b-i * t-r))))
+    ]
+]
+
+conv-inverse: func [
+    "Inverse-transform one accumulator into a build buffer, keeping the valid last half of the overlap-save frame."
+    :lv [conv-level!] "Borrowed level record."
+    :acc-re [c-pointer!] "Borrowed accumulator real parts."
+    :acc-im [c-pointer!] "Borrowed accumulator imaginary parts."
+    :dest [c-pointer!] "Borrowed lv-size output buffer."
+    return: [none!]
+] [
+    size: lv/lv-size
+    bytes: lv/lv-bins * 8
+    plan: lv/lv-plan
+    time-vec: lv/lv-time
+    time: time-vec/data
+    spec-re: lv/lv-spec-re
+    spec-im: lv/lv-spec-im
+    ; The inverse runs inside the spectrum it is given, so it gets a copy
+    ; and the accumulator is left as it was.
+    unsafe/memcpy spec-re/data acc-re bytes
+    unsafe/memcpy spec-im/data acc-im bytes
+    rfft-inverse :plan :spec-re :spec-im :time-vec
+    unsafe/memcpy dest (conv-at :time size) (size * 8)
+    return none
+]
+
+; The snapshot is bound in a helper of its own, in a straight-line body: a
+; vector bound inside a block that returns early is not released, and an
+; `either` choosing between two vector fields retains both and releases one,
+; so either form in conv-run-unit would leave a reference behind per call.
+conv-forward-left: func [
+    "Transform the left snapshot into the left delay-line slot at `x-off`."
+    :lv [conv-level!] "Borrowed level record."
+    x-off [i32!] "Element offset of the slot in the delay line."
+    return: [none!]
+] [
+    snap: lv/lv-snap-l
+    conv-forward :lv :snap (conv-at lv/lv-fdl-re-l x-off) (conv-at lv/lv-fdl-im-l x-off)
+]
+
+conv-forward-right: func [
+    "Transform the right snapshot into the right delay-line slot at `x-off`."
+    :lv [conv-level!] "Borrowed level record."
+    x-off [i32!] "Element offset of the slot in the delay line."
+    return: [none!]
+] [
+    snap: lv/lv-snap-r
+    conv-forward :lv :snap (conv-at lv/lv-fdl-re-r x-off) (conv-at lv/lv-fdl-im-r x-off)
+]
+
+conv-unit-count: func [
+    "Work units in one block for a level: two forward FFTs, the MACs, and the inverse FFTs, doubled for a DUAL block."
+    :state [conv-state!] "Borrowed convolver state."
+    :lv [conv-level!] "Borrowed level record."
+    index [i32!] "Level index."
+    return: [i32!] "Unit count."
+] [
+    live-parts: conv-set-parts :state index lv/lv-set
+    if lv/lv-phase = CONV-PHASE-DUAL [
+        other-parts: conv-set-parts :state index (1 - lv/lv-set)
+        return 2 + live-parts + other-parts + 4
+    ]
+    return 2 + live-parts + 2
+]
+
+conv-run-unit: func [
+    "Perform work unit `unit` of the current block for a level."
+    :state [conv-state!] "Borrowed convolver state."
+    :lv [conv-level!] "Borrowed level record."
+    index [i32!] "Level index."
+    unit [i32!] "Unit number in 0 .. conv-unit-count - 1."
+    return: [none!]
+] [
+    bins: lv/lv-bins
+    x-off: lv/lv-fdl-head * bins
+    dual: lv/lv-phase = CONV-PHASE-DUAL
+    live: lv/lv-set
+    live-parts: conv-set-parts :state index live
+    other-parts: either dual [conv-set-parts :state index (1 - live)] [0]
+    mac-end: 2 + live-parts + other-parts
+    if unit = 0 [
+        ; Clear the accumulators for this block, then transform the left
+        ; input frame into the delay-line slot the boundary advanced to.
+        conv-clear lv/lv-acc-re-l bins
+        conv-clear lv/lv-acc-im-l bins
+        conv-clear lv/lv-acc-re-r bins
+        conv-clear lv/lv-acc-im-r bins
+        conv-clear lv/lv-alt-re-l bins
+        conv-clear lv/lv-alt-im-l bins
+        conv-clear lv/lv-alt-re-r bins
+        conv-clear lv/lv-alt-im-r bins
+        conv-forward-left :lv x-off
+        return none
+    ]
+    if unit = 1 [
+        conv-forward-right :lv x-off
+        return none
+    ]
+    if unit < (2 + live-parts) [
+        conv-mac :lv live (unit - 2) false
+        return none
+    ]
+    if unit < mac-end [
+        conv-mac :lv (1 - live) (unit - 2 - live-parts) true
+        return none
+    ]
+    step: unit - mac-end
+    if step = 0 [conv-inverse :lv lv/lv-acc-re-l lv/lv-acc-im-l lv/lv-build-l]
+    if step = 1 [conv-inverse :lv lv/lv-acc-re-r lv/lv-acc-im-r lv/lv-build-r]
+    if step = 2 [conv-inverse :lv lv/lv-alt-re-l lv/lv-alt-im-l lv/lv-build-alt-l]
+    if step = 3 [conv-inverse :lv lv/lv-alt-re-r lv/lv-alt-im-r lv/lv-build-alt-r]
+]
+
+conv-boundary: func [
+    "Start a new block for a level: advance the crossover phase, promote the built output to playing, snapshot the input frame and reset the scheduler."
+    :state [conv-state!] "Borrowed convolver state."
+    :lv [conv-level!] "Borrowed level record."
+    index [i32!] "Level index."
+    return: [none!]
+] [
+    size: lv/lv-size
+    ; Crossover bookkeeping first: it decides what the outputs built during the
+    ; block that just ended mean.
+    if lv/lv-phase = CONV-PHASE-FADE [
+        lv/lv-phase: CONV-PHASE-STEADY
+        lv/lv-switched: true
+    ]
+    if lv/lv-phase = CONV-PHASE-DUAL [
+        ; Last block computed both; play them faded, and from now on compute
+        ; with the new set only.
+        lv/lv-phase: CONV-PHASE-FADE
+        lv/lv-set: 1 - lv/lv-set
+    ]
+    if all [lv/lv-phase = CONV-PHASE-STEADY state/cv-pending not lv/lv-switched] [
+        lv/lv-phase: CONV-PHASE-DUAL
+    ]
+    ; Promote: the block built last period plays now.
+    old-play-l: lv/lv-play-l
+    old-play-r: lv/lv-play-r
+    lv/lv-play-l: lv/lv-build-l
+    lv/lv-play-r: lv/lv-build-r
+    lv/lv-build-l: old-play-l
+    lv/lv-build-r: old-play-r
+    old-alt-l: lv/lv-play-alt-l
+    old-alt-r: lv/lv-play-alt-r
+    lv/lv-play-alt-l: lv/lv-build-alt-l
+    lv/lv-play-alt-r: lv/lv-build-alt-r
+    lv/lv-build-alt-l: old-alt-l
+    lv/lv-build-alt-r: old-alt-r
+    ; In FADE the alt pair holds the new set's output and the main pair the
+    ; old one -- but the live set has already flipped, so swap them so the
+    ; main pair is always "live" and alt is always "the other".
+    if lv/lv-phase = CONV-PHASE-FADE [
+        main-l: lv/lv-play-l
+        main-r: lv/lv-play-r
+        lv/lv-play-l: lv/lv-play-alt-l
+        lv/lv-play-r: lv/lv-play-alt-r
+        lv/lv-play-alt-l: main-l
+        lv/lv-play-alt-r: main-r
+    ]
+    ; Snapshot the frame and slide it by one block.
+    frame-l: lv/lv-frame-l
+    frame-r: lv/lv-frame-r
+    snap-l: lv/lv-snap-l
+    snap-r: lv/lv-snap-r
+    unsafe/memcpy snap-l/data frame-l (2 * size * 8)
+    unsafe/memcpy snap-r/data frame-r (2 * size * 8)
+    unsafe/memcpy frame-l (conv-at :frame-l size) (size * 8)
+    unsafe/memcpy frame-r (conv-at :frame-r size) (size * 8)
+    next-head: lv/lv-fdl-head + 1
+    lv/lv-fdl-head: either next-head >= lv/lv-max-parts [0] [next-head]
+    lv/lv-pos: 0
+    lv/lv-tick: 0
+    lv/lv-done: 0
+    lv/lv-units: conv-unit-count :state :lv index
+]
+
+conv-tick: func [
+    "Run this tick's share of a level's block work."
+    :state [conv-state!] "Borrowed convolver state."
+    :lv [conv-level!] "Borrowed level record."
+    index [i32!] "Level index."
+    return: [none!]
+] [
+    ticks: lv/lv-ticks
+    units: lv/lv-units
+    target: ((lv/lv-tick + 1) * units) / ticks
+    while [lv/lv-done < target] [
+        conv-run-unit :state :lv index lv/lv-done
+        lv/lv-done: lv/lv-done + 1
+    ]
+    lv/lv-tick: lv/lv-tick + 1
+]
+
+conv-finish-crossover: func [
+    "Retire the pending response once every level and the head have crossed over to it."
+    :state [conv-state!] "Borrowed convolver state."
+    return: [none!]
+] [
+    if not state/cv-pending [return none]
+    if state/cv-head-fade > 0 [return none]
+    repeat index BROM-CONV-LEVELS [
+        lv: make [#mutable conv-level!] as conv-level! (conv-level-view :state index)
+        if not lv/lv-switched [return none]
+    ]
+    state/cv-set: 1 - state/cv-set
+    state/cv-pending: false
+]
+
+conv-head-out: func [
+    #inline
+    "One output channel of the direct-form head: taps of path `from-l` against the left window plus taps of `from-r` against the right."
+    :head [c-pointer!] "Borrowed head set: 4 paths of reversed taps."
+    from-l [i32!] "Path from the left input to this output."
+    from-r [i32!] "Path from the right input to this output."
+    :win-l [c-pointer!] "Borrowed oldest-first window of the last HEAD left inputs."
+    :win-r [c-pointer!] "Borrowed oldest-first window of the last HEAD right inputs."
+    return: [f64!] "The head's output for this sample."
+] [
+    taps-l: conv-at :head (from-l * BROM-CONV-HEAD)
+    taps-r: conv-at :head (from-r * BROM-CONV-HEAD)
+    ; Four independent sums rather than one: a single accumulator makes
+    ; every multiply-add wait for the previous add, and this loop runs 256
+    ; times per output sample.
+    a0: make [#mutable f64!] 0.0
+    a1: make [#mutable f64!] 0.0
+    b0: make [#mutable f64!] 0.0
+    b1: make [#mutable f64!] 0.0
+    repeat half (BROM-CONV-HEAD / 2) [
+        j: half * 2
+        k: j + 1
+        a0: a0 + ((conv-get :taps-l j) * (conv-get :win-l j))
+        a1: a1 + ((conv-get :taps-l k) * (conv-get :win-l k))
+        b0: b0 + ((conv-get :taps-r j) * (conv-get :win-r j))
+        b1: b1 + ((conv-get :taps-r k) * (conv-get :win-r k))
+    ]
+    return (a0 + a1) + (b0 + b1)
+]
+
+conv-feed-level: func [
+    "Copy a run of input into a level's frame, at its current block position."
+    :lv [conv-level!] "Borrowed level record."
+    :in-l [c-pointer!] "Borrowed left input run."
+    :in-r [c-pointer!] "Borrowed right input run."
+    count [i32!] "Samples in the run; never crosses the level's block end."
+    return: [none!]
+] [
+    write-at: lv/lv-size + lv/lv-pos
+    unsafe/memcpy (conv-at lv/lv-frame-l write-at) in-l (count * 8)
+    unsafe/memcpy (conv-at lv/lv-frame-r write-at) in-r (count * 8)
+    return none
+]
+
+conv-play-level: func [
+    "Add a run of a level's playing output into the outputs, fading old to new during a crossover, and advance its position."
+    :lv [conv-level!] "Borrowed level record."
+    :out-l [c-pointer!] "Borrowed left output run, accumulated into."
+    :out-r [c-pointer!] "Borrowed right output run, accumulated into."
+    count [i32!] "Samples in the run."
+    return: [none!]
+] [
+    p: lv/lv-pos
+    play-l: conv-at lv/lv-play-l p
+    play-r: conv-at lv/lv-play-r p
+    either lv/lv-phase = CONV-PHASE-FADE [
+        ; Main is the new set, alt the old one.
+        alt-l: conv-at lv/lv-play-alt-l p
+        alt-r: conv-at lv/lv-play-alt-r p
+        inv-size: 1.0 / (as f64! lv/lv-size)
+        repeat i count [
+            g: ((as f64! (p + i)) + 0.5) * inv-size
+            h: 1.0 - g
+            conv-put :out-l i ((conv-get :out-l i) + (((conv-get :play-l i) * g) + ((conv-get :alt-l i) * h)))
+            conv-put :out-r i ((conv-get :out-r i) + (((conv-get :play-r i) * g) + ((conv-get :alt-r i) * h)))
+        ]
+    ] [
+        repeat i count [
+            conv-put :out-l i ((conv-get :out-l i) + (conv-get :play-l i))
+            conv-put :out-r i ((conv-get :out-r i) + (conv-get :play-r i))
+        ]
+    ]
+    lv/lv-pos: p + count
+    return none
+]
+
+conv-head-run: func [
+    "Run the direct-form head over a run of input, writing (not adding) the outputs."
+    :state [conv-state!] "Borrowed convolver state."
+    :in-l [c-pointer!] "Borrowed left input run."
+    :in-r [c-pointer!] "Borrowed right input run."
+    :out-l [c-pointer!] "Borrowed left output run; may alias in-l."
+    :out-r [c-pointer!] "Borrowed right output run; may alias in-r."
+    count [i32!] "Samples in the run."
+    return: [none!]
+] [
+    hist-l: state/cv-hist-l
+    hist-r: state/cv-hist-r
+    live-head: either state/cv-set = 0 [state/cv-head-0] [state/cv-head-1]
+    new-head: either state/cv-set = 0 [state/cv-head-1] [state/cv-head-0]
+    ; While a response is pending the head fades to it, then stays on it
+    ; until the slowest level has crossed over and the sets swap.
+    on-new: all [state/cv-pending state/cv-head-fade = 0]
+    heard-head: either on-new [new-head] [live-head]
+    repeat n count [
+        x-l: conv-get :in-l n
+        x-r: conv-get :in-r n
+        ; The history is written at pos and pos + HEAD, so the last HEAD
+        ; samples always sit contiguously at pos + 1 .. pos + HEAD.
+        pos: state/cv-hist-pos
+        conv-put :hist-l pos x-l
+        conv-put :hist-l (pos + BROM-CONV-HEAD) x-l
+        conv-put :hist-r pos x-r
+        conv-put :hist-r (pos + BROM-CONV-HEAD) x-r
+        win-l: conv-at :hist-l (pos + 1)
+        win-r: conv-at :hist-r (pos + 1)
+        y-l: make [#mutable f64!] conv-head-out :heard-head BROM-CONV-LL BROM-CONV-RL :win-l :win-r
+        y-r: make [#mutable f64!] conv-head-out :heard-head BROM-CONV-LR BROM-CONV-RR :win-l :win-r
+        if all [state/cv-pending state/cv-head-fade > 0] [
+            n-l: conv-head-out :new-head BROM-CONV-LL BROM-CONV-RL :win-l :win-r
+            n-r: conv-head-out :new-head BROM-CONV-LR BROM-CONV-RR :win-l :win-r
+            g: 1.0 - ((as f64! state/cv-head-fade) / (as f64! BROM-CONV-HEAD-FADE))
+            y-l: (y-l * (1.0 - g)) + (n-l * g)
+            y-r: (y-r * (1.0 - g)) + (n-r * g)
+            state/cv-head-fade: state/cv-head-fade - 1
+        ]
+        next-pos: pos + 1
+        state/cv-hist-pos: either next-pos >= BROM-CONV-HEAD [0] [next-pos]
+        conv-put :out-l n y-l
+        conv-put :out-r n y-r
+    ]
+    return none
+]
+
+brom-conv-process: func [
+    "Convolve `frames` samples of stereo input. Writes the wet signal only; mix it with the dry signal yourself."
+    :conv [c-pointer!] "Borrowed convolver."
+    :in-l [c-pointer!] "Borrowed left input, `frames` f64."
+    :in-r [c-pointer!] "Borrowed right input, `frames` f64."
+    :out-l [c-pointer!] "Borrowed left output, `frames` f64; may alias in-l."
+    :out-r [c-pointer!] "Borrowed right output, `frames` f64; may alias in-r."
+    frames [i32!] "Samples to process."
+    return: [none!]
+] [
+    state: make [#mutable conv-state!] as conv-state! conv
+    done: make [#mutable i32!] 0
+    ; Work in runs that end at the next tick, so every level is handled once
+    ; per run instead of once per sample.
+    while [done < frames] [
+        room: BROM-CONV-TICK - state/cv-tick-pos
+        left: frames - done
+        count: either left < room [left] [room]
+        run-in-l: conv-at :in-l done
+        run-in-r: conv-at :in-r done
+        run-out-l: conv-at :out-l done
+        run-out-r: conv-at :out-r done
+        ; Feed the levels before the head writes the outputs, because the
+        ; outputs may be the inputs.
+        repeat index BROM-CONV-LEVELS [
+            lv: make [#mutable conv-level!] as conv-level! (conv-level-view :state index)
+            if lv/lv-max-parts > 0 [conv-feed-level :lv :run-in-l :run-in-r count]
+        ]
+        conv-head-run :state :run-in-l :run-in-r :run-out-l :run-out-r count
+        repeat index2 BROM-CONV-LEVELS [
+            lv2: make [#mutable conv-level!] as conv-level! (conv-level-view :state index2)
+            if lv2/lv-max-parts > 0 [conv-play-level :lv2 :run-out-l :run-out-r count]
+        ]
+        done: done + count
+        tick-next: state/cv-tick-pos + count
+        state/cv-tick-pos: either tick-next >= BROM-CONV-TICK [0] [tick-next]
+        ; Tick: after the sample that completes one.
+        if state/cv-tick-pos = 0 [
+            repeat index3 BROM-CONV-LEVELS [
+                lv3: make [#mutable conv-level!] as conv-level! (conv-level-view :state index3)
+                if lv3/lv-max-parts > 0 [
+                    if lv3/lv-pos >= lv3/lv-size [conv-boundary :state :lv3 index3]
+                    conv-tick :state :lv3 index3
+                ]
+            ]
+            conv-finish-crossover :state
+        ]
+    ]
+]

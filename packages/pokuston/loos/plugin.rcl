@@ -1,0 +1,375 @@
+Recoil [
+    Title: "Loos format-neutral plug-in contract"
+    Description: {
+        Owns the engine descriptor, the host parameter schema, the state
+        contract and the factory bank shared by CLAP, VST3 and AUv2. The
+        synthesis stays in core.rcl.
+
+        This exists because the previous arrangement put all of it inside
+        clap/clap_entry.rcl, where only CLAP could reach it. That was invisible
+        while Loos had no presets -- a bank is keyed by parameter slug, and a
+        slug is built from the module and name a parameter is declared with, so
+        a schema only CLAP can see is a bank only CLAP can read. It was not
+        entirely invisible even then: the parameter count and state size were
+        restated in loos.h, drifted, and left the VST3 and AUv2 bridges
+        automating and saving one parameter fewer than CLAP for as long as the
+        Shape control has existed.
+
+        Ranges are not restated here either. core.rcl states each one once, in
+        loos-parameter-min / loos-parameter-max, and this file asks.
+    }
+    Type: module
+    Module: examples/pokuston/loos/plugin
+    Ffi: [c-string]
+    Imports: [
+        brom/plugin/engine [engine! param-info!]
+        brom/plugin/preset [
+            preset-snapshot! preset-fill-buffer
+            preset-factory-count preset-factory-name preset-factory-key
+            preset-factory-materialize
+        ]
+        brom/plugin/preset/schema [
+            brom-preset-schema-read brom-preset-prepare-text
+            brom-preset-format-snapshot brom-preset-decode-legacy
+            brom-preset-apply-validated
+        ]
+        brom/plugin/state/dispatch [brom-state-load brom-state-save]
+        brom/plugin/values [param-range! param-linear]
+        examples/pokuston/loos/editor-size [LOOS-EDITOR-WIDTH LOOS-EDITOR-HEIGHT]
+        examples/pokuston/loos/presets [
+            LOOS-FACTORY-PRESET-COUNT loos-factory-preset
+        ]
+        examples/pokuston/loos/core [
+            LOOS_PARAM_CUTOFF LOOS_PARAM_RESONANCE LOOS_PARAM_ENV_AMOUNT
+            LOOS_PARAM_ATTACK LOOS_PARAM_DECAY LOOS_PARAM_SUSTAIN
+            LOOS_PARAM_RELEASE LOOS_PARAM_LFO_RATE LOOS_PARAM_LFO_CUTOFF_DEPTH
+            LOOS_PARAM_MORPH LOOS_PARAM_COUNT
+            LOOS_MAX_VOICES LOOS_MAX_BLOCK
+            LOOS_STATE_MAGIC LOOS_STATE_SCHEMA
+            loos-create loos-destroy loos-activate loos-reset
+            loos-voice-state loos-note-on loos-note-off
+            loos-process-block loos-output
+            loos-get-parameter loos-set-parameter
+            loos-parameter-min loos-parameter-max loos-parameter-default
+            loos-state-size loos-save-state loos-load-state
+        ]
+    ]
+    Exports: [
+        loos-brom-engine
+        loos-plugin-create loos-plugin-destroy loos-plugin-activate
+        loos-plugin-reset loos-plugin-voice-state
+        loos-plugin-note-on loos-plugin-note-off
+        loos-plugin-process loos-plugin-output
+        loos-plugin-param-info loos-plugin-get-param loos-plugin-set-param
+        loos-plugin-save loos-plugin-load
+        loos-state-load loos-state-save
+    ]
+]
+
+; The BROM container's 20-byte header (8-byte universal prefix + the inner
+; codec's 12-byte magic/version/count) plus eight bytes per parameter.
+LOOS-STATE-BYTES: 100
+
+math-ffi: foreign <math.h> [
+    pow: "pow" [f64! f64!] return: [f64!]
+]
+
+; --- the host-facing schema ---------------------------------------------------
+; The module and name a parameter is declared with are not only what a host
+; displays: brom/plugin/preset folds them into the slug every factory preset is
+; keyed by. Renaming one here silently orphans that parameter in every preset
+; that mentions it, which is why the bank spells the slugs out.
+
+loos-param-name: func [
+    "Return the host-facing name of a Loos parameter."
+    #export
+    id [u32!] "Public parameter id."
+    return: [c-string!] "Borrowed static name, empty for an unknown id."
+] [
+    if id = LOOS_PARAM_CUTOFF [return as c-string! "Cutoff"]
+    if id = LOOS_PARAM_RESONANCE [return as c-string! "Resonance"]
+    if id = LOOS_PARAM_ENV_AMOUNT [return as c-string! "Env Amount"]
+    if id = LOOS_PARAM_ATTACK [return as c-string! "Attack"]
+    if id = LOOS_PARAM_DECAY [return as c-string! "Decay"]
+    if id = LOOS_PARAM_SUSTAIN [return as c-string! "Sustain"]
+    if id = LOOS_PARAM_RELEASE [return as c-string! "Release"]
+    if id = LOOS_PARAM_LFO_RATE [return as c-string! "Rate"]
+    if id = LOOS_PARAM_LFO_CUTOFF_DEPTH [return as c-string! "Cutoff Depth"]
+    if id = LOOS_PARAM_MORPH [return as c-string! "Shape"]
+    return as c-string! ""
+]
+
+loos-param-module: func [
+    "Return the host grouping of a Loos parameter."
+    #export
+    id [u32!] "Public parameter id."
+    return: [c-string!] "Borrowed static group name."
+] [
+    if id = LOOS_PARAM_MORPH [return as c-string! "Oscillator"]
+    if any [
+        id = LOOS_PARAM_CUTOFF id = LOOS_PARAM_RESONANCE
+        id = LOOS_PARAM_ENV_AMOUNT
+    ] [return as c-string! "Filter"]
+    if any [
+        id = LOOS_PARAM_ATTACK id = LOOS_PARAM_DECAY
+        id = LOOS_PARAM_SUSTAIN id = LOOS_PARAM_RELEASE
+    ] [return as c-string! "Envelope"]
+    return as c-string! "LFO"
+]
+
+loos-plugin-param-info: func [
+    "Describe one parameter to Brom's host shells."
+    index [i32!] "Zero-based parameter index."
+    :out [c-pointer!] "Borrowed caller-owned param-info! address."
+    return: [logic!] "False when the index is outside the schema."
+] [
+    if any [index < 0 index >= LOOS_PARAM_COUNT] [return false]
+    id: make u32! as u32! index
+    ; Linear in engineering units, which is what Loos has always reported. The
+    ; perceptual mapping lives in the engine's normalization, not here: a taper
+    ; introduced at this boundary would move every automation curve ever drawn.
+    low: make f64! loos-parameter-min id
+    high: make f64! loos-parameter-max id
+    range: param-linear low high
+    info: make [#mutable param-info!] as param-info! :out
+    info/id: id
+    info/name: loos-param-name id
+    info/module: loos-param-module id
+    info/default-value: make f64! loos-parameter-default id
+    info/range: range
+    return true
+]
+
+; --- descriptor slots ---------------------------------------------------------
+
+loos-plugin-create: func [
+    "Allocate a Loos engine instance."
+    return: [c-pointer!] "Owned opaque engine state."
+] [
+    core: make c-pointer! loos-create
+    return core
+]
+
+loos-plugin-destroy: func [
+    "Release a Loos engine instance."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [none!] "No value."
+] [
+    loos-destroy core
+    return none
+]
+
+loos-plugin-activate: func [
+    "Prepare Loos for playback at a sample rate."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    sample-rate [f64!] "Host sample rate in Hz."
+    max-frames [i32!] "Largest host block; the core uses its fixed capacity."
+    return: [logic!] "Always true; the core cannot fail activation."
+] [
+    unused max-frames
+    loos-activate :core sample-rate
+    return true
+]
+
+loos-plugin-reset: func [
+    "Immediately silence voices and clear transient state while retaining parameters."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [none!] "No value."
+] [loos-reset :core]
+
+loos-plugin-voice-state: func [
+    "Report one voice to Brom's shared allocator."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Voice slot to inspect."
+    :out [c-pointer!] "Borrowed caller-owned voice report."
+    return: [logic!] "False for an invalid slot."
+] [return loos-voice-state :core slot :out]
+
+loos-plugin-note-on: func [
+    "Start one Loos voice, converting the key to a frequency."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Allocated voice slot."
+    key [i32!] "MIDI note number."
+    velocity [f64!] "Normalized note velocity."
+    return: [none!] "No value."
+] [
+    ; Tuning is the instrument's business: the descriptor carries the MIDI key
+    ; so the shared shell never has to know about equal temperament.
+    freq: make f64! 440.0 * math-ffi/pow 2.0 ((key - 69) / 12.0)
+    loos-note-on :core slot freq velocity
+    return none
+]
+
+loos-plugin-note-off: func [
+    "Release one Loos voice."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Voice slot to release."
+    return: [none!] "No value."
+] [loos-note-off :core slot return none]
+
+loos-plugin-process: func [
+    "Render one block into Loos' output buffer."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    frames [i32!] "Frames to render."
+    return: [none!] "No value."
+] [loos-process-block :core frames return none]
+
+loos-plugin-output: func [
+    "Return Loos' mono output buffer."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [c-pointer!] "Borrowed sample buffer."
+] [return loos-output :core]
+
+loos-plugin-get-param: func [
+    "Read one Loos parameter in engineering units."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    id [u32!] "Public parameter id."
+    return: [f64!] "Current engineering-unit value."
+] [return loos-get-parameter :core id]
+
+loos-plugin-set-param: func [
+    "Write one Loos parameter in engineering units."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    id [u32!] "Public parameter id."
+    value [f64!] "Engineering-unit value."
+    return: [logic!] "Whether the id was recognized."
+] [return loos-set-parameter :core id value]
+
+loos-plugin-save: func [
+    "Write Loos' fixed state envelope."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    out [c-pointer!] "Caller-owned destination bytes."
+    capacity [i32!] "Destination capacity."
+    return: [logic!] "Whether the state was written."
+] [
+    if any [capacity < LOOS-STATE-BYTES loos-state-size <> (as size! LOOS-STATE-BYTES)] [
+        return false
+    ]
+    return loos-save-state :core out (as size! LOOS-STATE-BYTES)
+]
+
+loos-plugin-load: func [
+    "Read Loos' fixed state envelope."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    bytes [c-pointer!] "Borrowed state bytes."
+    length [i32!] "Available byte count."
+    return: [logic!] "Whether strict schema-two state was accepted."
+] [
+    if length < LOOS-STATE-BYTES [return false]
+    return loos-load-state :core bytes (as size! LOOS-STATE-BYTES)
+]
+
+; --- the descriptor -----------------------------------------------------------
+
+loos-brom-engine: make engine! [
+    id: (as c-string! "com.pokuston.loos")
+    name: (as c-string! "Loos")
+    vendor: (as c-string! "Pokuston")
+    version: (as c-string! "0.2.0")
+    description: (as c-string! "Pokuston Loos: four polyphonic voices, one contour apiece")
+
+    param-count: LOOS_PARAM_COUNT
+    max-voices: LOOS_MAX_VOICES
+    state-size: LOOS-STATE-BYTES
+    output-capacity: LOOS_MAX_BLOCK
+    editor-width: LOOS-EDITOR-WIDTH
+    editor-height: LOOS-EDITOR-HEIGHT
+    ; Explicit: the field zero-initializes, so an editor must be declared.
+    has-editor: true
+
+    create-fn: :loos-plugin-create
+    destroy-fn: :loos-plugin-destroy
+    activate-fn: :loos-plugin-activate
+    reset-fn: :loos-plugin-reset
+
+    voice-state-fn: :loos-plugin-voice-state
+    custom-voice-slot: false
+
+    process-fn: :loos-plugin-process
+    output-fn: :loos-plugin-output
+    note-on-fn: :loos-plugin-note-on
+    note-off-fn: :loos-plugin-note-off
+
+    param-info-fn: :loos-plugin-param-info
+    get-param-fn: :loos-plugin-get-param
+    set-param-fn: :loos-plugin-set-param
+
+    state-subsystem: LOOS_STATE_MAGIC
+    state-version: LOOS_STATE_SCHEMA
+    state-save-ascii: false
+
+    save-state-fn: :loos-plugin-save
+    load-state-fn: :loos-plugin-load
+
+    ; These two fields are the whole of what turns the CLAP shell's factory
+    ; preset ABI and host preset discovery on. There is no shell code to add.
+    factory-count: LOOS-FACTORY-PRESET-COUNT
+    factory-preset-fn: :loos-factory-preset
+]
+
+
+loos-state-load: func [
+    "C-ABI entry point the VST3 shell calls to load Loos's session/preset state, through the shared BROM dispatcher."
+    #export
+    :core [c-pointer!] "Borrowed mutable engine instance."
+    bytes [c-pointer!] "Borrowed source bytes."
+    size [size!] "Available source byte count."
+    return: [logic!] "True when the blob was recognized and applied."
+] [return brom-state-load :loos-brom-engine :core bytes size]
+
+loos-state-save: func [
+    "C-ABI entry point the VST3 shell calls to save Loos's session/preset state, through the shared BROM dispatcher."
+    #export
+    :core [c-pointer!] "Borrowed engine instance the values are read from."
+    out [c-pointer!] "Caller-owned destination bytes."
+    capacity [size!] "Destination capacity."
+    return: [logic!] "True when the state fitted and was written."
+] [return brom-state-save :loos-brom-engine :core out capacity]
+
+; --- the factory bank, as the host formats see it -----------------------------
+
+loos-get-factory-preset-count: func [
+    "Return the number of built-in Loos presets."
+    #export
+    return: [u32!] "Factory-bank size."
+] [return as u32! preset-factory-count :loos-brom-engine]
+
+loos-factory-preset-name: func [
+    "Copy one factory preset's display name into caller-owned bytes."
+    #export
+    index [u32!] "Zero-based factory-bank index."
+    out [c-pointer!] "Caller-owned destination bytes."
+    capacity [u32!] "Destination capacity including the terminator."
+    return: [logic!] "True when the name fitted."
+] [
+    name: preset-factory-name :loos-brom-engine (as i32! index)
+    return preset-fill-buffer :name :out (as i32! capacity)
+]
+
+loos-factory-preset-key: func [
+    "Copy one factory preset's stable key into caller-owned bytes."
+    #export
+    index [u32!] "Zero-based factory-bank index."
+    out [c-pointer!] "Caller-owned destination bytes."
+    capacity [u32!] "Destination capacity including the terminator."
+    return: [logic!] "True when the key fitted."
+] [
+    key: preset-factory-key :loos-brom-engine (as i32! index)
+    return preset-fill-buffer :key :out (as i32! capacity)
+]
+
+loos-factory-preset-values: func [
+    "Materialize one complete factory preset into caller-owned f64 values."
+    #export
+    index [u32!] "Zero-based factory-bank index."
+    out [c-pointer!] "Caller-owned f64 array."
+    capacity [u32!] "Number of f64 slots available."
+    return: [logic!] "True when the canonical snapshot was copied."
+] [
+    if any [none? out capacity < (as u32! LOOS_PARAM_COUNT)] [return false]
+    snapshot: make [#mutable preset-snapshot!] [count: 0 index: -1 values: []]
+    if not preset-factory-materialize :loos-brom-engine (as i32! index)
+        (addr-of snapshot) [return false]
+    unsafe/memcpy out (addr-of snapshot/values) (LOOS_PARAM_COUNT * 8)
+    return true
+]

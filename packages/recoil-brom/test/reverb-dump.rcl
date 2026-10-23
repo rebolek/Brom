@@ -1,0 +1,167 @@
+Recoil [
+    Title: "Deterministic reverb listening renders"
+    Type: module
+    Module: recoil-brom/test/reverb-dump
+    Imports: [
+        std/io [arg-count arg-at]
+        brom/dsp/audio [brom-audio-f32!]
+        brom/dsp/reverb [
+            brom-reverb-state! brom-reverb-params! brom-reverb-activate
+            brom-reverb-deactivate brom-reverb-process
+        ]
+    ]
+    Exports: []
+]
+
+stdio: foreign <stdio.h> [
+    open: "fopen" [c-string! c-string! return: [c-pointer!]]
+    write: "fwrite" [c-pointer! size! size! c-pointer! return: [size!]]
+    close: "fclose" [c-pointer! return: [i32!]]
+]
+math: foreign <math.h> [
+    sin: "sinf" [f32! return: [f32!]]
+    exp: "expf" [f32! return: [f32!]]
+]
+
+; The native desktop acceptance targets are little endian. This is a canonical
+; 44-byte RIFF header for IEEE float stereo, followed by interleaved f32 samples.
+wave-header!: make c-struct! [
+    riff: [c-array! [u8! 4]]
+    riff-size: [u32!]
+    wave: [c-array! [u8! 4]]
+    fmt: [c-array! [u8! 4]]
+    fmt-size: [u32!]
+    format: [u16!]
+    channels: [u16!]
+    rate: [u32!]
+    byte-rate: [u32!]
+    alignment: [u16!]
+    bits: [u16!]
+    data: [c-array! [u8! 4]]
+    data-size: [u32!]
+]
+interleaved!: make c-struct! [samples: [c-array! [f32! 1024]]]
+static-assert ((size-of wave-header!) = 44) "Float WAV header size"
+RATE: 48000
+FRAMES: 960000
+
+write-header: func [
+    "Write a float stereo WAV header for the complete deterministic render."
+    :handle [c-pointer!] "Borrowed open output file."
+    return: [logic!] "True when the complete header was written."
+] [
+    header: make [#mutable wave-header!] []
+    header/riff/0: as u8! 82
+    header/riff/1: as u8! 73
+    header/riff/2: as u8! 70
+    header/riff/3: as u8! 70
+    header/riff-size: as u32! ((FRAMES * 8) + 36)
+    header/wave/0: as u8! 87
+    header/wave/1: as u8! 65
+    header/wave/2: as u8! 86
+    header/wave/3: as u8! 69
+    header/fmt/0: as u8! 102
+    header/fmt/1: as u8! 109
+    header/fmt/2: as u8! 116
+    header/fmt/3: as u8! 32
+    header/fmt-size: as u32! 16
+    header/format: as u16! 3
+    header/channels: as u16! 2
+    header/rate: as u32! RATE
+    header/byte-rate: as u32! (RATE * 8)
+    header/alignment: as u16! 8
+    header/bits: as u16! 32
+    header/data/0: as u8! 100
+    header/data/1: as u8! 97
+    header/data/2: as u8! 116
+    header/data/3: as u8! 97
+    header/data-size: as u32! (FRAMES * 8)
+    pointer: addr-of header
+    return (stdio/write :pointer (as size! 44) (as size! 1) handle) = (as size! 1)
+]
+
+render-case: func [
+    "Render an impulse, overload burst, sine/pluck or seeded stereo noise."
+    kind [i32!] "Zero through three selects the deterministic stimulus."
+    :path [string!] "Borrowed full output WAV path under the RUT cache."
+    return: [logic!] "True when activation and every file operation succeeds."
+] [
+    handle: stdio/open (ffi/export-c-string path) "wb"
+    if handle = (as c-pointer! 0) [return false]
+    if (write-header :handle) = false [stdio/close handle return false]
+    state: make [#mutable brom-reverb-state!] []
+    input: make [#mutable brom-audio-f32!] []
+    output: make [#mutable brom-audio-f32!] []
+    packed: make [#mutable interleaved!] []
+    params: make [#mutable brom-reverb-params!] []
+    params/mix: as f32! 1.0
+    params/decay-seconds: as f32! 4.0
+    params/damping-hz: as f32! 6000.0
+    params/size: as f32! 1.0
+    params/diffusion: as f32! 0.75
+    params/predelay-ms: as f32! 20.0
+    if (brom-reverb-activate :state 48000.0 512) = false [stdio/close handle return false]
+    seed: make [#mutable u32!] 12345
+    cursor: make [#mutable i32!] 0
+    ok?: make [#mutable logic!] true
+    ; Stop blocks at sample-indexed control transitions as a host adapter does.
+    while [cursor < FRAMES] [
+        if cursor = (RATE * 2) [
+            params/size: as f32! 2.0
+            params/predelay-ms: as f32! 200.0
+            params/diffusion: as f32! 1.0
+        ]
+        if cursor = (RATE * 4) [
+            params/size: as f32! 0.5
+            params/predelay-ms: as f32! 0.0
+            params/diffusion: as f32! 0.0
+            params/decay-seconds: as f32! 0.1
+        ]
+        if cursor = (RATE * 6) [params/bypass: true]
+        count: make [#mutable i32!] 512
+        remaining: FRAMES - cursor
+        if count > remaining [count: remaining]
+        next-boundary: (((cursor / (RATE * 2)) + 1) * (RATE * 2)) - cursor
+        if count > next-boundary [count: next-boundary]
+        repeat i count [
+            n: cursor + i
+            left: make [#mutable f32!] 0.0
+            right: make [#mutable f32!] 0.0
+            if all [kind = 0 n = 0] [left: as f32! 1.0]
+            if all [kind = 1 n < 64] [left: as f32! 15.848932 right: as f32! -15.848932]
+            if all [kind = 2 n < (RATE * 3)] [
+                envelope: (as f32! 0.4) * (math/exp ((as f32! n) * (as f32! -0.00002)))
+                left: envelope * (math/sin ((as f32! n) * (as f32! 0.0287979327)))
+                right: envelope * (math/sin ((as f32! n) * (as f32! 0.0383972435)))
+            ]
+            if all [kind = 3 n < (RATE * 3)] [
+                seed: (seed * (as u32! 1664525)) + (as u32! 1013904223)
+                left: ((as f32! (seed >> 16)) / (as f32! 32768.0) - (as f32! 1.0)) * (as f32! 0.2)
+                seed: (seed * (as u32! 1664525)) + (as u32! 1013904223)
+                right: ((as f32! (seed >> 16)) / (as f32! 32768.0) - (as f32! 1.0)) * (as f32! 0.2)
+            ]
+            input/left/:i: left
+            input/right/:i: right
+        ]
+        if (brom-reverb-process :state :input :output 2 count :params) = false [ok?: false]
+        repeat i count [
+            packed/samples/(i * 2): output/left/:i
+            packed/samples/((i * 2) + 1): output/right/:i
+        ]
+        pointer: addr-of packed
+        if (stdio/write :pointer (as size! 4) (as size! (count * 2)) handle) <> (as size! (count * 2)) [ok?: false]
+        cursor: cursor + count
+    ]
+    brom-reverb-deactivate :state
+    if (stdio/close handle) <> 0 [ok?: false]
+    return ok?
+]
+
+ok?: make [#mutable logic!] (arg-count = 4)
+if ok? [
+    repeat kind 4 [
+        path: arg-at (as i64! kind)
+        if (render-case kind :path) = false [ok?: false]
+    ]
+]
+either ok? [print "dumped"] [print "FAIL"]

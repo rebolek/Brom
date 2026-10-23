@@ -1,0 +1,286 @@
+Recoil [
+    Title: "brom/dsp/oscillator phase-distortion exercise"
+    Description: {
+        Checks what every phase-distortion warp must be regardless of its
+        shape: a monotonic map of the unit interval onto itself, anchored at
+        both ends. A warp that overshoots, folds back or drifts off the ends
+        does not distort a waveform, it corrupts it -- and none of that shows
+        up as a compile error.
+
+        The A/B against Mach's Rust core proves the port reproduces one
+        specific instrument. This is the coverage the module has on its own.
+    }
+    Type: module
+    Module: recoil-brom/test/pd-oscillator-test
+    Imports: [
+        brom/dsp/oscillator [
+            BROM-WAVETABLE-SIZE BROM-MAX-HARMONICS
+            BROM-PD-ALGO-SAWTOOTH BROM-PD-ALGO-SINEPULSE BROM-PD-ALGO-SQUARE
+            BROM-PD-ALGO-SAWSQUARE BROM-PD-ALGO-TRAPEZOID
+            brom-fract
+            brom-wavetable! brom-wavetable-bytes brom-wavetable-fill brom-wavetable-read
+            brom-pd-cache! brom-pd-cache-update brom-pd-distort
+            brom-harmonic-phase brom-slope-value
+            brom-ln-table! brom-ln-table-bytes brom-ln-table-fill
+            brom-slope-table! brom-slope-table-bytes brom-slope-table-fill
+            brom-slope-table-audible-limit
+        ]
+        brom/dsp/utils [brom-abs-f64]
+    ]
+    Exports: []
+]
+
+check: func [
+    "Record one assertion as a PASS or FAIL line."
+    ok? [logic!] "Whether the assertion held."
+    return: [none!] "No value; the marker is written to stdout."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+near?: func [
+    "Whether two values agree to within a tolerance."
+    a [f64!] "First value."
+    b [f64!] "Second value."
+    tolerance [f64!] "Largest accepted absolute difference."
+    return: [logic!] "True when the values are close enough."
+] [
+    return (brom-abs-f64 (a - b)) <= tolerance
+]
+
+cache: make c-pointer! unsafe/malloc (as i32! size-of brom-pd-cache!)
+
+; --- every warp maps the unit interval onto itself, monotonically -----------
+; Walked at 512 points across five algorithms and four modulation depths. A
+; fold-back or an overshoot anywhere in that grid fails the whole check rather
+; than one assertion, so a single line covers 10240 samples.
+
+STEPS: 512
+depths: make [vector! [f64! 4]] [0.0 0.3 0.6 1.0]
+
+monotonic: make [#mutable logic!] true
+bounded: make [#mutable logic!] true
+anchored: make [#mutable logic!] true
+
+repeat algorithm 5 [
+    repeat d 4 [
+        depth: make f64! depths/:d
+        brom-pd-cache-update :cache depth
+        previous: make [#mutable f64!] -1.0
+        repeat i STEPS [
+            phase: (as f64! i) / 511.0
+            warped: brom-pd-distort :cache phase depth algorithm
+            if warped < previous [monotonic: false]
+            if warped < 0.0 [bounded: false]
+            if warped > 1.0 [bounded: false]
+            previous: warped
+        ]
+        start: brom-pd-distort :cache 0.0 depth algorithm
+        finish: brom-pd-distort :cache 1.0 depth algorithm
+        if (brom-abs-f64 start) > 0.000000001 [anchored: false]
+        if (brom-abs-f64 (finish - 1.0)) > 0.000000001 [anchored: false]
+    ]
+]
+
+check monotonic
+check bounded
+check anchored
+
+; --- a warp with no depth is the identity ----------------------------------
+; Not every algorithm: Square's transition width is clamped at a quarter, so
+; even at zero modulation it is still a square. The two that claim an identity
+; at zero are the ones tested for it.
+
+brom-pd-cache-update :cache 0.0
+identity: make [#mutable logic!] true
+repeat i 101 [
+    phase: (as f64! i) / 100.0
+    saw: brom-pd-distort :cache phase 0.0 BROM-PD-ALGO-SAWTOOTH
+    trapezoid: brom-pd-distort :cache phase 0.0 BROM-PD-ALGO-TRAPEZOID
+    unless near? saw phase 0.000000001 [identity: false]
+    unless near? trapezoid phase 0.000000001 [identity: false]
+]
+check identity
+
+; --- and depth actually moves it -------------------------------------------
+; The converse: if the modulation argument were dropped on the floor the
+; identity check above would still pass.
+
+brom-pd-cache-update :cache 0.8
+moved: make [#mutable logic!] false
+repeat i 101 [
+    phase: (as f64! i) / 100.0
+    repeat algorithm 5 [
+        warped: brom-pd-distort :cache phase 0.8 algorithm
+        if (brom-abs-f64 (warped - phase)) > 0.01 [moved: true]
+    ]
+]
+check moved
+
+; --- the two-segment warp crosses at its breakpoint -------------------------
+; Modulation 0.6 puts the breakpoint at 0.5 - 0.49*0.6 = 0.206, and the warp is
+; defined so that exactly half the cycle is spent either side of it.
+brom-pd-cache-update :cache 0.6
+check (near? (brom-pd-distort :cache 0.206 0.6 BROM-PD-ALGO-SAWTOOTH) 0.5 0.0000001)
+
+; --- the wavetable ----------------------------------------------------------
+
+sine: make c-pointer! unsafe/malloc brom-wavetable-bytes
+cosine: make c-pointer! unsafe/malloc brom-wavetable-bytes
+brom-wavetable-fill :sine false
+brom-wavetable-fill :cosine true
+
+check (near? (brom-wavetable-read :sine 0.0) 0.0 0.0000001)
+check (near? (brom-wavetable-read :sine 0.25) 1.0 0.0001)
+check (near? (brom-wavetable-read :cosine 0.0) 1.0 0.0000001)
+check (near? (brom-wavetable-read :cosine 0.5) -1.0 0.0001)
+; Reading past the end wraps rather than running off the table.
+check (near? (brom-wavetable-read :sine 1.0) (brom-wavetable-read :sine 0.0) 0.0000001)
+
+; A cycle of a sine carries no DC, which no partial or mis-scaled table would
+; satisfy.
+total: make [#mutable f64!] 0.0
+repeat i 1000 [
+    total: total + (brom-wavetable-read :sine ((as f64! i) / 1000.0))
+]
+check (near? total 0.0 0.000001)
+
+; --- harmonic addressing ----------------------------------------------------
+
+check (near? (brom-fract 0.25) 0.25 0.0)
+check (near? (brom-fract 3.25) 0.25 0.0000001)
+check (near? (brom-fract 1.0) 0.0 0.0)
+
+; With no drift a harmonic sits at a whole multiple of the fundamental phase.
+check (near? (brom-harmonic-phase 0.3 1 0.0 BROM-MAX-HARMONICS) 0.3 0.0)
+check (near? (brom-harmonic-phase 0.3 3 0.0 BROM-MAX-HARMONICS) 0.9 0.0000001)
+; Drift displaces the upper harmonics and leaves the fundamental alone.
+check (near? (brom-harmonic-phase 0.3 1 1.0 BROM-MAX-HARMONICS) 0.3 0.0)
+check (brom-harmonic-phase 0.3 3 1.0 BROM-MAX-HARMONICS) <> 0.9
+
+; --- the spectral slope -----------------------------------------------------
+; Slope zero is a sawtooth's 1/h, which is the anchor the whole -1..+1 range is
+; offset around. Approached to within brom-fast-exp's error rather than exactly:
+; the slope goes through the approximate exp, so 1/2 comes back as 0.4855. The
+; fundamental is the exception, returned as a literal one before any exp runs.
+check (near? (brom-slope-value 1 0.0) 1.0 0.0)
+check (near? (brom-slope-value 2 0.0) 0.5 0.02)
+check (near? (brom-slope-value 8 0.0) 0.125 0.005)
+; The ratio between two harmonics is what a spectrum is actually heard as, and
+; it survives the approximation better than either value does alone.
+check (near? ((brom-slope-value 2 0.0) / (brom-slope-value 4 0.0)) 2.0 0.01)
+check (near? ((brom-slope-value 4 0.0) / (brom-slope-value 8 0.0)) 2.0 0.01)
+; A positive slope is darker than a sawtooth, a negative one brighter.
+check (brom-slope-value 8 0.2) < (brom-slope-value 8 0.0)
+check (brom-slope-value 8 -0.2) > (brom-slope-value 8 0.0)
+
+falling: make [#mutable logic!] true
+last-level: make [#mutable f64!] 2.0
+repeat step 32 [
+    h: step + 1
+    level: brom-slope-value h 0.0
+    if level > last-level [falling: false]
+    last-level: level
+]
+check falling
+
+; --- the tabulated rebuild agrees with the single-value function -------------
+; These are two implementations of one spectrum, and the fast one is the one
+; that ships. If they ever part company the table is silently wrong, since
+; nothing downstream would look implausible.
+
+ln-table: make c-pointer! unsafe/malloc brom-ln-table-bytes
+slope-table: make c-pointer! unsafe/malloc brom-slope-table-bytes
+brom-ln-table-fill :ln-table
+
+agrees: make [#mutable logic!] true
+repeat s 5 [
+    param: ((as f64! s) / 2.0) - 1.0
+    brom-slope-table-fill :slope-table :ln-table param
+    table-view: make [#mutable brom-slope-table!] as brom-slope-table! slope-table
+    repeat step BROM-MAX-HARMONICS [
+        h: step + 1
+        tabulated: make f64! table-view/values/(h)
+        single: brom-slope-value h param
+        ; Relative, because a slope of +1 spans nine orders of magnitude across
+        ; the spectrum and an absolute tolerance would be meaningless at one end.
+        unless near? (tabulated / single) 1.0 0.000000001 [agrees: false]
+    ]
+]
+check agrees
+
+; The fundamental is unity whatever the slope -- it is the reference the rest
+; of the spectrum is expressed against.
+brom-slope-table-fill :slope-table :ln-table 0.75
+unity-view: make [#mutable brom-slope-table!] as brom-slope-table! slope-table
+check (near? (make f64! unity-view/values/1) 1.0 0.0)
+
+; --- the audible limit is the spectrum's own reach ---------------------------
+; How far up the series is worth summing is a property of the filled spectrum,
+; not of the caller: it falls out of how fast the slope drops and how loud the
+; series is scaled. Asserted rather than listened for because the engine caps
+; every voice's harmonic count with it, and a limit that comes back too high
+; only wastes a loop while one that comes back too low silently removes the top
+; octave of a patch.
+
+; A dark slope runs out of audible harmonics well inside the table.
+brom-slope-table-fill :slope-table :ln-table 1.0
+dark-odd: brom-slope-table-audible-limit :slope-table 1.0 1 1
+dark-even: brom-slope-table-audible-limit :slope-table 1.0 2 0
+check (dark-odd < BROM-MAX-HARMONICS)
+check (dark-even < BROM-MAX-HARMONICS)
+
+; The answer keeps the parity it was asked for, so a caller stepping by two
+; from it never walks onto the other series.
+check ((dark-odd % 2) = 1)
+check ((dark-even % 2) = 0)
+
+; A bright slope rises with h instead of falling, so nothing is ever inaudible
+; and both scans reach the last harmonic of their own parity.
+brom-slope-table-fill :slope-table :ln-table -1.0
+check ((brom-slope-table-audible-limit :slope-table 1.0 1 1) = 127)
+check ((brom-slope-table-audible-limit :slope-table 1.0 2 0) = 128)
+
+; Turning the series up reaches further into it, never less far.
+brom-slope-table-fill :slope-table :ln-table 0.5
+quiet-limit: brom-slope-table-audible-limit :slope-table 0.01 1 1
+loud-limit: brom-slope-table-audible-limit :slope-table 1.0 1 1
+check (loud-limit >= quiet-limit)
+
+; Steepening it reaches less far, never further.
+brom-slope-table-fill :slope-table :ln-table 0.25
+shallow-limit: brom-slope-table-audible-limit :slope-table 1.0 1 1
+brom-slope-table-fill :slope-table :ln-table 0.9
+steep-limit: brom-slope-table-audible-limit :slope-table 1.0 1 1
+check (steep-limit <= shallow-limit)
+
+; A series scaled to silence has nothing audible above the fundamental, and the
+; two parities disagree about what that means: the fundamental is summed
+; unconditionally, so odd bottoms out at one while even bottoms out at none.
+brom-slope-table-fill :slope-table :ln-table 0.0
+check ((brom-slope-table-audible-limit :slope-table 0.0 1 1) = 1)
+check ((brom-slope-table-audible-limit :slope-table 0.0 2 0) = 0)
+
+; A spectrum with a hole in it reports the harmonic above the hole, not the one
+; below. No table brom-slope-table-fill builds can have such a hole -- h^-e is
+; monotonic whatever e is -- so this one is written by hand. It is the only
+; assertion here that a scan stopping at the first inaudible harmonic would
+; fail, and without it the full scan is untested rather than justified.
+hand-filled: make [#mutable brom-slope-table!] as brom-slope-table! slope-table
+hand-filled/values/0: 0.0
+repeat step BROM-MAX-HARMONICS [
+    hand-h: step + 1
+    hand-filled/values/(hand-h): 0.0
+]
+hand-filled/values/1: 1.0
+hand-filled/values/3: 0.0000000001
+hand-filled/values/5: 1.0
+check ((brom-slope-table-audible-limit :slope-table 1.0 1 1) = 5)
+
+unsafe/free :ln-table
+unsafe/free :slope-table
+unsafe/free :cache
+unsafe/free :sine
+unsafe/free :cosine
+print "done"

@@ -1,0 +1,16 @@
+Recoil [
+    Title: "Brom probe effect AU entry"
+    Description: {
+        The Recoil half of the probe's AU component: the probe's engine and
+        the effect shell interface the generic AU shell
+        (brom/plugin/au/effect_au.mm) calls, in one translation unit. The
+        trampoline module is shared with the VST3 shell.
+    }
+    Type: module
+    Module: recoil-brom/test/probe-effect/au/au_entry
+    Imports: [
+        brom/plugin/vst3/effect-shell []
+        recoil-brom/test/probe-effect/plugin []
+    ]
+    Exports: []
+]

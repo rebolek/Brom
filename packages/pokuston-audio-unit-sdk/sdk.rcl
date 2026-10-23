@@ -1,0 +1,7 @@
+Recoil [
+    Title: "Pokuston Audio Unit SDK source package"
+    Type: module
+    Module: pokuston/audio-unit/sdk
+    Imports: []
+    Exports: []
+]

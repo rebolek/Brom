@@ -1,0 +1,99 @@
+Recoil [
+    Title: "Envelope A/B dump"
+    Description: {
+        Runs trigger / hold / release sequences through the Mach curve and
+        writes the levels as raw doubles for comparison against the Rust.
+
+        Both strides are dumped for each parameter set: one is the plain
+        per-sample path and four is what Mach actually runs, and the pair is
+        what shows whether a strided update means the same thing as an
+        unstrided one.
+    }
+    Type: module
+    Module: recoil-brom/test/envelope-dump
+    Imports: [
+        brom/dsp/envelope [
+            adsr-config! adsr-envelope! adsr-config-mach
+            adsr-reset adsr-trigger adsr-release adsr-tick-n adsr-level
+        ]
+    ]
+    Exports: []
+]
+
+stdio: foreign <stdio.h> [
+    fopen: "fopen" [c-string! c-string! return: [c-pointer!]]
+    fwrite: "fwrite" [c-pointer! size! size! c-pointer! return: [size!]]
+    fclose: "fclose" [c-pointer! return: [i32!]]
+]
+
+SAMPLE-RATE: 44100.0
+HOLD: 8000
+TAIL: 8000
+; Longest run is stride 1: 16000 levels. Six parameter sets, two strides.
+SLOT-SIZE: 16000
+CASE-COUNT: 12
+DUMP-PATH: "recoil-env.bin"
+
+buffer!: make c-struct! [
+    values: [c-array! [f64! 192000]]
+]
+
+run-case: func [
+    "Write one trigger/hold/release run into the dump buffer."
+    :out [c-pointer!] "Borrowed buffer! to write into."
+    slot [i32!] "Case index."
+    stride [i32!] "Samples advanced per group."
+    attack [f64!] "Attack time in seconds."
+    decay [f64!] "Decay time in seconds."
+    sustain [f64!] "Sustain level."
+    release [f64!] "Release time in seconds."
+    return: [i32!] "Number of levels written."
+] [
+    dump: make [#mutable buffer!] as buffer! :out
+    config: adsr-config-mach attack decay sustain release
+    envelope: make [#mutable adsr-envelope!] adsr-trigger adsr-reset
+    base: slot * SLOT-SIZE
+    written: make [#mutable i32!] 0
+    i: make [#mutable i32!] 0
+    while [i < HOLD] [
+        envelope: adsr-tick-n envelope config stride SAMPLE-RATE
+        dump/values/(base + written): adsr-level envelope
+        written: written + 1
+        i: i + stride
+    ]
+    envelope: adsr-release envelope
+    i: 0
+    while [i < TAIL] [
+        envelope: adsr-tick-n envelope config stride SAMPLE-RATE
+        dump/values/(base + written): adsr-level envelope
+        written: written + 1
+        i: i + stride
+    ]
+    return written
+]
+
+out: make c-pointer! unsafe/malloc (as i32! size-of buffer!)
+
+; Six parameter sets: a typical patch, a very short attack, an instant attack
+; (below the min-time threshold, so it must be instant rather than very fast),
+; full sustain so decay has nowhere to go, zero sustain so decay runs to
+; silence, and a release shorter than the floor.
+attacks: make [vector! [f64! 6]] [0.01 0.001 0.00001 0.05 0.02 0.01]
+decays: make [vector! [f64! 6]] [0.1 0.05 0.2 0.1 0.15 0.1]
+sustains: make [vector! [f64! 6]] [0.7 0.5 0.3 1.0 0.0 0.6]
+releases: make [vector! [f64! 6]] [0.3 0.2 0.1 0.25 0.4 0.001]
+
+slot: make [#mutable i32!] 0
+strides: make [vector! [i32! 2]] [1 4]
+repeat s 2 [
+    repeat p 6 [
+        run-case :out slot strides/:s attacks/:p decays/:p sustains/:p releases/:p
+        slot: slot + 1
+    ]
+]
+
+handle: stdio/fopen DUMP-PATH "wb"
+stdio/fwrite :out 8 (as size! (CASE-COUNT * SLOT-SIZE)) handle
+stdio/fclose handle
+unsafe/free :out
+print "dumped"

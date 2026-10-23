@@ -1,0 +1,7 @@
+Recoil [
+    Title: "Loos AU package root"
+    Type: module
+    Module: examples/pokuston/loos/au/project
+    Imports: []
+    Exports: []
+]

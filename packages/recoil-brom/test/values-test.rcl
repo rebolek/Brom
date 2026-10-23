@@ -1,0 +1,157 @@
+Recoil [
+    Title: "brom/plugin/values parameter mapping exercise"
+    Description: {
+        Invariant checks for the parameter taper and unit conversions. Prints
+        one PASS or FAIL line per assertion so a regression names itself in the
+        run log rather than surfacing as a shifted float in a golden string.
+
+        The centred-range figures are the worked example from the design
+        discussion: a 20 Hz - 20 kHz cutoff with its midpoint at 640 Hz, which
+        is the case an integer 0..100 control could not express.
+    }
+    Type: module
+    Module: recoil-brom/test/values-test
+    Imports: [
+        brom/plugin/values [
+            param-range!
+            param-linear param-skewed param-centred param-stepped param-bipolar
+            param-normalize param-denormalize param-skew-for-centre
+            linear-to-db db-to-linear
+            midi-note-to-freq freq-to-midi-note
+            val-to-omega omega-to-freq
+        ]
+    ]
+    Exports: []
+]
+
+near?: func [
+    "True when two values agree within an absolute tolerance."
+    a [f64!] "First value."
+    b [f64!] "Second value."
+    tol [f64!] "Absolute tolerance."
+    return: [logic!] "Whether |a - b| is below tol."
+] [
+    d: either (a - b) < 0.0 [b - a] [a - b]
+    return d < tol
+]
+
+check: func [
+    "Record one assertion as a PASS or FAIL line."
+    ok? [logic!] "Whether the assertion held."
+    return: [none!] "No value; the marker is written to stdout."
+] [
+    either ok? [print "PASS"] [print "FAIL"]
+    return none
+]
+
+; --- linear ------------------------------------------------------------------
+lin: param-linear 0.0 100.0
+check near? (param-denormalize lin 0.5) 50.0 0.000001
+check near? (param-normalize lin 25.0) 0.25 0.000001
+check near? (param-denormalize lin 0.0) 0.0 0.000001
+check near? (param-denormalize lin 1.0) 100.0 0.000001
+
+; Out-of-range input clamps rather than extrapolating.
+check near? (param-denormalize lin 1.5) 100.0 0.000001
+check near? (param-denormalize lin -0.5) 0.0 0.000001
+
+; --- centred (the log-cutoff case) -------------------------------------------
+cut: param-centred 20.0 20000.0 640.0
+
+; The midpoint of travel lands on the centre, which is the whole point.
+check near? (param-denormalize cut 0.5) 640.0 0.001
+; Endpoints are exact regardless of skew.
+check near? (param-denormalize cut 0.0) 20.0 0.000001
+check near? (param-denormalize cut 1.0) 20000.0 0.000001
+; The skew factor matches JUCE's setSkewForCentre for this range.
+check near? (param-skew-for-centre 20.0 20000.0 640.0) 0.199595 0.00001
+
+; Round-trip: normalize undoes denormalize across the curve.
+check near? (param-normalize cut (param-denormalize cut 0.25)) 0.25 0.000001
+check near? (param-normalize cut (param-denormalize cut 0.75)) 0.75 0.000001
+check near? (param-normalize cut (param-denormalize cut 0.01)) 0.01 0.000001
+
+; A degenerate centre outside the range degrades to linear instead of NaN.
+check near? (param-skew-for-centre 20.0 20000.0 20.0) 1.0 0.000001
+check near? (param-skew-for-centre 20.0 20000.0 30000.0) 1.0 0.000001
+
+; --- explicit skew -----------------------------------------------------------
+sk: param-skewed 0.0 1.0 0.5
+check near? (param-normalize sk (param-denormalize sk 0.3)) 0.3 0.000001
+; skew < 1 gives the low end more of the travel, so half-way along the control
+; produces a value below the arithmetic midpoint: 0.5 denormalizes through
+; exp(log(0.5)/0.5), i.e. 0.5 squared. This is the direction a frequency wants,
+; and it is the same direction param-centred derives for the cutoff above.
+check near? (param-denormalize sk 0.5) 0.25 0.000001
+
+; --- exponential (1V/oct) ----------------------------------------------------
+ex: param-exponential 20.0 20000.0
+check near? (param-denormalize ex 0.0) 20.0 0.000001
+check near? (param-denormalize ex 1.0) 20000.0 0.000001
+; Mid-travel is the geometric mean, sqrt(20 * 20000), with no centre supplied.
+check near? (param-denormalize ex 0.5) 632.4555320336759 0.000001
+check near? (param-normalize ex (param-denormalize ex 0.37)) 0.37 0.000001
+check near? (param-normalize ex 632.4555320336759) 0.5 0.000001
+
+; The property that distinguishes this from the power taper: equal travel buys
+; equal octaves everywhere, so each quarter-turn is the same ratio. Comparing
+; ratios rather than octaves keeps the check free of a log in the test itself.
+q1: (param-denormalize ex 0.25) / (param-denormalize ex 0.0)
+q2: (param-denormalize ex 0.5) / (param-denormalize ex 0.25)
+q3: (param-denormalize ex 0.75) / (param-denormalize ex 0.5)
+q4: (param-denormalize ex 1.0) / (param-denormalize ex 0.75)
+check near? q1 q2 0.000001
+check near? q2 q3 0.000001
+check near? q3 q4 0.000001
+
+; The same range under the power taper is deliberately uneven -- this pins the
+; difference so the two tapers can never quietly become one.
+pw: param-centred 20.0 20000.0 640.0
+p1: (param-denormalize pw 0.25) / (param-denormalize pw 0.0)
+p2: (param-denormalize pw 0.5) / (param-denormalize pw 0.25)
+check not near? p1 p2 0.1
+
+; A non-positive endpoint has no logarithm; the range degrades to linear
+; instead of producing NaN.
+bad: param-exponential 0.0 100.0
+check near? (param-denormalize bad 0.5) 50.0 0.000001
+
+; --- bipolar -----------------------------------------------------------------
+bip: param-bipolar -1.0 1.0 0.5
+; The midpoint of a symmetric range is its centre.
+check near? (param-denormalize bip 0.5) 0.0 0.000001
+check near? (param-denormalize bip 0.0) -1.0 0.000001
+check near? (param-denormalize bip 1.0) 1.0 0.000001
+; Symmetry: equal distances either side of centre map to opposite values.
+check near? (param-denormalize bip 0.75) (0.0 - (param-denormalize bip 0.25)) 0.000001
+check near? (param-normalize bip (param-denormalize bip 0.8)) 0.8 0.000001
+
+; --- stepped -----------------------------------------------------------------
+; Five positions across 0..4, so each step is one whole unit.
+st: param-stepped 0.0 4.0 5
+check near? (param-denormalize st 0.0) 0.0 0.000001
+check near? (param-denormalize st 1.0) 4.0 0.000001
+; 0.3 of travel is 1.2 units, which snaps to 1.
+check near? (param-denormalize st 0.3) 1.0 0.000001
+; 0.4 is 1.6 units, which snaps up to 2.
+check near? (param-denormalize st 0.4) 2.0 0.000001
+
+; --- decibels ----------------------------------------------------------------
+check near? (db-to-linear 0.0) 1.0 0.000001
+check near? (linear-to-db 1.0) 0.0 0.000001
+check near? (linear-to-db (db-to-linear -6.0)) -6.0 0.000001
+check near? (db-to-linear -6.0) 0.5011872336272722 0.000001
+; Silence has no dB value; the floor stands in for -inf.
+check near? (linear-to-db 0.0) -600.0 0.000001
+
+; --- MIDI --------------------------------------------------------------------
+check near? (midi-note-to-freq 69.0) 440.0 0.000001
+check near? (midi-note-to-freq 81.0) 880.0 0.000001
+check near? (freq-to-midi-note 440.0) 69.0 0.000001
+check near? (freq-to-midi-note (midi-note-to-freq 40.0)) 40.0 0.000001
+check near? (freq-to-midi-note 0.0) 0.0 0.000001
+
+; --- omega -------------------------------------------------------------------
+check near? (omega-to-freq (val-to-omega 1000.0 48000.0) 48000.0) 1000.0 0.000001
+check near? (val-to-omega 0.0 48000.0) 0.0 0.000001
+check near? (val-to-omega 1000.0 0.0) 0.0 0.000001
