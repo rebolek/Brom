@@ -1,0 +1,20 @@
+Recoil [
+    Title: "PM-101 CLAP entry"
+    Description: {
+        Links the PM-101 format-neutral plug-in contract to Brom's shared CLAP
+        shell. The contract itself is compiled beside this translation unit so
+        VST3, AUv2 and CLAP consume the same schema and factory bank.
+
+        This file was 1762 lines before Brom, and 361 before the contract moved
+        out of it. What was left here was the PM-101 engine descriptor and its
+        parameter schema -- which meant only CLAP could see them, and a factory
+        bank keyed by parameter slug is a bank only CLAP could have read.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/clap/clap_entry
+    Imports: [
+        brom/plugin/clap/entry []
+        examples/pokuston/pm101/engine-export []
+    ]
+    Exports: []
+]

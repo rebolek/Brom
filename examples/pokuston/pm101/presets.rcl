@@ -1,0 +1,167 @@
+Recoil [
+    Title: "PM-101 factory preset bank"
+    Description: {
+        Five patches in the format-neutral Brom preset text all three plug-in
+        formats read. A preset names only what it changes from the defaults,
+        and each key is a parameter's slug -- its group and name folded -- so
+        the spellings below are the host-facing names in param-names.rcl.
+
+        The bank is small on purpose: each patch is the shortest demonstration
+        of something the instrument does that a plain synth does not -- phase
+        distortion shaped by an envelope, hard sync, the resonant mixer filter,
+        and the FinalCrusher.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/presets
+    Imports: []
+    Exports: [PM101-FACTORY-PRESET-COUNT pm101-factory-preset]
+]
+
+PM101-FACTORY-PRESET-COUNT: make i32! 5
+
+pm101-factory-presets: make [array! [string!]] [
+{Recoil-Preset [
+    name: "Init"
+    key: "init"
+    description: "Every parameter at its default: one sawtooth line, no filter, full sustain."
+    features: [init default]
+    version: 1
+    plugin: "pm-101"
+    params: []
+]}
+{Recoil-Preset [
+    name: "CZ Brass"
+    key: "cz-brass"
+    description: "Two detuned windowed saws; the distortion opens and settles like a brass attack."
+    features: [brass saw bright]
+    version: 1
+    plugin: "pm-101"
+    params: [
+        dco1-wave-a: 0.0
+        dco1-window: 1.0
+        dco1-dcw: 0.9
+        dco2-wave-a: 0.0
+        dco2-window: 1.0
+        dco2-dcw: 0.9
+        global-detune-cent: 7.0
+        mixer-mode: 2.0
+        dco1-dcw-env-rate-1: 0.25
+        dco1-dcw-env-rate-2: 0.45
+        dco1-dcw-env-rate-3: 0.0
+        dco1-dcw-env-rate-4: 0.0
+        dco1-dcw-env-rate-5: 0.0
+        dco1-dcw-env-rate-6: 0.3
+        dco1-dcw-env-level-1: 1.0
+        dco1-dcw-env-level-2: 0.45
+        dco1-dcw-env-level-3: 0.45
+        dco1-dcw-env-level-4: 0.45
+        dco1-dcw-env-level-5: 0.45
+        dco1-dcw-env-level-6: 0.2
+        dco2-dcw-env-rate-1: 0.25
+        dco2-dcw-env-rate-2: 0.45
+        dco2-dcw-env-rate-3: 0.0
+        dco2-dcw-env-rate-4: 0.0
+        dco2-dcw-env-rate-5: 0.0
+        dco2-dcw-env-rate-6: 0.3
+        dco2-dcw-env-level-1: 1.0
+        dco2-dcw-env-level-2: 0.45
+        dco2-dcw-env-level-3: 0.45
+        dco2-dcw-env-level-4: 0.45
+        dco2-dcw-env-level-5: 0.45
+        dco2-dcw-env-level-6: 0.2
+        mixer-dca-env-rate-1: 0.15
+        mixer-dca-env-rate-2: 0.0
+        mixer-dca-env-rate-3: 0.0
+        mixer-dca-env-rate-4: 0.0
+        mixer-dca-env-rate-5: 0.0
+        mixer-dca-env-rate-6: 0.4
+        mixer-dca-env-level-1: 1.0
+        mixer-dca-env-level-2: 1.0
+        mixer-dca-env-level-3: 1.0
+        mixer-dca-env-level-4: 1.0
+        mixer-dca-env-level-5: 1.0
+        mixer-dca-env-level-6: 0.0
+    ]
+]}
+{Recoil-Preset [
+    name: "Hard Sync Sweep"
+    key: "hard-sync-sweep"
+    description: "DCO2 rises against DCO1's reset: the classic tearing sync sweep, from the pitch envelope."
+    features: [lead sync sweep]
+    version: 1
+    plugin: "pm-101"
+    params: [
+        dco1-wave-a: 0.0
+        dco2-wave-a: 0.0
+        mixer-mode: 1.0
+        global-osc-sync: 1.0
+        dco2-pitch-env-rate-1: 0.0
+        dco2-pitch-env-rate-2: 0.7
+        dco2-pitch-env-rate-3: 0.0
+        dco2-pitch-env-rate-4: 0.0
+        dco2-pitch-env-rate-5: 0.0
+        dco2-pitch-env-rate-6: 0.0
+        dco2-pitch-env-level-1: 0.5
+        dco2-pitch-env-level-2: 0.88
+        dco2-pitch-env-level-3: 0.88
+        dco2-pitch-env-level-4: 0.88
+        dco2-pitch-env-level-5: 0.88
+        dco2-pitch-env-level-6: 0.5
+    ]
+]}
+{Recoil-Preset [
+    name: "Resonant Bass"
+    key: "resonant-bass"
+    description: "Square and saw under a resonant low-pass whose envelope closes onto the sustain."
+    features: [bass resonant filter]
+    version: 1
+    plugin: "pm-101"
+    params: [
+        dco1-wave-a: 1.0
+        dco2-wave-a: 0.0
+        mixer-mode: 2.0
+        mixer-filter: 1.0
+        mixer-cutoff: 0.4
+        mixer-resonance: 0.8
+        global-detune-octave: -1.0
+        mixer-cutoff-env-rate-1: 0.0
+        mixer-cutoff-env-rate-2: 0.55
+        mixer-cutoff-env-rate-3: 0.0
+        mixer-cutoff-env-rate-4: 0.0
+        mixer-cutoff-env-rate-5: 0.0
+        mixer-cutoff-env-rate-6: 0.3
+        mixer-cutoff-env-level-1: 1.0
+        mixer-cutoff-env-level-2: 0.25
+        mixer-cutoff-env-level-3: 0.25
+        mixer-cutoff-env-level-4: 0.25
+        mixer-cutoff-env-level-5: 0.25
+        mixer-cutoff-env-level-6: 0.25
+    ]
+]}
+{Recoil-Preset [
+    name: "Crushed Ring"
+    key: "crushed-ring"
+    description: "Sine-sync ring-modulated with a triangle a fifth up, then thrown through the FinalCrusher."
+    features: [ring crushed lo-fi]
+    version: 1
+    plugin: "pm-101"
+    params: [
+        dco1-wave-a: 5.0
+        dco1-dcw: 0.5
+        dco2-wave-a: 4.0
+        mixer-mode: 3.0
+        global-detune-note: 7.0
+        mixer-bit-depth: 8.0
+        mixer-freq-divider: 3.0
+    ]
+]}
+]
+
+pm101-factory-preset: func [
+    "Return one factory preset's Brom preset text by bank index."
+    index [i32!] "Zero-based factory-bank index."
+    return: [string!] "Borrowed preset text, empty when out of range."
+] [
+    if any [index < 0 index >= PM101-FACTORY-PRESET-COUNT] [return make string! ""]
+    return pm101-factory-presets/:index
+]

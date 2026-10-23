@@ -1,0 +1,244 @@
+Recoil [
+    Title: "PM-101 core invariants"
+    Description: {
+        What has to stay true of the port, written as properties rather than
+        listening notes:
+
+        1. The schema agrees with itself: block sizes add up to the parameter
+           count, every default sits inside its range, and the normalized domain
+           round-trips (choices snap, so they are held to a fixed point instead).
+        2. Silence before a note, sound during it, silence after its release,
+           and a hard reset silences at once.
+        3. Phase distortion at depth zero is a plain cosine: the energy sits on
+           the fundamental, not on its second harmonic.
+        4. Every wave through every filter type stays finite and inside the
+           unit range -- the original's square wave raised a negative base to a
+           fractional power and overflowed (its missing #8).
+        5. A render is reproducible: two instances given the same notes and
+           parameters produce the same samples.
+
+        Windowless, like the Loos checks: it links the core and nothing else.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/core-test
+    Imports: [
+        examples/pokuston/pm101/core [
+            PM101_MAX_BLOCK PM101_PARAM_COUNT PM101_ENV_STAGES
+            PM101_DCO_PARAMS PM101_MIX_BASE PM101_GLOBAL_BASE
+            pm101-create pm101-destroy pm101-activate pm101-reset
+            pm101-note-on pm101-note-off pm101-process-block pm101-output
+            pm101-set-parameter pm101-get-parameter
+            pm101-parameter-min pm101-parameter-max pm101-parameter-default
+            pm101-parameter-steps
+            pm101-parameter-to-normalized pm101-parameter-from-normalized
+            pm101-state-size
+        ]
+    ]
+    Exports: []
+]
+
+math-ffi: foreign <math.h> [
+    sqrt: "sqrt" [f64! return: [f64!]]
+    cos: "cos" [f64! return: [f64!]]
+    fabs: "fabs" [f64! return: [f64!]]
+]
+
+TEST-SAMPLE-RATE: 48000.0
+TEST-TAU: 6.283185307179586
+; Parameter ids the tests poke by name; core.rcl owns the layout.
+ID-DCO1-WAVE-A: 0
+ID-DCO1-DCW: 3
+ID-DCO1-FILTER: 5
+ID-MIX-MODE: 162
+BROM-PARAM-CEILING: 256
+
+output-view!: make c-struct! [samples: [c-array! [f64! 512]]]
+
+failures: make [#mutable i32!] 0
+checks: make [#mutable i32!] 0
+
+check: func [
+    "Record one condition."
+    condition [logic!] "Condition that must hold."
+    return: [none!] "No value."
+] [
+    checks: checks + 1
+    if not condition [failures: failures + 1]
+    return none
+]
+
+block-peak: func [
+    "The largest absolute sample in the last rendered block; -1 if any is not finite."
+    :raw [c-pointer!] "Opaque instance."
+    frames [i32!] "Frames rendered."
+    return: [f64!] "Peak magnitude, or -1.0 when a sample is NaN."
+] [
+    view: make [#mutable output-view!] as output-view! (pm101-output :raw)
+    peak: make [#mutable f64!] 0.0
+    repeat frame frames [
+        sample: make f64! view/samples/:frame
+        if sample <> sample [return -1.0]
+        magnitude: math-ffi/fabs sample
+        if magnitude > peak [peak: magnitude]
+    ]
+    return peak
+]
+
+goertzel-at: func [
+    "Amplitude of one frequency over a rendered block."
+    :raw [c-pointer!] "Opaque instance."
+    frames [i32!] "Frames in the block."
+    frequency [f64!] "Frequency of interest in hertz."
+    return: [f64!] "Amplitude per sample."
+] [
+    view: make [#mutable output-view!] as output-view! (pm101-output :raw)
+    coefficient: 2.0 * (math-ffi/cos ((TEST-TAU * frequency) / TEST-SAMPLE-RATE))
+    s1: make [#mutable f64!] 0.0
+    s2: make [#mutable f64!] 0.0
+    repeat frame frames [
+        s0: ((make f64! view/samples/:frame) + (coefficient * s1)) - s2
+        s2: s1
+        s1: s0
+    ]
+    power: ((s1 * s1) + (s2 * s2)) - ((coefficient * s1) * s2)
+    return (math-ffi/sqrt (math-ffi/fabs power)) / (as f64! frames)
+]
+
+fresh: func [
+    "A new instance at the test sample rate."
+    return: [c-pointer!] "Owned instance."
+] [
+    raw: pm101-create
+    pm101-activate raw TEST-SAMPLE-RATE
+    return raw
+]
+
+; --- 1. the schema -------------------------------------------------------------
+
+stages: make [#mutable i32!] PM101_ENV_STAGES
+envelope-params: make [#mutable i32!] (2 * stages)
+dco-block: make [#mutable i32!] (9 + (6 * envelope-params))
+mixer-block: make [#mutable i32!] (9 + (3 * envelope-params))
+check (dco-block = PM101_DCO_PARAMS)
+check ((2 * dco-block) = PM101_MIX_BASE)
+check ((PM101_MIX_BASE + mixer-block) = PM101_GLOBAL_BASE)
+check ((PM101_GLOBAL_BASE + 6) = PM101_PARAM_COUNT)
+check (PM101_PARAM_COUNT <= BROM-PARAM-CEILING)
+check ((pm101-state-size) = (as size! (20 + (8 * PM101_PARAM_COUNT))))
+check (PM101_MAX_BLOCK = 512)
+
+repeat id PM101_PARAM_COUNT [
+    param: make u32! as u32! id
+    low: make f64! pm101-parameter-min param
+    high: make f64! pm101-parameter-max param
+    check (high > low)
+    fallback: make f64! pm101-parameter-default param
+    check (fallback >= low)
+    check (fallback <= high)
+    steps: pm101-parameter-steps param
+    ; The ends of the range are the ends of the UI domain.
+    check ((math-ffi/fabs (pm101-parameter-to-normalized param low)) < 0.000001)
+    check ((math-ffi/fabs ((pm101-parameter-to-normalized param high) - 1.0)) < 0.000001)
+    repeat step 5 [
+        want: make f64! ((as f64! step) * 0.2)
+        physical: make f64! pm101-parameter-from-normalized param want
+        back: make f64! pm101-parameter-to-normalized param physical
+        check (physical >= low)
+        check (physical <= high)
+        either steps > 0 [
+            ; A choice snaps: mapping what it snapped to must change nothing.
+            again: make f64! pm101-parameter-from-normalized param back
+            check ((math-ffi/fabs (again - physical)) < 0.000001)
+        ] [
+            check ((math-ffi/fabs (back - want)) < 0.000001)
+        ]
+    ]
+]
+
+; --- 2. silence, sound, release, reset -----------------------------------------
+
+voice: fresh
+pm101-process-block :voice PM101_MAX_BLOCK
+check ((block-peak :voice PM101_MAX_BLOCK) = 0.0)
+pm101-note-on :voice 0 220.0 1.0
+repeat settle 8 [pm101-process-block :voice PM101_MAX_BLOCK]
+sounding: make f64! block-peak :voice PM101_MAX_BLOCK
+check (sounding > 0.01)
+check (sounding <= 1.0)
+pm101-note-off :voice 0
+; Default release is (0.35 + 1)^14 ms, about 66 ms; four seconds is ample.
+repeat release 380 [pm101-process-block :voice PM101_MAX_BLOCK]
+check ((block-peak :voice PM101_MAX_BLOCK) < 0.0001)
+pm101-note-on :voice 0 220.0 1.0
+repeat settle 8 [pm101-process-block :voice PM101_MAX_BLOCK]
+check ((block-peak :voice PM101_MAX_BLOCK) > 0.01)
+pm101-reset :voice
+pm101-process-block :voice PM101_MAX_BLOCK
+check ((block-peak :voice PM101_MAX_BLOCK) = 0.0)
+pm101-destroy voice
+
+; --- 3. depth zero is a cosine ----------------------------------------------------
+
+tone: fresh
+pm101-set-parameter :tone (as u32! ID-DCO1-DCW) 0.0
+pm101-note-on :tone 0 480.0 1.0
+repeat settle 8 [pm101-process-block :tone PM101_MAX_BLOCK]
+pm101-process-block :tone PM101_MAX_BLOCK
+fundamental: make f64! goertzel-at :tone PM101_MAX_BLOCK 480.0
+second: make f64! goertzel-at :tone PM101_MAX_BLOCK 960.0
+check (fundamental > 0.05)
+check (second < (fundamental * 0.05))
+pm101-destroy tone
+
+; --- 4. every wave through every filter stays finite and bounded -------------------
+
+repeat wave 6 [
+    repeat filter 5 [
+        rig: fresh
+        pm101-set-parameter :rig (as u32! ID-DCO1-WAVE-A) (as f64! wave)
+        pm101-set-parameter :rig (as u32! ID-DCO1-FILTER) (as f64! filter)
+        ; Full depth and full resonance: the corner the original overflowed in.
+        pm101-set-parameter :rig (as u32! ID-DCO1-DCW) 1.0
+        pm101-set-parameter :rig (as u32! 7) 1.0
+        pm101-note-on :rig 0 330.0 1.0
+        repeat settle 6 [
+            pm101-process-block :rig PM101_MAX_BLOCK
+            peak: make f64! block-peak :rig PM101_MAX_BLOCK
+            check (peak >= 0.0)
+            check (peak <= 1.0)
+        ]
+        pm101-destroy rig
+    ]
+]
+
+; --- 5. a render repeats -----------------------------------------------------------
+
+one: fresh
+two: fresh
+pm101-set-parameter :one (as u32! ID-MIX-MODE) 6.0
+pm101-set-parameter :two (as u32! ID-MIX-MODE) 6.0
+pm101-note-on :one 0 261.63 0.8
+pm101-note-on :two 0 261.63 0.8
+pm101-note-on :one 1 329.63 0.8
+pm101-note-on :two 1 329.63 0.8
+same: make [#mutable logic!] true
+view-one: make [#mutable output-view!] as output-view! (pm101-output :one)
+view-two: make [#mutable output-view!] as output-view! (pm101-output :two)
+repeat pass 6 [
+    pm101-process-block :one PM101_MAX_BLOCK
+    pm101-process-block :two PM101_MAX_BLOCK
+    repeat frame PM101_MAX_BLOCK [
+        left: make f64! view-one/samples/:frame
+        right: make f64! view-two/samples/:frame
+        if left <> right [same: false]
+    ]
+]
+check same
+pm101-destroy one
+pm101-destroy two
+
+print "checks:"
+print checks
+print "failures:"
+print failures
+either failures = 0 [print "PASS"] [print "FAIL"]

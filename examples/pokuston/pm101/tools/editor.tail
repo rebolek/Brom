@@ -1,0 +1,36 @@
+
+    ] :native-parent width height :editor
+
+    if none? e/context [return false]
+    show-preset-name (pm101-host/current-preset e/user)
+    return true
+]
+
+pm101-editor-preset-changed: func [
+    {Push a host preset change into this editor's caption. Selecting the view
+     first keeps multiple open instances from updating one another.}
+    #export
+    :editor [c-pointer!] "Borrowed editor."
+    index [i32!] "Committed factory-bank index, or -1."
+    return: [none!] "No value."
+] [
+    if none? editor [return none]
+    e: make [#mutable pm101-editor!] as pm101-editor! editor
+    if none? e/context [return none]
+    if not view-select e/context [return none]
+    show-preset-name index
+    return none
+]
+
+pm101-editor-tick: func [
+    "Pump the host-driven frame."
+    #export
+    :editor [c-pointer!] "Borrowed editor."
+    return: [none!] "No value."
+] [
+    if none? editor [return none]
+    e: make [#mutable pm101-editor!] as pm101-editor! :editor
+    if none? e/context [return none]
+    view-context-tick e/context
+    return none
+]

@@ -1,0 +1,36 @@
+Recoil [
+    Title: "PM-101 parameter roles"
+    Description: {
+        What kind of control a parameter is. Its own module for the reason
+        editor-size.rcl is one: the core assigns roles and the editor reads
+        them to decide how a value is drawn, and the editor cannot import the
+        core without compiling it into a second translation unit. A module of
+        constants can be imported anywhere.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/roles
+    Exports: [
+        PM101_ROLE_UNIT PM101_ROLE_WAVE_A PM101_ROLE_WAVE_B PM101_ROLE_WINDOW
+        PM101_ROLE_FILTER PM101_ROLE_RATE PM101_ROLE_LEVEL PM101_ROLE_MODE
+        PM101_ROLE_TOGGLE PM101_ROLE_BITS PM101_ROLE_DIVIDER
+        PM101_ROLE_DETUNE_OCTAVE PM101_ROLE_DETUNE_NOTE PM101_ROLE_DETUNE_CENT
+        PM101_ROLE_VIBRATO_RATE
+    ]
+]
+
+; Order is the ABI shared with pm101.h.
+PM101_ROLE_UNIT: 0
+PM101_ROLE_WAVE_A: 1
+PM101_ROLE_WAVE_B: 2
+PM101_ROLE_WINDOW: 3
+PM101_ROLE_FILTER: 4
+PM101_ROLE_RATE: 5
+PM101_ROLE_LEVEL: 6
+PM101_ROLE_MODE: 7
+PM101_ROLE_TOGGLE: 8
+PM101_ROLE_BITS: 9
+PM101_ROLE_DIVIDER: 10
+PM101_ROLE_DETUNE_OCTAVE: 11
+PM101_ROLE_DETUNE_NOTE: 12
+PM101_ROLE_DETUNE_CENT: 13
+PM101_ROLE_VIBRATO_RATE: 14

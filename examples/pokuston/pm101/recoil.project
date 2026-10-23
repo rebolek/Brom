@@ -1,0 +1,7 @@
+Recoil-Project [
+    Name: pm101-core
+    Version: 0.5.0
+    Dependencies: [
+        [package: recoil-brom source: [path %../../../packages/recoil-brom/]] [package: recoil-gui source: [recoil %packages/recoil-gui/]] [package: recoil-gui-backend-pugl source: [recoil %packages/recoil-gui-backend-pugl/]] [package: recoil-pugl-backend-darwin source: [recoil %packages/recoil-pugl-backend-darwin/]]
+    ]
+]

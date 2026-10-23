@@ -1,0 +1,17 @@
+Recoil [
+    Title: "PM-101 editor size"
+    Description: {
+        The one place the editor size is written down: the descriptor reports
+        it to the host and the editor refuses any other, so a second copy is a
+        silent black window the day they disagree. A module of two constants
+        rather than an import of the editor, because importing the editor into
+        the descriptor's translation unit would define every function in it
+        twice at link time.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/editor-size
+    Exports: [PM101-EDITOR-WIDTH PM101-EDITOR-HEIGHT]
+]
+
+PM101-EDITOR-WIDTH: make i32! 760
+PM101-EDITOR-HEIGHT: make i32! 560
