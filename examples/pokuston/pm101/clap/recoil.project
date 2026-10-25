@@ -1,0 +1,9 @@
+Recoil-Project [
+    Name: clap-pm101
+    Version: 0.1.0
+    Dependencies: [
+        [package: recoil-brom source: [path %../../../../packages/recoil-brom/]]
+        [package: pm101-core source: [path %../]]
+        [package: pokuston-clap-sdk source: [path %../../../../packages/pokuston-clap-sdk/]]
+    ]
+]

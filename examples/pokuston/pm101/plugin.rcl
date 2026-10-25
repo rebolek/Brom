@@ -1,0 +1,355 @@
+Recoil [
+    Title: "PM-101 format-neutral plug-in contract"
+    Description: {
+        Owns the engine descriptor, the host parameter schema and the factory
+        bank. The synthesis stays in core.rcl, and so does every range: this
+        file asks core.rcl for them rather than restating any.
+
+        PM-101 has no editor of its own yet. has-editor is false, so the CLAP
+        shell withholds clap.gui and a host shows its generic parameter view,
+        grouped by the module each parameter is declared with: the two lines,
+        their twelve envelopes, the mixer and FinalCrusher.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/plugin
+    Ffi: [c-string]
+    Imports: [
+        brom/plugin/engine [engine! param-info!]
+        brom/plugin/values [param-range! param-linear param-stepped]
+        examples/pokuston/pm101/presets [
+            PM101-FACTORY-PRESET-COUNT pm101-factory-preset
+        ]
+        examples/pokuston/pm101/core [
+            PM101-MAX-VOICES PM101-MAX-BLOCK PM101-PARAM-COUNT
+            PM101-GLOBAL-COUNT PM101-LINE-STRIDE PM101-ENV-BASE PM101-ENV-STRIDE
+            PM101-ENV-SEGMENTS
+            PM101-PARAM-MIX-MODE PM101-PARAM-LINE2-OCTAVE PM101-PARAM-LINE2-DETUNE
+            PM101-PARAM-OCTAVE PM101-PARAM-VIBRATO-RATE PM101-PARAM-VIBRATO-DEPTH
+            PM101-PARAM-SUSTAIN-STEP PM101-PARAM-CRUSH-BITS PM101-PARAM-CRUSH-DIVIDER
+            PM101-PARAM-SHAPER-THRESHOLD PM101-PARAM-VOLUME PM101-PARAM-VELOCITY
+            PM101-LINE-WAVE1 PM101-LINE-WAVE2 PM101-LINE-WINDOW PM101-LINE-DCW
+            PM101-LINE-DPS PM101-LINE-FILTER PM101-LINE-CUTOFF PM101-LINE-RESONANCE
+            PM101-LINE-DCA
+            PM101-ENV-PITCH PM101-ENV-DCW PM101-ENV-DPS PM101-ENV-CUTOFF
+            PM101-ENV-RESONANCE PM101-ENV-DCA
+            PM101-STATE-MAGIC PM101-STATE-SCHEMA
+            pm101-param-steps
+            pm101-create pm101-destroy pm101-activate pm101-reset
+            pm101-voice-state pm101-note-on pm101-note-off
+            pm101-process-block pm101-output
+            pm101-get-parameter pm101-set-parameter
+            pm101-parameter-min pm101-parameter-max pm101-parameter-default
+        ]
+    ]
+    Exports: [
+        pm101-brom-engine
+        pm101-plugin-create pm101-plugin-destroy pm101-plugin-activate
+        pm101-plugin-reset pm101-plugin-voice-state
+        pm101-plugin-note-on pm101-plugin-note-off
+        pm101-plugin-process pm101-plugin-output
+        pm101-plugin-param-info pm101-plugin-get-param pm101-plugin-set-param
+        PM101-STATE-BYTES
+    ]
+]
+
+; The BROM container's 20-byte header (8-byte universal prefix + the inner
+; codec's 12-byte magic/version/count) plus eight bytes per parameter: 20 +
+; 8 * 234.
+PM101-STATE-BYTES: 1892
+
+pm101-plugin-math: foreign <math.h> [
+    pow: "pow" [f64! f64!] return: [f64!]
+]
+
+; --- the host-facing schema ---------------------------------------------------
+; The module and name a parameter is declared with are not only what a host
+; displays: brom/plugin/preset folds them into the slug every factory preset is
+; keyed by ("line-1-dcw-env-level-3"). Renaming one here silently orphans that
+; parameter in every preset that mentions it.
+
+pm101-global-name: func [
+    "Host-facing name of an instrument-wide control."
+    id [i32!] "Parameter id below PM101-GLOBAL-COUNT."
+    return: [c-string!] "Borrowed static name."
+] [
+    if id = PM101-PARAM-MIX-MODE [return as c-string! "Mode"]
+    if id = PM101-PARAM-LINE2-OCTAVE [return as c-string! "Line 2 Octave"]
+    if id = PM101-PARAM-LINE2-DETUNE [return as c-string! "Line 2 Detune"]
+    if id = PM101-PARAM-OCTAVE [return as c-string! "Octave"]
+    if id = PM101-PARAM-VIBRATO-RATE [return as c-string! "Vibrato Rate"]
+    if id = PM101-PARAM-VIBRATO-DEPTH [return as c-string! "Vibrato Depth"]
+    if id = PM101-PARAM-SUSTAIN-STEP [return as c-string! "Sustain Step"]
+    if id = PM101-PARAM-CRUSH-BITS [return as c-string! "Bits"]
+    if id = PM101-PARAM-CRUSH-DIVIDER [return as c-string! "Divider"]
+    if id = PM101-PARAM-SHAPER-THRESHOLD [return as c-string! "Threshold"]
+    if id = PM101-PARAM-VOLUME [return as c-string! "Volume"]
+    if id = PM101-PARAM-VELOCITY [return as c-string! "Velocity"]
+    return as c-string! ""
+]
+
+pm101-global-module: func [
+    "Host grouping of an instrument-wide control."
+    id [i32!] "Parameter id below PM101-GLOBAL-COUNT."
+    return: [c-string!] "Borrowed static group name."
+] [
+    if id <= PM101-PARAM-LINE2-DETUNE [return as c-string! "Mixer"]
+    if id <= PM101-PARAM-VIBRATO-DEPTH [return as c-string! "Pitch"]
+    if id = PM101-PARAM-SUSTAIN-STEP [return as c-string! "Envelope"]
+    if id <= PM101-PARAM-SHAPER-THRESHOLD [return as c-string! "FinalCrusher"]
+    return as c-string! "Master"
+]
+
+pm101-line-knob-name: func [
+    "Host-facing name of one of a line's own knobs, as the PHiDO2 panel labelled it."
+    offset [i32!] "Offset below PM101-ENV-BASE."
+    return: [c-string!] "Borrowed static name."
+] [
+    if offset = PM101-LINE-WAVE1 [return as c-string! "Wave 1"]
+    if offset = PM101-LINE-WAVE2 [return as c-string! "Wave 2"]
+    if offset = PM101-LINE-WINDOW [return as c-string! "Window"]
+    if offset = PM101-LINE-DCW [return as c-string! "DCW"]
+    if offset = PM101-LINE-DPS [return as c-string! "DPS"]
+    if offset = PM101-LINE-FILTER [return as c-string! "Filter"]
+    if offset = PM101-LINE-CUTOFF [return as c-string! "Cutoff"]
+    if offset = PM101-LINE-RESONANCE [return as c-string! "Resonance"]
+    return as c-string! "DCA"
+]
+
+pm101-env-slot-name: func [
+    "Host-facing name of one envelope control: eight rates, then nine levels."
+    slot [i32!] "Position inside the envelope, nought through sixteen."
+    return: [c-string!] "Borrowed static name."
+] [
+    if slot = 0 [return as c-string! "Rate 1"]
+    if slot = 1 [return as c-string! "Rate 2"]
+    if slot = 2 [return as c-string! "Rate 3"]
+    if slot = 3 [return as c-string! "Rate 4"]
+    if slot = 4 [return as c-string! "Rate 5"]
+    if slot = 5 [return as c-string! "Rate 6"]
+    if slot = 6 [return as c-string! "Rate 7"]
+    if slot = 7 [return as c-string! "Rate 8"]
+    if slot = 8 [return as c-string! "Level 1"]
+    if slot = 9 [return as c-string! "Level 2"]
+    if slot = 10 [return as c-string! "Level 3"]
+    if slot = 11 [return as c-string! "Level 4"]
+    if slot = 12 [return as c-string! "Level 5"]
+    if slot = 13 [return as c-string! "Level 6"]
+    if slot = 14 [return as c-string! "Level 7"]
+    if slot = 15 [return as c-string! "Level 8"]
+    return as c-string! "Level 9"
+]
+
+pm101-env-module: func [
+    "Host grouping of one envelope of one line."
+    line [i32!] "Line, nought or one."
+    env [i32!] "One of the PM101-ENV-* envelopes."
+    return: [c-string!] "Borrowed static group name."
+] [
+    either line = 0 [
+        if env = PM101-ENV-PITCH [return as c-string! "Line 1 Pitch Env"]
+        if env = PM101-ENV-DCW [return as c-string! "Line 1 DCW Env"]
+        if env = PM101-ENV-DPS [return as c-string! "Line 1 DPS Env"]
+        if env = PM101-ENV-CUTOFF [return as c-string! "Line 1 Cutoff Env"]
+        if env = PM101-ENV-RESONANCE [return as c-string! "Line 1 Resonance Env"]
+        return as c-string! "Line 1 DCA Env"
+    ] [
+        if env = PM101-ENV-PITCH [return as c-string! "Line 2 Pitch Env"]
+        if env = PM101-ENV-DCW [return as c-string! "Line 2 DCW Env"]
+        if env = PM101-ENV-DPS [return as c-string! "Line 2 DPS Env"]
+        if env = PM101-ENV-CUTOFF [return as c-string! "Line 2 Cutoff Env"]
+        if env = PM101-ENV-RESONANCE [return as c-string! "Line 2 Resonance Env"]
+        return as c-string! "Line 2 DCA Env"
+    ]
+]
+
+pm101-param-name: func [
+    "Return the host-facing name of a PM-101 parameter."
+    #export
+    parameter [u32!] "Public parameter id."
+    return: [c-string!] "Borrowed static name, empty for an unknown id."
+] [
+    id: as i32! parameter
+    if any [id < 0 id >= PM101-PARAM-COUNT] [return as c-string! ""]
+    if id < PM101-GLOBAL-COUNT [return pm101-global-name id]
+    offset: (id - PM101-GLOBAL-COUNT) % PM101-LINE-STRIDE
+    if offset < PM101-ENV-BASE [return pm101-line-knob-name offset]
+    return pm101-env-slot-name ((offset - PM101-ENV-BASE) % PM101-ENV-STRIDE)
+]
+
+pm101-param-module: func [
+    "Return the host grouping of a PM-101 parameter."
+    #export
+    parameter [u32!] "Public parameter id."
+    return: [c-string!] "Borrowed static group name."
+] [
+    id: as i32! parameter
+    if any [id < 0 id >= PM101-PARAM-COUNT] [return as c-string! ""]
+    if id < PM101-GLOBAL-COUNT [return pm101-global-module id]
+    line: (id - PM101-GLOBAL-COUNT) / PM101-LINE-STRIDE
+    offset: (id - PM101-GLOBAL-COUNT) % PM101-LINE-STRIDE
+    if offset < PM101-ENV-BASE [
+        if line = 0 [return as c-string! "Line 1"]
+        return as c-string! "Line 2"
+    ]
+    return pm101-env-module line ((offset - PM101-ENV-BASE) / PM101-ENV-STRIDE)
+]
+
+pm101-plugin-param-info: func [
+    "Describe one parameter to Brom's host shells."
+    index [i32!] "Zero-based parameter index."
+    :out [c-pointer!] "Borrowed caller-owned param-info! address."
+    return: [logic!] "False when the index is outside the schema."
+] [
+    if any [index < 0 index >= PM101-PARAM-COUNT] [return false]
+    id: make u32! as u32! index
+    low: make f64! pm101-parameter-min id
+    high: make f64! pm101-parameter-max id
+    steps: pm101-param-steps id
+    ; Selectors are whole steps, so a host lists their positions instead of
+    ; offering a continuous knob between "sawtooth" and "square".
+    range: either steps > 1 [param-stepped low high steps] [param-linear low high]
+    info: make [#mutable param-info!] as param-info! :out
+    info/id: id
+    info/name: pm101-param-name id
+    info/module: pm101-param-module id
+    info/default-value: make f64! pm101-parameter-default id
+    info/range: range
+    return true
+]
+
+; --- descriptor slots ---------------------------------------------------------
+
+pm101-plugin-create: func [
+    "Allocate a PM-101 engine instance."
+    return: [c-pointer!] "Owned opaque engine state."
+] [
+    core: make c-pointer! pm101-create
+    return core
+]
+
+pm101-plugin-destroy: func [
+    "Release a PM-101 engine instance."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [none!] "No value."
+] [
+    pm101-destroy core
+    return none
+]
+
+pm101-plugin-activate: func [
+    "Prepare PM-101 for playback at a sample rate."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    sample-rate [f64!] "Host sample rate in Hz."
+    max-frames [i32!] "Largest host block; the core uses its fixed capacity."
+    return: [logic!] "Always true; the core cannot fail activation."
+] [
+    unused max-frames
+    pm101-activate :core sample-rate
+    return true
+]
+
+pm101-plugin-reset: func [
+    "Immediately silence voices and clear transient state while retaining parameters."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [none!] "No value."
+] [pm101-reset :core]
+
+pm101-plugin-voice-state: func [
+    "Report one voice to Brom's shared allocator."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Voice slot to inspect."
+    :out [c-pointer!] "Borrowed caller-owned voice report."
+    return: [logic!] "False for an invalid slot."
+] [return pm101-voice-state :core slot :out]
+
+pm101-plugin-note-on: func [
+    "Start one PM-101 voice, converting the key to a frequency."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Allocated voice slot."
+    key [i32!] "MIDI note number."
+    velocity [f64!] "Normalized note velocity."
+    return: [none!] "No value."
+] [
+    freq: make f64! 440.0 * pm101-plugin-math/pow 2.0 ((key - 69) / 12.0)
+    pm101-note-on :core slot freq velocity
+    return none
+]
+
+pm101-plugin-note-off: func [
+    "Release one PM-101 voice."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    slot [i32!] "Voice slot to release."
+    return: [none!] "No value."
+] [pm101-note-off :core slot return none]
+
+pm101-plugin-process: func [
+    "Render one block into PM-101's output buffer."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    frames [i32!] "Frames to render."
+    return: [none!] "No value."
+] [pm101-process-block :core frames return none]
+
+pm101-plugin-output: func [
+    "Return PM-101's mono output buffer."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    return: [c-pointer!] "Borrowed sample buffer."
+] [return pm101-output :core]
+
+pm101-plugin-get-param: func [
+    "Read one PM-101 parameter."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    id [u32!] "Public parameter id."
+    return: [f64!] "Current value."
+] [return pm101-get-parameter :core id]
+
+pm101-plugin-set-param: func [
+    "Write one PM-101 parameter."
+    :core [c-pointer!] "Borrowed opaque engine state."
+    id [u32!] "Public parameter id."
+    value [f64!] "Value in the parameter's own units."
+    return: [logic!] "Whether the id was recognized."
+] [return pm101-set-parameter :core id value]
+
+; --- the descriptor -----------------------------------------------------------
+
+pm101-brom-engine: make engine! [
+    id: (as c-string! "com.pokuston.pm101")
+    name: (as c-string! "PM-101")
+    vendor: (as c-string! "Pokuston")
+    version: (as c-string! "0.1.0")
+    description: (as c-string! "Sintezar PM-101: two-line phase-manipulation synthesizer, ported from Rebol 2")
+
+    param-count: PM101-PARAM-COUNT
+    max-voices: PM101-MAX-VOICES
+    state-size: PM101-STATE-BYTES
+    output-capacity: PM101-MAX-BLOCK
+    editor-width: 0
+    editor-height: 0
+    has-editor: false
+
+    create-fn: :pm101-plugin-create
+    destroy-fn: :pm101-plugin-destroy
+    activate-fn: :pm101-plugin-activate
+    reset-fn: :pm101-plugin-reset
+
+    voice-state-fn: :pm101-plugin-voice-state
+    custom-voice-slot: false
+
+    process-fn: :pm101-plugin-process
+    output-fn: :pm101-plugin-output
+    note-on-fn: :pm101-plugin-note-on
+    note-off-fn: :pm101-plugin-note-off
+
+    param-info-fn: :pm101-plugin-param-info
+    get-param-fn: :pm101-plugin-get-param
+    set-param-fn: :pm101-plugin-set-param
+
+    state-subsystem: PM101-STATE-MAGIC
+    state-version: PM101-STATE-SCHEMA
+    ; Binary rather than preset text: a fully dialled patch of 234 values
+    ; would spend most of the shell's state buffer on slugs.
+    state-save-ascii: false
+
+    factory-count: PM101-FACTORY-PRESET-COUNT
+    factory-preset-fn: :pm101-factory-preset
+]

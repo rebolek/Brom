@@ -1,0 +1,7 @@
+Recoil-Project [
+    Name: pm101-core
+    Version: 0.1.0
+    Dependencies: [
+        [package: recoil-brom source: [path %../../../packages/recoil-brom/]]
+    ]
+]
