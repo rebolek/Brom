@@ -1,0 +1,1087 @@
+Recoil [
+    Title: "Pokuston PM-101 phase-manipulation synth core"
+    Description: {
+        Sintezar PM-101, ported from the Rebol 2 script (Rebolek, 2005-2006)
+        to a real-time Brom engine.
+
+        The original computed one sound at a time into a buffer: two lines,
+        each a PHiDO2 oscillator (DCO), a phase distortion (DCW), a phase
+        shaper (DPS), a state-variable filter (DCF) and an amplifier (DCA),
+        every one of them driven by its own eight-segment ESE envelope; the
+        two lines combined by a mixer, and the whole thing finished by
+        FinalCrusher. All of that is kept, per voice and per line, with the
+        signal path in the original's order.
+
+        Three things a buffer renderer never needed and a plug-in cannot do
+        without are added, each as small as it can be:
+
+        - a key. The original had one pitch knob; a voice takes its pitch from
+          the MIDI note, and the old octave control survives as Octave.
+        - a sustain point. The original envelopes ran their eight segments
+          and stopped. Sustain Step holds every envelope at the end of that
+          segment while the key is down, and a note-off jumps to the segment
+          after it, the way the CZ the instrument is modelled on behaves.
+          Zero turns it off and the envelopes free-run as they always did.
+        - polyphony, eight voices allocated by Brom's shared policy.
+
+        Where the recovered source was unreadable the formula here is a
+        reconstruction, and the comment beside it says so.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/core
+    Imports: [
+        brom/dsp/utils [brom-clamp-f64 brom-abs-f64 brom-sanitize-f64]
+        brom/dsp/oscillator [brom-dc-coefficient]
+    ]
+    Exports: [
+        PM101-MAX-VOICES PM101-MAX-BLOCK PM101-PARAM-COUNT
+        PM101-GLOBAL-COUNT PM101-LINE-STRIDE PM101-ENV-BASE PM101-ENV-STRIDE
+        PM101-ENV-COUNT PM101-ENV-SEGMENTS
+        PM101-PARAM-MIX-MODE PM101-PARAM-LINE2-OCTAVE PM101-PARAM-LINE2-DETUNE
+        PM101-PARAM-OCTAVE PM101-PARAM-VIBRATO-RATE PM101-PARAM-VIBRATO-DEPTH
+        PM101-PARAM-SUSTAIN-STEP PM101-PARAM-CRUSH-BITS PM101-PARAM-CRUSH-DIVIDER
+        PM101-PARAM-SHAPER-THRESHOLD PM101-PARAM-VOLUME PM101-PARAM-VELOCITY
+        PM101-LINE-WAVE1 PM101-LINE-WAVE2 PM101-LINE-WINDOW PM101-LINE-DCW
+        PM101-LINE-DPS PM101-LINE-FILTER PM101-LINE-CUTOFF PM101-LINE-RESONANCE
+        PM101-LINE-DCA
+        PM101-ENV-PITCH PM101-ENV-DCW PM101-ENV-DPS PM101-ENV-CUTOFF
+        PM101-ENV-RESONANCE PM101-ENV-DCA
+        PM101-MIX-LINE1 PM101-MIX-LINE2 PM101-MIX-MIX PM101-MIX-RING
+        PM101-MIX-MIX-RING
+        PM101-STATE-MAGIC PM101-STATE-SCHEMA
+        pm101-line-param pm101-env-rate-param pm101-env-level-param
+        pm101-param-steps
+        pm101-create pm101-destroy pm101-activate pm101-reset
+        pm101-voice-state pm101-note-on pm101-note-off pm101-process-block
+        pm101-output pm101-output-capacity
+        pm101-get-parameter pm101-set-parameter
+        pm101-parameter-min pm101-parameter-max pm101-parameter-default
+    ]
+]
+
+pm101-math: foreign <math.h> [
+    cos: "cos" [f64! return: [f64!]]
+    sin: "sin" [f64! return: [f64!]]
+    asin: "asin" [f64! return: [f64!]]
+    acos: "acos" [f64! return: [f64!]]
+    sqrt: "sqrt" [f64! return: [f64!]]
+    pow: "pow" [f64! f64! return: [f64!]]
+    exp: "exp" [f64! return: [f64!]]
+    floor: "floor" [f64! return: [f64!]]
+]
+
+PM101-TAU: 6.283185307179586
+PM101-HALF-PI: 1.5707963267948966
+PM101-PI: 3.141592653589793
+PM101-LN2: 0.6931471805599453
+; The rate the original always rendered at. The filter's coefficient curve was
+; written against it, so it is used to keep that curve where it was whatever
+; rate the host runs at.
+PM101-REFERENCE-RATE: 44100.0
+
+PM101-MAX-VOICES: 8
+PM101-MAX-BLOCK: 512
+
+; --- parameter layout ---------------------------------------------------------
+; Order is the ABI: ids are what a saved state is keyed by. Twelve instrument-
+; wide controls, then two identical line blocks. A line block is the nine
+; knobs and selectors of the original's PHiDO2 panel followed by its six
+; envelopes, each eight rates and nine levels exactly as the ESE panel had.
+
+PM101-PARAM-MIX-MODE: 0
+PM101-PARAM-LINE2-OCTAVE: 1
+PM101-PARAM-LINE2-DETUNE: 2
+PM101-PARAM-OCTAVE: 3
+PM101-PARAM-VIBRATO-RATE: 4
+PM101-PARAM-VIBRATO-DEPTH: 5
+PM101-PARAM-SUSTAIN-STEP: 6
+PM101-PARAM-CRUSH-BITS: 7
+PM101-PARAM-CRUSH-DIVIDER: 8
+PM101-PARAM-SHAPER-THRESHOLD: 9
+PM101-PARAM-VOLUME: 10
+PM101-PARAM-VELOCITY: 11
+PM101-GLOBAL-COUNT: 12
+
+PM101-LINE-WAVE1: 0
+PM101-LINE-WAVE2: 1
+PM101-LINE-WINDOW: 2
+PM101-LINE-DCW: 3
+PM101-LINE-DPS: 4
+PM101-LINE-FILTER: 5
+PM101-LINE-CUTOFF: 6
+PM101-LINE-RESONANCE: 7
+PM101-LINE-DCA: 8
+PM101-ENV-BASE: 9
+
+; The six ESE envelopes of one line, in the original's order.
+PM101-ENV-PITCH: 0
+PM101-ENV-DCW: 1
+PM101-ENV-DPS: 2
+PM101-ENV-CUTOFF: 3
+PM101-ENV-RESONANCE: 4
+PM101-ENV-DCA: 5
+PM101-ENV-COUNT: 6
+PM101-ENV-SEGMENTS: 8
+; Eight rates, then nine levels.
+PM101-ENV-STRIDE: 17
+PM101-LINE-STRIDE: 111
+PM101-PARAM-COUNT: 234
+
+; Mixer modes. Mix-Ring is the original's: the ring product with the second
+; line added back, so line two is carrier and modulator at once.
+PM101-MIX-LINE1: 0
+PM101-MIX-LINE2: 1
+PM101-MIX-MIX: 2
+PM101-MIX-RING: 3
+PM101-MIX-MIX-RING: 4
+
+; Waveforms of the PHiDO2 oscillator. Plain integers rather than an enum!,
+; because enum! variants lower to unqualified C identifiers. Wave 2 uses the
+; same numbers shifted up by one, with nought meaning the original's no-wave.
+PM101-WAVE-SAWTOOTH: 0
+PM101-WAVE-NEW-SAWTOOTH: 1
+PM101-WAVE-SQUARE: 2
+PM101-WAVE-PULSE: 3
+PM101-WAVE-SAW-PULSE: 4
+PM101-WAVE-SINE-SYNC: 5
+PM101-WAVE-TRIANGLE: 6
+
+PM101-WINDOW-NONE: 0
+PM101-WINDOW-SAWTOOTH: 1
+PM101-WINDOW-TRIANGLE: 2
+PM101-WINDOW-TRAPEZOID: 3
+PM101-WINDOW-SAW-PULSE: 4
+
+PM101-FILTER-NONE: 0
+PM101-FILTER-LOW: 1
+PM101-FILTER-BAND: 2
+PM101-FILTER-HIGH: 3
+PM101-FILTER-NOTCH: 4
+
+PM101-STATE-MAGIC: 0#31304d50
+PM101-STATE-SCHEMA: 1
+
+; --- state --------------------------------------------------------------------
+
+pm101-env!: make c-struct! [
+    ; Segment being run, nought through seven; eight means finished.
+    step: [i32!]
+    ; Samples into the segment and its length, both as floats because the
+    ; length comes from a power curve and is never a whole number to begin
+    ; with.
+    pos: [f64!]
+    len: [f64!]
+    from: [f64!]
+    to: [f64!]
+    ; Last value produced, so a note-off can start the release from where the
+    ; envelope actually is rather than from the level it was heading for.
+    value: [f64!]
+    holding: [logic!]
+]
+
+pm101-line!: make c-struct! [
+    phase: [f64!]
+    ; The original's octave-modulation flag: with a second waveform chosen,
+    ; the oscillator alternates between the two on every cycle.
+    second: [logic!]
+    ; Chamberlin state: band and low.
+    d1: [f64!]
+    d2: [f64!]
+    envs: [c-array! [pm101-env! 6]]
+]
+
+pm101-voice!: make c-struct! [
+    active: [logic!]
+    gate: [logic!]
+    age: [i64!]
+    frequency: [f64!]
+    velocity: [f64!]
+    lines: [c-array! [pm101-line! 2]]
+]
+
+pm101-state!: make c-struct! [
+    sample-rate: [f64!]
+    params: [c-array! [f64! 234]]
+    voices: [c-array! [pm101-voice! 8]]
+    next-age: [i64!]
+    vibrato-phase: [f64!]
+    ; FinalCrusher's frequency divider: the held sample and how long it has
+    ; left to be held.
+    hold-value: [f64!]
+    hold-count: [i32!]
+    ; One DC blocker on the voice sum. The PHiDO2 window shapes toward one
+    ; rather than toward nought, so a windowed wave carries an offset the
+    ; original simply wrote into its file; a plug-in output cannot.
+    dc-x: [f64!]
+    dc-y: [f64!]
+    dc-pole: [f64!]
+    output: [c-array! [f64! 512]]
+]
+
+; --- parameter addressing -----------------------------------------------------
+
+pm101-line-param: func [
+    "Id of one of a line's own knobs."
+    line [i32!] "Line, nought or one."
+    offset [i32!] "One of the PM101-LINE-* offsets."
+    return: [i32!] "Parameter id."
+] [
+    return PM101-GLOBAL-COUNT + (line * PM101-LINE-STRIDE) + offset
+]
+
+pm101-env-rate-param: func [
+    "Id of one segment rate of one envelope."
+    line [i32!] "Line, nought or one."
+    env [i32!] "One of the PM101-ENV-* envelopes."
+    segment [i32!] "Segment, nought through seven."
+    return: [i32!] "Parameter id."
+] [
+    return (pm101-line-param line PM101-ENV-BASE) + (env * PM101-ENV-STRIDE) + segment
+]
+
+pm101-env-level-param: func [
+    "Id of one level of one envelope."
+    line [i32!] "Line, nought or one."
+    env [i32!] "One of the PM101-ENV-* envelopes."
+    level [i32!] "Level, nought through eight."
+    return: [i32!] "Parameter id."
+] [
+    return (pm101-env-rate-param line env 0) + PM101-ENV-SEGMENTS + level
+]
+
+; The three numbers every id decodes to. Globals report line -1.
+pm101-id-line: func [
+    "Line a parameter id belongs to."
+    id [i32!] "Parameter id."
+    return: [i32!] "Nought or one, or -1 for an instrument-wide control."
+] [
+    if id < PM101-GLOBAL-COUNT [return -1]
+    return (id - PM101-GLOBAL-COUNT) / PM101-LINE-STRIDE
+]
+
+pm101-id-offset: func [
+    "Offset of a line parameter inside its line block."
+    id [i32!] "Parameter id of a line parameter."
+    return: [i32!] "Offset in nought to one hundred and ten."
+] [
+    return (id - PM101-GLOBAL-COUNT) % PM101-LINE-STRIDE
+]
+
+; --- the one range table -----------------------------------------------------
+; Every range is stated once, here. The plug-in schema asks.
+
+pm101-param-steps: func [
+    "How many positions a selector parameter has."
+    #export
+    parameter [u32!] "Parameter id."
+    return: [i32!] "Position count for a stepped parameter, nought for a continuous one."
+] [
+    id: as i32! parameter
+    if id >= PM101-PARAM-COUNT [return 0]
+    if id = PM101-PARAM-MIX-MODE [return 5]
+    if id = PM101-PARAM-LINE2-OCTAVE [return 5]
+    if id = PM101-PARAM-OCTAVE [return 7]
+    if id = PM101-PARAM-SUSTAIN-STEP [return 8]
+    if id = PM101-PARAM-CRUSH-BITS [return 24]
+    if id = PM101-PARAM-CRUSH-DIVIDER [return 32]
+    if id < PM101-GLOBAL-COUNT [return 0]
+    offset: pm101-id-offset id
+    if offset = PM101-LINE-WAVE1 [return 7]
+    if offset = PM101-LINE-WAVE2 [return 8]
+    if offset = PM101-LINE-WINDOW [return 5]
+    if offset = PM101-LINE-FILTER [return 5]
+    return 0
+]
+
+pm101-parameter-min: func [
+    "The low end of one parameter's range."
+    #export
+    parameter [u32!] "Parameter id."
+    return: [f64!] "Range minimum, or nought for an unknown id."
+] [
+    id: as i32! parameter
+    if id = PM101-PARAM-LINE2-OCTAVE [return -2.0]
+    if id = PM101-PARAM-LINE2-DETUNE [return -100.0]
+    if id = PM101-PARAM-OCTAVE [return -3.0]
+    if id = PM101-PARAM-VIBRATO-RATE [return 0.1]
+    if id = PM101-PARAM-CRUSH-BITS [return 1.0]
+    if id = PM101-PARAM-CRUSH-DIVIDER [return 1.0]
+    return 0.0
+]
+
+pm101-parameter-max: func [
+    "The high end of one parameter's range."
+    #export
+    parameter [u32!] "Parameter id."
+    return: [f64!] "Range maximum, or nought for an unknown id."
+] [
+    id: as i32! parameter
+    if id >= PM101-PARAM-COUNT [return 0.0]
+    steps: pm101-param-steps parameter
+    if steps > 0 [return (pm101-parameter-min parameter) + (as f64! (steps - 1))]
+    if id = PM101-PARAM-LINE2-DETUNE [return 100.0]
+    if id = PM101-PARAM-VIBRATO-RATE [return 12.0]
+    ; Semitones either side at full depth.
+    if id = PM101-PARAM-VIBRATO-DEPTH [return 2.0]
+    ; Every other control is a knob of the original, which all ran nought to one.
+    return 1.0
+]
+
+pm101-parameter-default: func [
+    "Return the stable default for one parameter: the original's own initial patch."
+    #export
+    parameter [u32!] "Parameter id."
+    return: [f64!] "Default value, or nought for an unknown id."
+] [
+    id: as i32! parameter
+    if id >= PM101-PARAM-COUNT [return 0.0]
+    if id = PM101-PARAM-VIBRATO-RATE [return 5.0]
+    ; Holding at the end of segment two, which in the default patch is the
+    ; sixteen-second plateau, so the initial patch plays like an organ.
+    if id = PM101-PARAM-SUSTAIN-STEP [return 2.0]
+    if id = PM101-PARAM-CRUSH-BITS [return 24.0]
+    if id = PM101-PARAM-CRUSH-DIVIDER [return 1.0]
+    ; One is the waveshaper's off position.
+    if id = PM101-PARAM-SHAPER-THRESHOLD [return 1.0]
+    if id = PM101-PARAM-VOLUME [return 0.35]
+    if id = PM101-PARAM-VELOCITY [return 0.5]
+    if id < PM101-GLOBAL-COUNT [return 0.0]
+    offset: pm101-id-offset id
+    if offset = PM101-LINE-DCW [return 1.0]
+    if offset = PM101-LINE-CUTOFF [return 1.0]
+    ; Minus three decibels, as the original shipped.
+    if offset = PM101-LINE-DCA [return 0.7071]
+    if offset < PM101-ENV-BASE [return 0.0]
+    in-env: (offset - PM101-ENV-BASE) % PM101-ENV-STRIDE
+    env: (offset - PM101-ENV-BASE) / PM101-ENV-STRIDE
+    if in-env < PM101-ENV-SEGMENTS [
+        ; Rates [0 1 0 0 0 0 0 0]: a one-millisecond rise, a sixteen-second
+        ; plateau, a one-millisecond fall.
+        if in-env = 1 [return 1.0]
+        return 0.0
+    ]
+    ; The pitch envelope sits at its centre, where it bends nothing.
+    if env = PM101-ENV-PITCH [return 0.5]
+    level: in-env - PM101-ENV-SEGMENTS
+    ; Levels [0 1 1 0 0 0 0 0 0].
+    if any [level = 1 level = 2] [return 1.0]
+    return 0.0
+]
+
+pm101-param-value: func [
+    "Clamp a value into a parameter's range, snapping a selector to a whole position."
+    parameter [u32!] "Parameter id."
+    value [f64!] "Requested value."
+    return: [f64!] "Value inside the range."
+] [
+    clamped: brom-clamp-f64 value (pm101-parameter-min parameter) (pm101-parameter-max parameter)
+    if (pm101-param-steps parameter) > 0 [return pm101-math/floor (clamped + 0.5)]
+    return clamped
+]
+
+pm101-param: func [
+    #inline
+    "Read one stored parameter."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    id [i32!] "Parameter id."
+    return: [f64!] "Stored value."
+] [
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    return state/params/:id
+]
+
+pm101-param-i: func [
+    #inline
+    "Read one stored selector parameter as a whole number."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    id [i32!] "Parameter id."
+    return: [i32!] "Stored position."
+] [
+    return as i32! (pm101-param :raw id)
+]
+
+; --- ESE: the eight-segment envelope -----------------------------------------
+
+pm101-segment-length: func [
+    "Samples one envelope segment lasts at a rate knob position."
+    rate [f64!] "Rate knob, nought to one."
+    sample-rate [f64!] "Sample rate in Hz."
+    return: [f64!] "Segment length in samples, at least one."
+] [
+    ; The original's curve: ((rate + 1) ^ 14) / 1000 seconds, one millisecond at
+    ; nought and sixteen seconds at one. Stated in seconds, so a segment lasts
+    ; as long at any host rate as it did at 44.1 kHz.
+    r: brom-clamp-f64 rate 0.0 1.0
+    return ((pm101-math/pow (r + 1.0) 14.0) / 1000.0 * sample-rate) + 1.0
+]
+
+pm101-env-start: func [
+    "Begin one segment of an envelope."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    :envp [c-pointer!] "Borrowed address of the pm101-env! to start."
+    line [i32!] "Line the envelope belongs to."
+    env [i32!] "Which of the line's envelopes it is."
+    step [i32!] "Segment to start, nought through seven."
+    gate [logic!] "Whether the key is still held."
+    return: [none!] "No value."
+] [
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    e: make [#mutable pm101-env!] as pm101-env! envp
+    e/step: step
+    if step >= PM101-ENV-SEGMENTS [
+        e/value: 0.0
+        e/holding: false
+        return none
+    ]
+    e/from: pm101-param :raw (pm101-env-level-param line env step)
+    e/to: pm101-param :raw (pm101-env-level-param line env (step + 1))
+    e/len: pm101-segment-length (pm101-param :raw (pm101-env-rate-param line env step))
+        state/sample-rate
+    e/pos: 0.0
+    e/value: e/from
+    sustain: pm101-param-i :raw PM101-PARAM-SUSTAIN-STEP
+    ; Arriving at the sustain point with the key down: hold the level the
+    ; previous segment ended on until the key is let go.
+    e/holding: all [gate sustain > 0 step = sustain]
+    return none
+]
+
+pm101-env-trigger: func [
+    "Restart an envelope from its first level."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    :envp [c-pointer!] "Borrowed address of the pm101-env!."
+    line [i32!] "Line the envelope belongs to."
+    env [i32!] "Which of the line's envelopes it is."
+    return: [none!] "No value."
+] [
+    pm101-env-start :raw :envp line env 0 true
+    return none
+]
+
+pm101-env-release: func [
+    "Let go of an envelope: leave the sustain hold, or jump past the sustain point."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    :envp [c-pointer!] "Borrowed address of the pm101-env!."
+    line [i32!] "Line the envelope belongs to."
+    env [i32!] "Which of the line's envelopes it is."
+    return: [none!] "No value."
+] [
+    e: make [#mutable pm101-env!] as pm101-env! envp
+    e/holding: false
+    sustain: pm101-param-i :raw PM101-PARAM-SUSTAIN-STEP
+    if sustain <= 0 [return none]
+    if e/step >= sustain [return none]
+    ; Released before the sustain point was reached: go straight to the
+    ; segment after it, beginning from wherever the envelope had got to, so
+    ; the release never jumps.
+    current: e/value
+    pm101-env-start :raw :envp line env sustain false
+    e/from: current
+    e/value: current
+    return none
+]
+
+pm101-env-tick: func [
+    "Produce one envelope sample and advance it."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    :envp [c-pointer!] "Borrowed address of the pm101-env!."
+    line [i32!] "Line the envelope belongs to."
+    env [i32!] "Which of the line's envelopes it is."
+    gate [logic!] "Whether the key is still held."
+    return: [f64!] "Envelope value."
+] [
+    e: make [#mutable pm101-env!] as pm101-env! envp
+    ; Past the last segment the original's envelope reads nought.
+    if e/step >= PM101-ENV-SEGMENTS [return 0.0]
+    if e/holding [
+        if gate [return e/value]
+        e/holding: false
+    ]
+    e/value: e/from + ((e/to - e/from) * (e/pos / e/len))
+    e/pos: e/pos + 1.0
+    if e/pos >= e/len [
+        pm101-env-start :raw :envp line env (e/step + 1) gate
+    ]
+    return e/value
+]
+
+pm101-env-done?: func [
+    #inline
+    "Whether an envelope has run its last segment."
+    :envp [c-pointer!] "Borrowed address of the pm101-env!."
+    return: [logic!] "True once finished."
+] [
+    e: make [#mutable pm101-env!] as pm101-env! envp
+    return e/step >= PM101-ENV-SEGMENTS
+]
+
+; --- PHiDO2 -------------------------------------------------------------------
+; Each waveform bends the running phase and the oscillator reads a cosine at
+; the bent position, so DCW nought is a pure cosine for every wave and the
+; amount of bending is the timbre. The constants are the original's where the
+; recovered source was legible.
+
+pm101-warp: func [
+    "Bend one phase through one PHiDO2 waveform."
+    wave [i32!] "One of the PM101-WAVE-* waveforms."
+    phase [f64!] "Phase, nought to one."
+    dcw [f64!] "Distortion amount, nought to one."
+    return: [f64!] "Bent phase."
+] [
+    if wave = PM101-WAVE-SAWTOOTH [
+        ; The knee slides from mid-cycle to the very start.
+        knee: brom-clamp-f64 (0.5 * (1.0 - dcw)) 0.0005 0.5
+        if phase <= knee [return 0.5 * (phase / knee)]
+        return 0.5 + (0.5 * ((phase - knee) / (1.0 - knee)))
+    ]
+    if wave = PM101-WAVE-NEW-SAWTOOTH [
+        ; Reconstructed: the source line was unreadable past its knee constant,
+        ; (1 - DCW) / 4 + 0.05. A linear rise to the knee, then a sine-shaped
+        ; run to the end of the cycle, so it never quite becomes a pure cosine.
+        knee: (0.25 * (1.0 - dcw)) + 0.05
+        if phase <= knee [return 0.5 * (phase / knee)]
+        return 0.5 + (0.5 * (pm101-math/sin (PM101-HALF-PI * ((phase - knee) / (1.0 - knee)))))
+    ]
+    if wave = PM101-WAVE-SQUARE [
+        ; Each half-cycle rises over its first part and holds, at the trough
+        ; and then at the peak of the cosine.
+        width: brom-clamp-f64 (0.5 * (1.0 - dcw)) 0.0005 0.5
+        if phase < 0.5 [return 0.5 * (brom-clamp-f64 (phase / width) 0.0 1.0)]
+        return 0.5 + (0.5 * (brom-clamp-f64 ((phase - 0.5) / width) 0.0 1.0))
+    ]
+    if wave = PM101-WAVE-PULSE [
+        ; One cosine cycle squeezed into the start, then silence at the peak.
+        width: (0.875 * (1.0 - dcw)) + 0.125
+        if phase <= width [return phase / width]
+        return 1.0
+    ]
+    if wave = PM101-WAVE-SAW-PULSE [
+        width: (0.5 * (1.0 - dcw)) + 0.5
+        if phase <= width [return phase]
+        return 1.0
+    ]
+    if wave = PM101-WAVE-SINE-SYNC [
+        ; Up to sixteen cosine cycles per period: the CZ's resonance waves,
+        ; once a window shapes them.
+        return phase * (1.0 + (15.0 * dcw))
+    ]
+    ; Triangle. Reconstructed: only its constant survived legibly. The bend
+    ; that turns the cosine into an exact triangle, crossfaded by DCW.
+    tri: make [#mutable f64!] 0.0
+    either phase < 0.5 [
+        tri: (pm101-math/acos (brom-clamp-f64 (1.0 - (4.0 * phase)) -1.0 1.0)) / PM101-TAU
+    ] [
+        tri: 1.0 - ((pm101-math/acos (brom-clamp-f64 ((4.0 * phase) - 3.0) -1.0 1.0)) / PM101-TAU)
+    ]
+    return phase + (dcw * (tri - phase))
+]
+
+pm101-window: func [
+    "The original's window functions, read across the window's own phase."
+    shape [i32!] "One of the PM101-WINDOW-* shapes."
+    phase [f64!] "Window phase, nought to one."
+    return: [f64!] "Window gain, nought to one."
+] [
+    if shape = PM101-WINDOW-SAWTOOTH [return 1.0 - phase]
+    if shape = PM101-WINDOW-TRIANGLE [
+        if phase < 0.5 [return 2.0 * phase]
+        return 2.0 * (1.0 - phase)
+    ]
+    if shape = PM101-WINDOW-TRAPEZOID [
+        if phase < 0.5 [return 1.0]
+        return 2.0 * (1.0 - phase)
+    ]
+    if shape = PM101-WINDOW-SAW-PULSE [
+        if phase < 0.5 [return 1.0 - (2.0 * phase)]
+        return 1.0
+    ]
+    return 1.0
+]
+
+; --- one line -----------------------------------------------------------------
+
+pm101-line-dca: func [
+    "Address of a line's amplifier envelope."
+    :linep [c-pointer!] "Borrowed address of the pm101-line!."
+    return: [c-pointer!] "Borrowed address of its DCA pm101-env!."
+] [
+    l: make [#mutable pm101-line!] as pm101-line! linep
+    return addr-of l/envs/(as i32! PM101-ENV-DCA)
+]
+
+pm101-line-reset: func [
+    "Put one line of one voice back to the start of a note."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    :linep [c-pointer!] "Borrowed address of the pm101-line!."
+    line [i32!] "Which line it is."
+    return: [none!] "No value."
+] [
+    l: make [#mutable pm101-line!] as pm101-line! linep
+    ; Every note starts on phase nought, as every computed sound in the
+    ; original did: the attack is part of the patch.
+    l/phase: 0.0
+    l/second: false
+    l/d1: 0.0
+    l/d2: 0.0
+    repeat env PM101-ENV-COUNT [
+        pm101-env-trigger :raw (addr-of l/envs/:env) line env
+    ]
+    return none
+]
+
+pm101-line-release: func [
+    "Release every envelope of one line."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    :linep [c-pointer!] "Borrowed address of the pm101-line!."
+    line [i32!] "Which line it is."
+    return: [none!] "No value."
+] [
+    l: make [#mutable pm101-line!] as pm101-line! linep
+    repeat env PM101-ENV-COUNT [
+        pm101-env-release :raw (addr-of l/envs/:env) line env
+    ]
+    return none
+]
+
+pm101-line-tick: func [
+    "Render one sample of one line: DCO, DCW, DPS, window, DCF, DCA."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    :linep [c-pointer!] "Borrowed address of the pm101-line!."
+    line [i32!] "Which line it is."
+    frequency [f64!] "Line pitch in Hz before its pitch envelope."
+    gate [logic!] "Whether the key is still held."
+    return: [f64!] "Line output, nought when its amplifier envelope has finished."
+] [
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    l: make [#mutable pm101-line!] as pm101-line! linep
+    if pm101-env-done? (pm101-line-dca :linep) [return 0.0]
+
+    e-pitch: pm101-env-tick :raw (addr-of l/envs/(as i32! PM101-ENV-PITCH)) line PM101-ENV-PITCH gate
+    e-dcw: pm101-env-tick :raw (addr-of l/envs/(as i32! PM101-ENV-DCW)) line PM101-ENV-DCW gate
+    e-dps: pm101-env-tick :raw (addr-of l/envs/(as i32! PM101-ENV-DPS)) line PM101-ENV-DPS gate
+    e-cutoff: pm101-env-tick :raw (addr-of l/envs/(as i32! PM101-ENV-CUTOFF)) line PM101-ENV-CUTOFF gate
+    e-resonance: pm101-env-tick :raw (addr-of l/envs/(as i32! PM101-ENV-RESONANCE)) line PM101-ENV-RESONANCE gate
+    e-dca: pm101-env-tick :raw (addr-of l/envs/(as i32! PM101-ENV-DCA)) line PM101-ENV-DCA gate
+
+    wave1: pm101-param-i :raw (pm101-line-param line PM101-LINE-WAVE1)
+    wave2: pm101-param-i :raw (pm101-line-param line PM101-LINE-WAVE2)
+    window-type: pm101-param-i :raw (pm101-line-param line PM101-LINE-WINDOW)
+    filter-type: pm101-param-i :raw (pm101-line-param line PM101-LINE-FILTER)
+    dcw: brom-clamp-f64 ((pm101-param :raw (pm101-line-param line PM101-LINE-DCW)) * e-dcw) 0.0 1.0
+    dps: brom-clamp-f64 ((pm101-param :raw (pm101-line-param line PM101-LINE-DPS)) * e-dps) 0.0 1.0
+
+    ; The pitch envelope bends two octaves either way about its centre.
+    pitch: frequency * (pm101-math/exp (PM101-LN2 * 4.0 * (e-pitch - 0.5)))
+    increment: brom-clamp-f64 (pitch / state/sample-rate) 0.0 0.5
+
+    ; Two waveforms alternate cycle by cycle, and the window then spans the
+    ; pair, so it shapes the composite rather than each half on its own.
+    two-waves: wave2 > 0
+    wave: either all [two-waves l/second] [wave2 - 1] [wave1]
+    window-phase: make [#mutable f64!] l/phase
+    if two-waves [
+        window-phase: either l/second [(0.5 * l/phase) + 0.5] [0.5 * l/phase]
+    ]
+
+    ; DPS: the wave runs faster and stops at the end of its cycle, so it
+    ; shortens while the period stays put. The scale of six is the legible
+    ; part of a garbled line.
+    shaped: brom-clamp-f64 (l/phase * (1.0 + (6.0 * dps))) 0.0 1.0
+    oscillator: pm101-math/cos (PM101-TAU * (pm101-warp wave shaped dcw))
+    gain: pm101-window window-type window-phase
+    ; The original's own combination: a window of nought leaves the wave at
+    ; its resting value of one rather than at silence.
+    sound: (gain * (oscillator - 1.0)) + 1.0
+
+    filtered: make [#mutable f64!] sound
+    if filter-type > PM101-FILTER-NONE [
+        ; The original's coefficient, sin(90 deg * cutoff), was a Chamberlin f
+        ; at 44.1 kHz. Read it back as the frequency it meant there, then run
+        ; the filter at twice the host rate: the original's top setting sits
+        ; past where a Chamberlin at one times the rate is stable.
+        cut: brom-clamp-f64 ((pm101-param :raw (pm101-line-param line PM101-LINE-CUTOFF)) * e-cutoff) 0.0 1.0
+        reference-f: pm101-math/sin (PM101-HALF-PI * cut)
+        hertz: (PM101-REFERENCE-RATE / PM101-PI) * (pm101-math/asin (0.5 * reference-f))
+        f-raw: 2.0 * (pm101-math/sin (PM101-PI * hertz / (2.0 * state/sample-rate)))
+        ; Reconstructed: the source's resonance line divided by a knob whose
+        ; default was nought. Damping here runs from two at nought, no
+        ; resonance, to a tenth at one, just short of self-oscillation.
+        res: brom-clamp-f64 ((pm101-param :raw (pm101-line-param line PM101-LINE-RESONANCE)) * e-resonance) 0.0 1.0
+        damping: 2.0 - (1.9 * res)
+        ; Chamberlin is stable while f * f + 2 * f * damping < 4.
+        f-limit: 0.98 * ((pm101-math/sqrt ((damping * damping) + 4.0)) - damping)
+        f: brom-clamp-f64 f-raw 0.0 f-limit
+        low: make [#mutable f64!] 0.0
+        high: make [#mutable f64!] 0.0
+        band: make [#mutable f64!] 0.0
+        repeat pass 2 [
+            low: (f * l/d1) + l/d2
+            high: sound - low - (damping * l/d1)
+            band: (f * high) + l/d1
+            l/d2: brom-sanitize-f64 low 1000.0
+            l/d1: brom-sanitize-f64 band 1000.0
+        ]
+        if filter-type = PM101-FILTER-LOW [filtered: low]
+        ; Scaled by the damping, as the original scaled its outputs, so the
+        ; band-pass peak stays at unity as the resonance changes.
+        if filter-type = PM101-FILTER-BAND [filtered: band * damping]
+        if filter-type = PM101-FILTER-HIGH [filtered: high]
+        if filter-type = PM101-FILTER-NOTCH [filtered: high + low]
+    ]
+
+    dca: pm101-param :raw (pm101-line-param line PM101-LINE-DCA)
+    out: brom-clamp-f64 (e-dca * dca * filtered) -1.0 1.0
+
+    next-phase: l/phase + increment
+    either next-phase >= 1.0 [
+        l/phase: next-phase - 1.0
+        ; The original's octave modulation flips on every wrap.
+        l/second: either two-waves [not l/second] [false]
+    ] [
+        l/phase: next-phase
+    ]
+    return out
+]
+
+; --- voices -------------------------------------------------------------------
+
+pm101-voice-line-active?: func [
+    "Whether the mixer mode listens to a line at all."
+    mode [i32!] "One of the PM101-MIX-* modes."
+    line [i32!] "Line, nought or one."
+    return: [logic!] "True when the line is heard."
+] [
+    if mode = PM101-MIX-LINE1 [return line = 0]
+    if mode = PM101-MIX-LINE2 [return line = 1]
+    return true
+]
+
+pm101-tick-voice: func [
+    "Render and advance one voice: both lines through the mixer."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    index [i32!] "Voice slot."
+    vibrato [f64!] "This sample's vibrato pitch ratio."
+    return: [f64!] "The voice's contribution to the sum."
+] [
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    voice: make [#mutable pm101-voice!] as pm101-voice! (addr-of state/voices/:index)
+    if not voice/active [return 0.0]
+    mode: pm101-param-i :raw PM101-PARAM-MIX-MODE
+    octave: pm101-param :raw PM101-PARAM-OCTAVE
+    base: voice/frequency * vibrato * (pm101-math/exp (PM101-LN2 * octave))
+    line2-octave: pm101-param :raw PM101-PARAM-LINE2-OCTAVE
+    line2-cents: pm101-param :raw PM101-PARAM-LINE2-DETUNE
+    line2-ratio: pm101-math/exp (PM101-LN2 * (line2-octave + (line2-cents / 1200.0)))
+
+    one: make [#mutable f64!] 0.0
+    two: make [#mutable f64!] 0.0
+    sounding: make [#mutable logic!] false
+    if pm101-voice-line-active? mode 0 [
+        one: pm101-line-tick :raw (addr-of voice/lines/0) 0 base voice/gate
+        if not pm101-env-done? (pm101-line-dca (addr-of voice/lines/0)) [sounding: true]
+    ]
+    if pm101-voice-line-active? mode 1 [
+        two: pm101-line-tick :raw (addr-of voice/lines/1) 1 (base * line2-ratio) voice/gate
+        if not pm101-env-done? (pm101-line-dca (addr-of voice/lines/1)) [sounding: true]
+    ]
+    if not sounding [
+        voice/active: false
+        return 0.0
+    ]
+
+    mixed: make [#mutable f64!] one
+    if mode = PM101-MIX-LINE2 [mixed: two]
+    if mode = PM101-MIX-MIX [mixed: 0.5 * (one + two)]
+    if mode = PM101-MIX-RING [mixed: one * two]
+    if mode = PM101-MIX-MIX-RING [mixed: 0.5 * ((one * two) + two)]
+
+    ; The original had no keyboard, so no velocity; the amount is how much of
+    ; it this port lets through.
+    amount: pm101-param :raw PM101-PARAM-VELOCITY
+    return mixed * ((1.0 - amount) + (amount * voice/velocity))
+]
+
+; --- FinalCrusher -------------------------------------------------------------
+
+pm101-crush: func [
+    "FinalCrusher: frequency divider, bit reduction, then the waveshaper."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    input [f64!] "Summed, DC-blocked voices."
+    return: [f64!] "Crushed sample."
+] [
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    divider: pm101-param-i :raw PM101-PARAM-CRUSH-DIVIDER
+    if state/hold-count <= 0 [
+        state/hold-value: input
+        state/hold-count: divider
+    ]
+    state/hold-count: state/hold-count - 1
+    x: make [#mutable f64!] state/hold-value
+
+    bits: pm101-param-i :raw PM101-PARAM-CRUSH-BITS
+    if bits < 24 [
+        steps: pm101-math/pow 2.0 (as f64! (bits - 1))
+        x: (pm101-math/floor ((x * steps) + 0.5)) / steps
+    ]
+
+    ; The waveshaper with a threshold: a soft knee above it, flattening to
+    ; the midpoint between threshold and one. At one it does nothing.
+    threshold: pm101-param :raw PM101-PARAM-SHAPER-THRESHOLD
+    if threshold < 0.999 [
+        magnitude: brom-abs-f64 x
+        if magnitude > threshold [
+            shaped: make [#mutable f64!] 0.0
+            either magnitude > 1.0 [
+                shaped: 0.5 * (threshold + 1.0)
+            ] [
+                over: (magnitude - threshold) / (1.0 - threshold)
+                shaped: threshold + ((magnitude - threshold) / (1.0 + (over * over)))
+            ]
+            x: either x < 0.0 [0.0 - shaped] [shaped]
+        ]
+    ]
+    return x
+]
+
+; --- lifecycle ------------------------------------------------------------------
+
+pm101-voice-clear: func [
+    "Silence one voice slot."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    index [i32!] "Voice slot."
+    return: [none!] "No value."
+] [
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    voice: make [#mutable pm101-voice!] as pm101-voice! (addr-of state/voices/:index)
+    voice/active: false
+    voice/gate: false
+    voice/age: as i64! 0
+    voice/frequency: 440.0
+    voice/velocity: 0.0
+    repeat line 2 [
+        pm101-line-reset :raw (addr-of voice/lines/:line) line
+        l: make [#mutable pm101-line!] as pm101-line! (addr-of voice/lines/:line)
+        repeat env PM101-ENV-COUNT [
+            e: make [#mutable pm101-env!] as pm101-env! (addr-of l/envs/:env)
+            e/step: PM101-ENV-SEGMENTS
+            e/value: 0.0
+            e/holding: false
+        ]
+    ]
+    return none
+]
+
+pm101-clear-transients: func [
+    "Silence every voice and clear the instance-wide signal history."
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    return: [none!] "No value."
+] [
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    state/next-age: as i64! 0
+    state/vibrato-phase: 0.0
+    state/hold-value: 0.0
+    state/hold-count: 0
+    state/dc-x: 0.0
+    state/dc-y: 0.0
+    repeat index PM101-MAX-VOICES [pm101-voice-clear :raw index]
+    repeat frame PM101-MAX-BLOCK [state/output/:frame: 0.0]
+    return none
+]
+
+pm101-create: func [
+    "Allocate and initialize one independent PM-101 instance."
+    #export
+    return: [c-pointer!] "Opaque instance pointer, or null when allocation fails."
+] [
+    raw: unsafe/malloc (as i32! size-of pm101-state!)
+    if none? raw [return as c-pointer! 0]
+    unsafe/memset raw 0 (as i32! size-of pm101-state!)
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    state/sample-rate: PM101-REFERENCE-RATE
+    state/dc-pole: brom-dc-coefficient PM101-REFERENCE-RATE
+    repeat id PM101-PARAM-COUNT [
+        state/params/:id: pm101-parameter-default as u32! id
+    ]
+    pm101-clear-transients raw
+    return make c-pointer! raw
+]
+
+pm101-destroy: func [
+    "Release one PM-101 instance."
+    #export
+    raw [c-pointer!] "Opaque instance pointer returned by pm101-create."
+    return: [none!] "No value."
+] [
+    if not none? raw [unsafe/free raw]
+    return none
+]
+
+pm101-activate: func [
+    "Set the processing sample rate and silence every voice."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    sample-rate [f64!] "Host sample rate in Hz."
+    return: [none!] "No value."
+] [
+    if none? raw [return none]
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    state/sample-rate: either sample-rate > 100.0 [sample-rate] [PM101-REFERENCE-RATE]
+    state/dc-pole: brom-dc-coefficient state/sample-rate
+    pm101-clear-transients :raw
+    return none
+]
+
+pm101-reset: func [
+    "Silence every voice and clear signal history while retaining parameters."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    return: [none!] "No value."
+] [
+    if none? raw [return none]
+    pm101-clear-transients :raw
+    return none
+]
+
+pm101-voice-report!: make c-struct! [
+    active: [logic!]
+    gate:   [logic!]
+    energy: [f64!]
+    age:    [i64!]
+]
+
+pm101-voice-state: func [
+    "Report one voice's state so Brom's shared allocator can rank it."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    slot [i32!] "Voice slot to describe."
+    :out [c-pointer!] "Borrowed address of a caller-owned brom-voice-state!."
+    return: [logic!] "False when the slot is out of range."
+] [
+    if none? raw [return false]
+    if any [slot < 0 slot >= PM101-MAX-VOICES] [return false]
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    voice: make [#mutable pm101-voice!] as pm101-voice! (addr-of state/voices/:slot)
+    vs: make [#mutable pm101-voice-report!] as pm101-voice-report! :out
+    vs/active: voice/active
+    vs/gate: voice/gate
+    ; Loudness is the larger of the two amplifier envelopes.
+    one: make [#mutable pm101-env!] as pm101-env! (pm101-line-dca (addr-of voice/lines/0))
+    two: make [#mutable pm101-env!] as pm101-env! (pm101-line-dca (addr-of voice/lines/1))
+    vs/energy: either one/value > two/value [one/value] [two/value]
+    vs/age: voice/age
+    return true
+]
+
+pm101-note-on: func [
+    "Start one voice."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    index [i32!] "Voice slot."
+    frequency [f64!] "Note frequency in Hz."
+    velocity [f64!] "Normalized note velocity."
+    return: [none!] "No value."
+] [
+    if any [none? raw index < 0 index >= PM101-MAX-VOICES] [return none]
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    voice: make [#mutable pm101-voice!] as pm101-voice! (addr-of state/voices/:index)
+    voice/active: true
+    voice/gate: true
+    state/next-age: state/next-age + 1
+    voice/age: state/next-age
+    voice/frequency: frequency
+    voice/velocity: brom-clamp-f64 velocity 0.0 1.0
+    repeat line 2 [pm101-line-reset :raw (addr-of voice/lines/:line) line]
+    return none
+]
+
+pm101-note-off: func [
+    "Release one voice."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    index [i32!] "Voice slot."
+    return: [none!] "No value."
+] [
+    if any [none? raw index < 0 index >= PM101-MAX-VOICES] [return none]
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    voice: make [#mutable pm101-voice!] as pm101-voice! (addr-of state/voices/:index)
+    if not voice/gate [return none]
+    voice/gate: false
+    repeat line 2 [pm101-line-release :raw (addr-of voice/lines/:line) line]
+    return none
+]
+
+pm101-process-block: func [
+    "Render an instance-local block of up to 512 mono samples."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    frames [i32!] "Requested sample count."
+    return: [none!] "No value."
+] [
+    if none? raw [return none]
+    count: make [#mutable i32!] frames
+    if count < 0 [count: 0]
+    if count > PM101-MAX-BLOCK [count: PM101-MAX-BLOCK]
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    rate: pm101-param :raw PM101-PARAM-VIBRATO-RATE
+    depth: pm101-param :raw PM101-PARAM-VIBRATO-DEPTH
+    volume: pm101-param :raw PM101-PARAM-VOLUME
+    repeat frame count [
+        ; One vibrato for the instance, as the original had one.
+        lfo: pm101-math/sin (state/vibrato-phase * PM101-TAU)
+        vibrato: pm101-math/exp (PM101-LN2 * (depth / 12.0) * lfo)
+        total: make [#mutable f64!] 0.0
+        repeat index PM101-MAX-VOICES [total: total + pm101-tick-voice :raw index vibrato]
+        blocked: total - state/dc-x + (state/dc-pole * state/dc-y)
+        state/dc-x: total
+        state/dc-y: brom-sanitize-f64 blocked 1000.0
+        state/output/:frame: volume * (pm101-crush :raw state/dc-y)
+        next-phase: state/vibrato-phase + (rate / state/sample-rate)
+        state/vibrato-phase: either next-phase >= 1.0 [next-phase - 1.0] [next-phase]
+    ]
+    return none
+]
+
+pm101-output: func [
+    "Return the instance-local sample buffer."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    return: [c-pointer!] "Pointer to the first f64 sample, or null."
+] [
+    if none? raw [return as c-pointer! 0]
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    return addr-of state/output/0
+]
+
+pm101-output-capacity: func [
+    "Return the fixed render-buffer capacity."
+    #export
+    return: [i32!] "Maximum render block length in samples."
+] [return PM101-MAX-BLOCK]
+
+pm101-set-parameter: func [
+    "Set one parameter."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    parameter [u32!] "Parameter id."
+    value [f64!] "Value in the parameter's own units."
+    return: [logic!] "True when the parameter id was recognized."
+] [
+    if none? raw [return false]
+    if parameter >= (as u32! PM101-PARAM-COUNT) [return false]
+    state: make [#mutable pm101-state!] as pm101-state! raw
+    id: as i32! parameter
+    state/params/:id: pm101-param-value parameter value
+    return true
+]
+
+pm101-get-parameter: func [
+    "Read one parameter."
+    #export
+    :raw [c-pointer!] "Opaque PM-101 instance."
+    parameter [u32!] "Parameter id."
+    return: [f64!] "Current value, or nought for an unknown parameter."
+] [
+    if none? raw [return 0.0]
+    if parameter >= (as u32! PM101-PARAM-COUNT) [return 0.0]
+    return pm101-param :raw (as i32! parameter)
+]

@@ -1,0 +1,15 @@
+Recoil [
+    Title: "PM-101 CLAP entry"
+    Description: {
+        Links PM-101's format-neutral plug-in contract to Brom's shared CLAP
+        shell. Everything instrument-specific is in ../plugin.rcl and
+        ../core.rcl.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/clap/clap_entry
+    Imports: [
+        brom/plugin/clap/entry []
+        examples/pokuston/pm101/engine-export []
+    ]
+    Exports: []
+]

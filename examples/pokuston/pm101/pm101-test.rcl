@@ -1,0 +1,261 @@
+Recoil [
+    Title: "PM-101 engine, schema and factory bank exercise"
+    Description: {
+        Checks what the port claims rather than replaying stored numbers:
+        every default sits in its range and survives the schema, selectors
+        snap to whole positions, every factory patch materializes and sounds
+        without leaving -1..1, a held note sustains and a released one ends,
+        a free-running patch ends with no note-off at all, and a saved state
+        comes back exactly.
+
+        Each check prints PASS or FAIL.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/pm101-test
+    Imports: [
+        brom/plugin/engine [param-info!]
+        brom/plugin/preset [
+            preset-snapshot! preset-factory-count preset-factory-name
+            preset-factory-key preset-factory-materialize
+        ]
+        brom/plugin/state/dispatch [brom-state-load brom-state-save]
+        examples/pokuston/pm101/plugin [
+            pm101-brom-engine pm101-plugin-param-info PM101-STATE-BYTES
+        ]
+        examples/pokuston/pm101/core [
+            PM101-PARAM-COUNT PM101-MAX-VOICES PM101-PARAM-SUSTAIN-STEP
+            PM101-PARAM-MIX-MODE PM101-LINE-WAVE1 PM101-LINE-DCW
+            PM101-ENV-DCW PM101-ENV-DCA
+            pm101-line-param pm101-env-rate-param pm101-env-level-param
+            pm101-create pm101-destroy pm101-activate
+            pm101-voice-state pm101-note-on pm101-note-off
+            pm101-process-block pm101-output
+            pm101-get-parameter pm101-set-parameter
+            pm101-parameter-min pm101-parameter-max pm101-parameter-default
+        ]
+    ]
+    Exports: []
+]
+
+PM101-BANK-SIZE: 9
+SAMPLE-RATE: 48000.0
+
+sample-buffer!: make c-struct! [samples: [c-array! [f64! 512]]]
+voice-report!: make c-struct! [
+    active: [logic!]
+    gate: [logic!]
+    energy: [f64!]
+    age: [i64!]
+]
+
+absolute: func [
+    "Return a sample's non-negative magnitude."
+    value [f64!] "Sample value."
+    return: [f64!] "Absolute magnitude."
+] [return either value < 0.0 [0.0 - value] [value]]
+
+check: func [
+    "Print the canonical verdict for one condition."
+    condition [logic!] "Condition to report."
+    return: [none!] "No value."
+] [print either condition ["PASS"] ["FAIL"] return none]
+
+render-energy: func [
+    "Render some blocks and sum their magnitude, or report minus one if any sample was out of bounds or not finite."
+    :core [c-pointer!] "Borrowed PM-101 instance."
+    blocks [i32!] "Blocks of 512 to render."
+    bound [f64!] "Largest magnitude a sample may have."
+    return: [f64!] "Summed magnitude, or minus one on a bad sample."
+] [
+    energy: make [#mutable f64!] 0.0
+    bad: make [#mutable logic!] false
+    repeat block blocks [
+        pm101-process-block :core 512
+        output: make sample-buffer! as sample-buffer! (pm101-output :core)
+        repeat frame 512 [
+            sample: output/samples/:frame
+            if sample <> sample [bad: true]
+            if (absolute sample) > bound [bad: true]
+            energy: energy + absolute sample
+        ]
+    ]
+    if bad [return -1.0]
+    return energy
+]
+
+render-blocks: func [
+    "Render some blocks and discard them."
+    :core [c-pointer!] "Borrowed PM-101 instance."
+    blocks [i32!] "Blocks of 512 to render."
+    return: [none!] "No value."
+] [
+    repeat block blocks [pm101-process-block :core 512]
+    return none
+]
+
+voice-active?: func [
+    "Whether one voice slot is still sounding."
+    :core [c-pointer!] "Borrowed PM-101 instance."
+    slot [i32!] "Voice slot."
+    return: [logic!] "The slot's active flag."
+] [
+    report: make [#mutable voice-report!] [active: false gate: false energy: 0.0 age: 0]
+    pm101-voice-state :core slot (addr-of report)
+    return report/active
+]
+
+; --- schema -------------------------------------------------------------------
+
+check pm101-brom-engine/param-count = PM101-PARAM-COUNT
+check PM101-STATE-BYTES = (20 + (8 * PM101-PARAM-COUNT))
+
+info-raw: make c-pointer! unsafe/malloc (as i32! size-of param-info!)
+unsafe/memset info-raw 0 (as i32! size-of param-info!)
+info: make [#mutable param-info!] as param-info! info-raw
+schema-ok: make [#mutable logic!] true
+repeat index PM101-PARAM-COUNT [
+    id: as u32! index
+    if not pm101-plugin-param-info index info-raw [schema-ok: false]
+    low: pm101-parameter-min id
+    high: pm101-parameter-max id
+    initial: pm101-parameter-default id
+    if any [initial < low initial > high low >= high] [schema-ok: false]
+    if info/default-value <> initial [schema-ok: false]
+]
+check schema-ok
+check not pm101-plugin-param-info PM101-PARAM-COUNT info-raw
+unsafe/free info-raw
+
+; A fresh instance holds every default, and an out-of-range or fractional
+; selector value lands on a whole position inside its range.
+core: make c-pointer! pm101-create
+check not none? core
+pm101-activate :core SAMPLE-RATE
+defaults-ok: make [#mutable logic!] true
+repeat index PM101-PARAM-COUNT [
+    if (pm101-get-parameter :core (as u32! index)) <> (pm101-parameter-default as u32! index) [
+        defaults-ok: false
+    ]
+]
+check defaults-ok
+wave1: as u32! (pm101-line-param 0 PM101-LINE-WAVE1)
+pm101-set-parameter :core wave1 2.6
+check (pm101-get-parameter :core wave1) = 3.0
+pm101-set-parameter :core wave1 99.0
+check (pm101-get-parameter :core wave1) = 6.0
+pm101-set-parameter :core wave1 0.0
+check not pm101-set-parameter :core (as u32! PM101-PARAM-COUNT) 1.0
+
+; --- voices -------------------------------------------------------------------
+
+; The default patch holds while the key is down and ends after it is let go.
+pm101-note-on :core 0 220.0 1.0
+held: render-energy :core 40 1.0
+check held > 1.0
+check voice-active? :core 0
+pm101-note-off :core 0
+render-blocks :core 20
+check not voice-active? :core 0
+
+; Every slot can sound at once. Eight full voices can sum past one -- the
+; output is not clipped, as no Brom instrument's is -- but stay finite.
+repeat slot PM101-MAX-VOICES [
+    pm101-note-on :core slot (110.0 * (1.0 + (as f64! slot))) 1.0
+]
+check (render-energy :core 20 8.0) > 1.0
+repeat slot PM101-MAX-VOICES [pm101-note-off :core slot]
+render-blocks :core 20
+
+; With the sustain point off the envelopes free-run, as the original's did,
+; and a note ends by itself.
+pm101-set-parameter :core (as u32! PM101-PARAM-SUSTAIN-STEP) 0.0
+pm101-note-on :core 1 330.0 1.0
+render-blocks :core 10
+check voice-active? :core 1
+; The default amplifier plateau is segment two's sixteen seconds; shorten it
+; to a millisecond and the whole contour runs out in under ten.
+pm101-set-parameter :core (as u32! (pm101-env-rate-param 0 PM101-ENV-DCA 1)) 0.0
+pm101-note-on :core 1 330.0 1.0
+render-blocks :core 20
+check not voice-active? :core 1
+pm101-destroy core
+
+; --- state --------------------------------------------------------------------
+
+source: make c-pointer! pm101-create
+pm101-set-parameter :source (as u32! PM101-PARAM-MIX-MODE) 4.0
+pm101-set-parameter :source (as u32! (pm101-line-param 1 PM101-LINE-DCW)) 0.25
+pm101-set-parameter :source (as u32! (pm101-env-level-param 1 PM101-ENV-DCW 8)) 0.75
+state-buf: make c-pointer! unsafe/malloc PM101-STATE-BYTES
+unsafe/memset state-buf 0 PM101-STATE-BYTES
+check brom-state-save :pm101-brom-engine :source state-buf (as size! PM101-STATE-BYTES)
+target: make c-pointer! pm101-create
+check brom-state-load :pm101-brom-engine :target state-buf (as size! PM101-STATE-BYTES)
+same: make [#mutable logic!] true
+repeat index PM101-PARAM-COUNT [
+    if (pm101-get-parameter :source (as u32! index)) <> (pm101-get-parameter :target (as u32! index)) [
+        same: false
+    ]
+]
+check same
+unsafe/free state-buf
+pm101-destroy source
+pm101-destroy target
+
+; --- factory bank -------------------------------------------------------------
+
+check (preset-factory-count :pm101-brom-engine) = PM101-BANK-SIZE
+
+metadata-ok: make [#mutable logic!] true
+repeat index PM101-BANK-SIZE [
+    name: preset-factory-name :pm101-brom-engine index
+    key: preset-factory-key :pm101-brom-engine index
+    if any [(length? name) = 0 (length? key) = 0] [metadata-ok: false]
+]
+check metadata-ok
+
+snapshot: make [#mutable preset-snapshot!] [count: 0 index: -1 values: []]
+
+; Init declares nothing, so it must arrive as the engine's own defaults.
+check preset-factory-materialize :pm101-brom-engine 0 (addr-of snapshot)
+init-ok: make [#mutable logic!] true
+repeat parameter PM101-PARAM-COUNT [
+    if snapshot/values/:parameter <> (pm101-parameter-default as u32! parameter) [
+        init-ok: false
+    ]
+]
+check init-ok
+
+; CZ Brass reaches an envelope level by slug, which is the deepest key the
+; schema builds: a slug the bank misspells would silently not apply.
+check preset-factory-materialize :pm101-brom-engine 1 (addr-of snapshot)
+check snapshot/values/(pm101-env-level-param 0 PM101-ENV-DCW 2) = 0.55
+
+; Ring Bell is the one patch that sets the mixer to Mix-Ring.
+check preset-factory-materialize :pm101-brom-engine 5 (addr-of snapshot)
+check snapshot/values/(as i32! PM101-PARAM-MIX-MODE) = 4.0
+
+; And every one of them makes a sound, within -1..1.
+all-sound: make [#mutable logic!] true
+repeat preset PM101-BANK-SIZE [
+    if not preset-factory-materialize :pm101-brom-engine preset (addr-of snapshot) [
+        all-sound: false
+    ]
+    voice-core: make c-pointer! pm101-create
+    if none? voice-core [all-sound: false]
+    if not none? voice-core [
+        pm101-activate :voice-core SAMPLE-RATE
+        repeat parameter PM101-PARAM-COUNT [
+            accepted: make logic! pm101-set-parameter
+                :voice-core (as u32! parameter) snapshot/values/:parameter
+            if not accepted [all-sound: false]
+        ]
+        pm101-note-on :voice-core 0 110.0 0.9
+        pm101-note-on :voice-core 1 220.0 0.9
+        pm101-note-on :voice-core 2 330.0 0.9
+        energy: render-energy :voice-core 40 1.0
+        if energy <= 0.001 [all-sound: false]
+        pm101-destroy voice-core
+    ]
+]
+check all-sound

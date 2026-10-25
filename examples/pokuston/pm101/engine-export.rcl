@@ -1,0 +1,21 @@
+Recoil [
+    Title: "PM-101 engine export"
+    Description: {
+        The symbol Brom's plug-in shells link against: every plug-in binary
+        exports exactly one brom-engine-ptr, pointing at its descriptor.
+
+        Kept apart from plugin.rcl for the reason Loos keeps its own apart: a
+        program that plays several Brom synths imports each plugin module into
+        one namespace, and a brom-engine-ptr in each would collide. Only the
+        shells import this module.
+    }
+    Type: module
+    Module: examples/pokuston/pm101/engine-export
+    Imports: [
+        examples/pokuston/pm101/plugin [pm101-brom-engine]
+    ]
+    Exports: []
+]
+
+#export [brom-engine-ptr]
+brom-engine-ptr: make c-pointer! addr-of pm101-brom-engine
